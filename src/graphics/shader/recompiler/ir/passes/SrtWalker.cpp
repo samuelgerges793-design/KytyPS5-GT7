@@ -554,6 +554,17 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 		}
 	}
 	uint32_t word = 0;
+	if (!vector && address < 0x10000u) {
+		// Experimental: refuse null-page reads instead of faulting the host.
+		static std::atomic_int reports = 0;
+		if (reports++ < 8) {
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "warning: SRT evaluation read from address 0x{:x} (shader=0x{:016x})\n",
+			    address, m_program.shader_hash));
+		}
+		g_null_page_read = true;
+		return false;
+	}
 	const auto reader = vector ? m_runtime.read_specialization_memory : m_runtime.read_memory;
 	if (reader != nullptr) {
 		if (!reader(m_runtime.userdata, address, {&word, 1})) {
