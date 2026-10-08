@@ -24,6 +24,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdlib>
 #include <cctype>
 #include <cstdio>
 #include <cstring>
@@ -106,7 +107,20 @@ void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
 	Log::WriteToConsoleAndLog(message);
 }
 
+// Experimental: set per shader lookup; the first memory read of its materialization waits for
+// the GPU work recorded so far, so values written by earlier dispatches are not read stale.
+thread_local bool g_sync_before_shader_read = false;
+
+bool SpecializationSyncEnabled() {
+	static const bool enabled = std::getenv("KYTY_NO_SPEC_SYNC") == nullptr;
+	return enabled;
+}
+
 bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) {
+	if (g_sync_before_shader_read) {
+		g_sync_before_shader_read = false;
+		Libs::LibKernel::Memory::SyncGpuForShaderReads();
+	}
 	// Scalar and unformatted buffer dependencies use the same backing as native raw loads.
 	// Image synchronization belongs to formatted buffer bindings, not these reads.
 	return !values.empty() &&
@@ -334,6 +348,7 @@ struct PipelineCache::ProgramCache {
 		}
 
 		DebugNoteShader(params.hash, static_cast<uint32_t>(stage));
+		g_sync_before_shader_read = SpecializationSyncEnabled();
 		const auto user_data = std::span(params.user_data).first(params.user_data_count);
 		lookup_key.stage           = stage;
 		lookup_key.hash            = params.hash;

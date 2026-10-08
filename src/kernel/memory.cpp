@@ -876,6 +876,15 @@ bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 	       g_guest_address_space->TryReadBacking(vaddr, data, size);
 }
 
+void SyncGpuForShaderReads() {
+	if (g_gpu_resources == nullptr || !Graphics::GuestGpu::IsGpuThread()) {
+		return;
+	}
+	auto& scheduler = GetGpuResources().GetCommandScheduler();
+	scheduler.EndRendering();
+	scheduler.Wait(scheduler.CurrentTick());
+}
+
 bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size)) {
 		if (!Graphics::GuestGpu::IsGpuThread()) {
