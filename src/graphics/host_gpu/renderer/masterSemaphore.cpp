@@ -5,6 +5,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdlib>
 #include <map>
 #include <fmt/format.h>
@@ -17,21 +18,31 @@ namespace Libs::Graphics {
 namespace {
 
 struct NotedShader {
-	uint64_t hash  = 0;
-	uint32_t stage = 0;
-	uint32_t count = 0;
+	uint64_t hash       = 0;
+	uint32_t stage      = 0;
+	uint32_t count      = 0;
+	uint64_t max_groups = 0;
+	uint32_t last_x = 0, last_y = 0, last_z = 0;
+	uint32_t indirect   = 0;
+	uint64_t last_args  = 0;
 };
 
 std::mutex                                   g_noted_mutex;
 std::vector<NotedShader>                     g_recording;
 std::map<uint64_t, std::vector<NotedShader>> g_submitted;
+size_t                                       g_last_noted = SIZE_MAX;
 
 std::string FormatNoted(const std::vector<NotedShader>& list) {
 	static constexpr const char* Stages[] = {"?", "VS", "PS", "FS", "CS", "MS", "LS", "HS", "TES"};
 	std::string text;
 	for (const auto& n: list) {
-		text += fmt::format("  stage={} hash=0x{:016x} uses={}\n",
+		text += fmt::format("  stage={} hash=0x{:016x} uses={}",
 		                    n.stage < std::size(Stages) ? Stages[n.stage] : "?", n.hash, n.count);
+		if (n.max_groups != 0 || n.indirect != 0) {
+			text += fmt::format(" groups(last)={}x{}x{} max_groups={} indirect={} args=0x{:x}",
+			                    n.last_x, n.last_y, n.last_z, n.max_groups, n.indirect, n.last_args);
+		}
+		text += "\n";
 	}
 	return text;
 }
@@ -44,8 +55,27 @@ void DebugNoteShader(uint64_t hash, uint32_t stage) {
 	    g_recording, [&](const NotedShader& n) { return n.hash == hash && n.stage == stage; });
 	if (found != g_recording.end()) {
 		found->count++;
+		g_last_noted = static_cast<size_t>(found - g_recording.begin());
 	} else if (g_recording.size() < 256) {
-		g_recording.push_back({hash, stage, 1});
+		g_recording.push_back({.hash = hash, .stage = stage, .count = 1});
+		g_last_noted = g_recording.size() - 1;
+	} else {
+		g_last_noted = SIZE_MAX;
+	}
+}
+
+void DebugNoteDispatch(uint32_t x, uint32_t y, uint32_t z, bool indirect, uint64_t args) {
+	std::scoped_lock lock(g_noted_mutex);
+	if (g_last_noted >= g_recording.size()) return;
+	auto& n = g_recording[g_last_noted];
+	if (indirect) {
+		n.indirect++;
+		n.last_args = args;
+	} else {
+		n.last_x = x;
+		n.last_y = y;
+		n.last_z = z;
+		n.max_groups = std::max<uint64_t>(n.max_groups, uint64_t(x) * y * z);
 	}
 }
 
@@ -53,6 +83,7 @@ void DebugSubmitNoted(uint64_t tick) {
 	std::scoped_lock lock(g_noted_mutex);
 	g_submitted[tick] = std::move(g_recording);
 	g_recording.clear();
+	g_last_noted = SIZE_MAX;
 	while (g_submitted.size() > 256) {
 		g_submitted.erase(g_submitted.begin());
 	}
@@ -83,6 +114,7 @@ void DebugClearNotedShaders() {
 	std::scoped_lock lock(g_noted_mutex);
 	g_recording.clear();
 	g_submitted.clear();
+	g_last_noted = SIZE_MAX;
 }
 
 bool DebugSyncSubmitEnabled() {

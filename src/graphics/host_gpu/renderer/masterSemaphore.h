@@ -41,6 +41,7 @@ private:
 // Experimental diagnostics: the shaders looked up since the last completed sync-mode submit
 // are printed when the device is lost. KYTY_SYNC_SUBMIT=1 waits for every submit.
 void DebugNoteShader(uint64_t hash, uint32_t stage);
+void DebugNoteDispatch(uint32_t x, uint32_t y, uint32_t z, bool indirect, uint64_t args);
 void DebugSubmitNoted(uint64_t tick);
 void DebugCompletedUpTo(uint64_t tick);
 void DebugReportNotedShaders(const char* reason, uint64_t completed_tick);
