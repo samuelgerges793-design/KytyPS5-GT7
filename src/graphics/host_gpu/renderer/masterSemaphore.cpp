@@ -11,6 +11,8 @@
 #endif
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <map>
@@ -156,6 +158,63 @@ bool SerializeShader(uint64_t hash) {
 	return std::ranges::find(hashes, hash) != hashes.end();
 }
 
+namespace {
+
+struct CheckpointInfo {
+	uint64_t seq = 0, submit_id = 0, arg4 = 0, shader = 0, tick = 0;
+	uint32_t op = 0, arg0 = 0, arg1 = 0, arg2 = 0, arg3 = 0;
+};
+
+constexpr size_t                         CheckpointRing = 1u << 16u;
+std::atomic_bool                         g_checkpoints_enabled = false;
+std::atomic<uint64_t>                    g_checkpoint_seq      = 0;
+std::array<CheckpointInfo, CheckpointRing> g_checkpoints {};
+
+} // namespace
+
+void DebugSetCheckpointsEnabled(bool enabled) {
+	g_checkpoints_enabled = enabled;
+}
+
+bool DebugCheckpointsEnabled() {
+	return g_checkpoints_enabled;
+}
+
+void* DebugRecordCheckpoint(uint32_t op, uint64_t submit_id, uint32_t arg0, uint32_t arg1,
+                            uint32_t arg2, uint32_t arg3, uint64_t arg4, uint64_t tick) {
+	const auto seq = ++g_checkpoint_seq;
+	uint64_t   shader = 0;
+	{
+		std::scoped_lock lock(g_noted_mutex);
+		if (g_last_noted < g_recording.size()) shader = g_recording[g_last_noted].hash;
+	}
+	g_checkpoints[seq % CheckpointRing] = {seq, submit_id, arg4, shader, tick, op, arg0, arg1, arg2, arg3};
+	return reinterpret_cast<void*>(static_cast<uintptr_t>(seq));
+}
+
+void DebugReportCheckpoints(vk::Queue queue) {
+	if (!g_checkpoints_enabled || queue == nullptr) return;
+	uint32_t count = 0;
+	VULKAN_HPP_DEFAULT_DISPATCHER.vkGetQueueCheckpointDataNV(queue, &count, nullptr);
+	std::vector<VkCheckpointDataNV> data(count, VkCheckpointDataNV {VK_STRUCTURE_TYPE_CHECKPOINT_DATA_NV});
+	VULKAN_HPP_DEFAULT_DISPATCHER.vkGetQueueCheckpointDataNV(queue, &count, data.data());
+	static constexpr const char* Ops[] = {"DispatchDirect", "DrawIndex", "DrawIndexAuto", "EopWrite",
+	                                      "EopInterrupt", "EopWriteBack", "EopFlip", "EopWriteBackFlip",
+	                                      "EopOnlyFlip", "DispatchIndirect", "Unknown"};
+	std::string text = fmt::format("--- GPU checkpoints at device loss ({} stages, last seq recorded {}) ---\n",
+	                               count, g_checkpoint_seq.load());
+	for (const auto& d: data) {
+		const auto seq  = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(d.pCheckpointMarker));
+		const auto& i   = g_checkpoints[seq % CheckpointRing];
+		const char* name = i.op < std::size(Ops) ? Ops[i.op] : "?";
+		text += fmt::format("  stage=0x{:x} marker={} -> {} submit={} tick={} shader=0x{:016x} "
+		                    "args={},{},{},{},0x{:x}\n",
+		                    static_cast<uint32_t>(d.stage), seq, i.seq == seq ? name : "(overwritten)",
+		                    i.submit_id, i.tick, i.shader, i.arg0, i.arg1, i.arg2, i.arg3, i.arg4);
+	}
+	Log::WriteToConsoleAndLog(text);
+}
+
 bool DebugSyncSubmitEnabled() {
 	static const bool enabled = std::getenv("KYTY_SYNC_SUBMIT") != nullptr;
 	return enabled;
@@ -184,6 +243,7 @@ void MasterSemaphore::Refresh() {
 	const auto result  = m_graphics.device.getSemaphoreCounterValue(m_semaphore, &counter);
 	if (result != vk::Result::eSuccess) {
 		DebugReportNotedShaders("getSemaphoreCounterValue failed", KnownGpuTick());
+		DebugReportCheckpoints(m_graphics.queue);
 	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 	DebugCompletedUpTo(counter);
@@ -212,6 +272,7 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	const auto result = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
 	if (result != vk::Result::eSuccess) {
 		DebugReportNotedShaders("waitSemaphores failed", KnownGpuTick());
+		DebugReportCheckpoints(m_graphics.queue);
 	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 	Refresh();

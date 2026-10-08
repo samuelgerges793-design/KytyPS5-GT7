@@ -10,6 +10,7 @@
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/timer.h"
+#include "graphics/host_gpu/renderer/masterSemaphore.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -24,6 +25,8 @@
 #include "loader/systemContent.h"
 
 #include <algorithm>
+#include <string_view>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <fmt/format.h>
@@ -1018,6 +1021,18 @@ void WindowContext::CreateVulkan() {
 		}
 	}
 
+	if (std::getenv("KYTY_CHECKPOINTS") != nullptr) {
+		uint32_t ext_count = 0;
+		(void)graphic_ctx.physical_device.enumerateDeviceExtensionProperties(nullptr, &ext_count, nullptr);
+		std::vector<vk::ExtensionProperties> exts(ext_count);
+		(void)graphic_ctx.physical_device.enumerateDeviceExtensionProperties(nullptr, &ext_count, exts.data());
+		const bool found = std::ranges::any_of(exts, [](const vk::ExtensionProperties& e) {
+			return std::string_view(e.extensionName.data()) == VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME;
+		});
+		if (found) device_extensions.push_back(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
+		DebugSetCheckpointsEnabled(found);
+		std::printf("GPU checkpoints: %s\n", found ? "enabled" : "not supported");
+	}
 	graphic_ctx.device = VulkanCreateDevice(graphic_ctx, device_extensions);
 	if (graphic_ctx.device == nullptr) {
 		EXIT("Could not create device");
