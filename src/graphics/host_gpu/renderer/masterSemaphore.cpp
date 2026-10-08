@@ -6,10 +6,11 @@
 
 #include <algorithm>
 #include <cstdlib>
-#include <deque>
+#include <map>
 #include <fmt/format.h>
 #include <mutex>
 #include <utility>
+#include <vector>
 
 namespace Libs::Graphics {
 
@@ -21,43 +22,67 @@ struct NotedShader {
 	uint32_t count = 0;
 };
 
-std::mutex              g_noted_mutex;
-std::deque<NotedShader> g_noted;
+std::mutex                                   g_noted_mutex;
+std::vector<NotedShader>                     g_recording;
+std::map<uint64_t, std::vector<NotedShader>> g_submitted;
+
+std::string FormatNoted(const std::vector<NotedShader>& list) {
+	static constexpr const char* Stages[] = {"?", "VS", "PS", "FS", "CS", "MS", "LS", "HS", "TES"};
+	std::string text;
+	for (const auto& n: list) {
+		text += fmt::format("  stage={} hash=0x{:016x} uses={}\n",
+		                    n.stage < std::size(Stages) ? Stages[n.stage] : "?", n.hash, n.count);
+	}
+	return text;
+}
 
 } // namespace
 
 void DebugNoteShader(uint64_t hash, uint32_t stage) {
 	std::scoped_lock lock(g_noted_mutex);
 	const auto found = std::ranges::find_if(
-	    g_noted, [&](const NotedShader& n) { return n.hash == hash && n.stage == stage; });
-	NotedShader entry {hash, stage, 0};
-	if (found != g_noted.end()) {
-		entry = *found;
-		g_noted.erase(found);
-	}
-	entry.count++;
-	g_noted.push_back(entry);
-	while (g_noted.size() > 64) {
-		g_noted.pop_front();
+	    g_recording, [&](const NotedShader& n) { return n.hash == hash && n.stage == stage; });
+	if (found != g_recording.end()) {
+		found->count++;
+	} else if (g_recording.size() < 256) {
+		g_recording.push_back({hash, stage, 1});
 	}
 }
 
-void DebugReportNotedShaders(const char* reason) {
+void DebugSubmitNoted(uint64_t tick) {
 	std::scoped_lock lock(g_noted_mutex);
-	static constexpr const char* Stages[] = {"?", "VS", "PS", "FS", "CS", "MS", "LS", "HS", "TES"};
-	std::string text = fmt::format("--- {}: shaders since last completed submit (oldest first, "
-	                               "sync mode={}) ---\n",
-	                               reason, DebugSyncSubmitEnabled() ? "on" : "off");
-	for (const auto& n: g_noted) {
-		text += fmt::format("  stage={} hash=0x{:016x} uses={}\n",
-		                    n.stage < std::size(Stages) ? Stages[n.stage] : "?", n.hash, n.count);
+	g_submitted[tick] = std::move(g_recording);
+	g_recording.clear();
+	while (g_submitted.size() > 256) {
+		g_submitted.erase(g_submitted.begin());
 	}
+}
+
+void DebugCompletedUpTo(uint64_t tick) {
+	std::scoped_lock lock(g_noted_mutex);
+	g_submitted.erase(g_submitted.begin(), g_submitted.upper_bound(tick));
+}
+
+void DebugReportNotedShaders(const char* reason, uint64_t completed_tick) {
+	std::scoped_lock lock(g_noted_mutex);
+	std::string text = fmt::format("--- {}: GPU completed tick {}, {} submits unfinished ---\n",
+	                               reason, completed_tick, g_submitted.size());
+	int shown = 0;
+	for (const auto& [tick, list]: g_submitted) {
+		if (tick <= completed_tick) continue;
+		text += fmt::format(" submit tick {}{}:\n", tick,
+		                    shown == 0 ? " (oldest unfinished, where the GPU stopped)" : "");
+		text += FormatNoted(list);
+		if (++shown == 3) break;
+	}
+	text += " still recording:\n" + FormatNoted(g_recording);
 	Log::WriteToConsoleAndLog(text);
 }
 
 void DebugClearNotedShaders() {
 	std::scoped_lock lock(g_noted_mutex);
-	g_noted.clear();
+	g_recording.clear();
+	g_submitted.clear();
 }
 
 bool DebugSyncSubmitEnabled() {
@@ -87,9 +112,10 @@ void MasterSemaphore::Refresh() {
 	uint64_t   counter = 0;
 	const auto result  = m_graphics.device.getSemaphoreCounterValue(m_semaphore, &counter);
 	if (result != vk::Result::eSuccess) {
-		DebugReportNotedShaders("getSemaphoreCounterValue failed");
+		DebugReportNotedShaders("getSemaphoreCounterValue failed", KnownGpuTick());
 	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	DebugCompletedUpTo(counter);
 
 	auto known = m_gpu_tick.load(std::memory_order_acquire);
 	while (known < counter &&
@@ -114,7 +140,7 @@ void MasterSemaphore::Wait(uint64_t tick) {
 
 	const auto result = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
 	if (result != vk::Result::eSuccess) {
-		DebugReportNotedShaders("waitSemaphores failed");
+		DebugReportNotedShaders("waitSemaphores failed", KnownGpuTick());
 	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 	Refresh();
