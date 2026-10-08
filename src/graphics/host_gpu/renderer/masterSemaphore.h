@@ -38,6 +38,13 @@ private:
 	std::atomic<uint64_t> m_current_tick {1};
 };
 
+// Experimental diagnostics: the shaders looked up since the last completed sync-mode submit
+// are printed when the device is lost. KYTY_SYNC_SUBMIT=1 waits for every submit.
+void DebugNoteShader(uint64_t hash, uint32_t stage);
+void DebugReportNotedShaders(const char* reason);
+void DebugClearNotedShaders();
+bool DebugSyncSubmitEnabled();
+
 } // namespace Libs::Graphics
 
 #endif // EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_MASTERSEMAPHORE_H_

@@ -382,6 +382,10 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
 	m_command.m_buffer = nullptr;
+	if (DebugSyncSubmitEnabled()) {
+		m_master.Wait(tick);
+		DebugClearNotedShaders();
+	}
 	return tick;
 }
 
