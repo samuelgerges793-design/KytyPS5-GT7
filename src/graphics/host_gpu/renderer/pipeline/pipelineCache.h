@@ -13,6 +13,7 @@
 #include <filesystem>
 #include <memory>
 #include <span>
+#include <string>
 #include <type_traits>
 #include <unordered_map>
 
@@ -104,11 +105,25 @@ struct ShaderProgram {
 class PipelineCache {
 public:
 	explicit PipelineCache(GraphicContext& graphics);
+	// Keeps the persistent caches of `title_id` in `directory` (tests).
+	PipelineCache(GraphicContext& graphics, const std::filesystem::path& directory,
+	              const std::string& title_id);
 	~PipelineCache();
 	KYTY_CLASS_NO_COPY(PipelineCache);
 	void Save();
 	// Writes the driver cache without releasing it, so crashes keep earlier compiles.
 	bool WriteDriverCache();
+
+	struct ProgramStats {
+		uint64_t compiled       = 0; // Permutations compiled by the caller of Get*Program.
+		uint64_t compiled_ahead = 0; // Permutations compiled from the shader cache.
+		uint64_t recorded       = 0; // Recipes known to the shader cache.
+		uint64_t waited         = 0; // Lookups that waited for a background compilation.
+		uint64_t waited_us      = 0;
+	};
+	[[nodiscard]] ProgramStats GetProgramStats() const;
+	// Blocks until every queued background compilation has finished (tests).
+	void WaitForBackgroundCompilation();
 
 	struct Pipeline {
 		vk::PipelineLayout      pipeline_layout       = nullptr;
@@ -184,7 +199,8 @@ private:
 	std::chrono::steady_clock::time_point m_last_save            = std::chrono::steady_clock::now();
 	void                                  NotePipelineCreated();
 
-	void InitializeDriverCache();
+	void InitializeCaches(const std::filesystem::path& directory, const std::string& title_id);
+	void InitializeDriverCache(const std::filesystem::path& path);
 };
 
 void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pixel_program_id);
