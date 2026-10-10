@@ -52,7 +52,17 @@ bool DebugSyncSubmitEnabled();
 bool SerializeShader(uint64_t hash);
 
 // Where frame time goes: totals since the last report, printed with the fps every 5 s.
-enum class PerfCounter { GpuWait, ShaderReadSync, SerializedDispatch, CommandThreadCompile, Readback, Count };
+enum class PerfCounter {
+	GpuWait,
+	ShaderReadSync,
+	SerializedDispatch,
+	CommandThreadCompile,
+	Readback,
+	PipelineCreate,
+	GpuThreadIdle,
+	GpuThreadBlocked,
+	Count
+};
 void PerfAdd(PerfCounter counter, uint64_t nanoseconds);
 void PerfReport(double fps);
 class PerfScope {

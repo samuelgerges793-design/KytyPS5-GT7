@@ -19,6 +19,7 @@
 #include <map>
 #include <fmt/format.h>
 #include <mutex>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -181,6 +182,32 @@ uint64_t PerfNow() {
 
 } // namespace
 
+struct WaitSite {
+	uint64_t count = 0;
+	uint64_t ns    = 0;
+};
+std::mutex                       g_wait_sites_mutex;
+std::unordered_map<uintptr_t, WaitSite> g_wait_sites;
+
+void NoteWaitSite(uint64_t ns) {
+#ifdef _WIN32
+	void*      frames[4] {};
+	const auto count = RtlCaptureStackBackTrace(2, 4, frames, nullptr);
+	const auto base  = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+	// The first frame outside the scheduler wrappers names who waited.
+	uintptr_t site = 0;
+	for (USHORT i = 0; i < count && site == 0; i++) {
+		site = reinterpret_cast<uintptr_t>(frames[i]) - base;
+	}
+	std::scoped_lock lock(g_wait_sites_mutex);
+	auto&            entry = g_wait_sites[site];
+	entry.count++;
+	entry.ns += ns;
+#else
+	(void)ns;
+#endif
+}
+
 void PerfAdd(PerfCounter counter, uint64_t nanoseconds) {
 	auto& totals = g_perf[static_cast<size_t>(counter)];
 	totals.ns.fetch_add(nanoseconds, std::memory_order_relaxed);
@@ -199,8 +226,9 @@ void PerfReport(double fps) {
 	if (now - last < 5'000'000'000ull) return;
 	const double seconds = static_cast<double>(now - last) / 1e9;
 	last                 = now;
-	static constexpr const char* Names[] = {"gpu-wait", "shader-read-sync", "serialized-dispatch",
-	                                        "compile", "readback"};
+	static constexpr const char* Names[] = {"gpu-wait",      "shader-read-sync", "serialized-dispatch",
+	                                        "compile",       "readback",         "pipeline-create",
+	                                        "gpu-idle",      "gpu-blocked"};
 	std::string text = fmt::format("perf: {:.1f} fps |", fps);
 	for (size_t i = 0; i < g_perf.size(); i++) {
 		const auto ns    = g_perf[i].ns.exchange(0, std::memory_order_relaxed);
@@ -208,6 +236,17 @@ void PerfReport(double fps) {
 		text += fmt::format(" {} {:.0f} ms/s ({:.0f}/s) |", Names[i],
 		                    static_cast<double>(ns) / 1e6 / seconds,
 		                    static_cast<double>(count) / seconds);
+	}
+	{
+		std::scoped_lock lock(g_wait_sites_mutex);
+		std::vector<std::pair<uintptr_t, WaitSite>> sites(g_wait_sites.begin(), g_wait_sites.end());
+		g_wait_sites.clear();
+		std::ranges::sort(sites, [](const auto& a, const auto& b) { return a.second.ns > b.second.ns; });
+		if (!sites.empty()) text += " waits by caller:";
+		for (size_t i = 0; i < sites.size() && i < 5; i++) {
+			text += fmt::format(" rva=0x{:x} {:.0f}ms/{}", sites[i].first,
+			                    static_cast<double>(sites[i].second.ns) / 1e6, sites[i].second.count);
+		}
 	}
 	Log::WriteToConsoleAndLog(text + "\n");
 }
@@ -340,8 +379,10 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	wait_info.pSemaphores    = &m_semaphore;
 	wait_info.pValues        = &tick;
 
-	PerfScope  perf(PerfCounter::GpuWait);
-	const auto result = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
+	const auto wait_start = PerfNow();
+	const auto result     = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
+	PerfAdd(PerfCounter::GpuWait, PerfNow() - wait_start);
+	NoteWaitSite(PerfNow() - wait_start);
 	if (result != vk::Result::eSuccess) {
 		DebugReportNotedShaders("waitSemaphores failed", KnownGpuTick());
 		DebugReportCheckpoints(m_graphics.queue);
