@@ -778,6 +778,14 @@ static std::vector<ResourceBlock> ResourceControlFlow(const Program& program, co
 		block.sources.erase(std::unique(block.sources.begin(), block.sources.end()),
 		                    block.sources.end());
 	}
+	if (HostScalarShader(program.shader_hash)) {
+		for (auto& block: blocks) block.condition = predicate(block.condition);
+		if (std::ranges::none_of(
+		        blocks, [](const ResourceBlock& block) { return !block.condition.IsEmpty(); })) {
+			return {};
+		}
+		return blocks;
+	}
 	// Only branches that can change future resource access belong in the host plan.
 	std::vector<uint8_t> resource_reachable(blocks.size());
 	std::vector<uint32_t> pending;

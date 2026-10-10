@@ -6,6 +6,9 @@
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include <algorithm>
+#include <cstdlib>
+#include <string>
+#include <vector>
 #include <fmt/format.h>
 #include <map>
 #include <optional>
@@ -14,6 +17,24 @@
 #include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
+
+bool HostScalarShader(uint64_t shader_hash) {
+	static const std::vector<uint64_t> hashes = [] {
+		std::vector<uint64_t> list;
+		if (const char* env = std::getenv("KYTY_HOST_SCALAR_SHADERS"); env != nullptr) {
+			const std::string text(env);
+			size_t            start = 0;
+			while (start < text.size()) {
+				const auto end = std::min(text.find(',', start), text.size());
+				if (end > start) list.push_back(std::stoull(text.substr(start, end - start), nullptr, 16));
+				start = end + 1;
+			}
+		}
+		return list;
+	}();
+	return !hashes.empty() && std::ranges::find(hashes, shader_hash) != hashes.end();
+}
+
 namespace {
 
 constexpr uint32_t SamplerBorderClampMask    = (1u << 2u) | (1u << 5u) | (1u << 8u);
@@ -804,6 +825,19 @@ private:
 					           base, source, flags.pc);
 					for (uint32_t word = 0; word < width; ++word)
 						CollectScalarRead(source.dwords[word], flags.pc);
+				}
+			}
+		}
+		if (HostScalarShader(m_program.shader_hash)) {
+			// Experimental per-shader opt-out: read immediate-offset scalar loads on the host.
+			for (auto* block: m_program.blocks) {
+				for (auto& inst: *block) {
+					uint32_t index = 0;
+					if (inst.GetOpcode() == ValueOpcode::LoadAddressU32 &&
+					    ScalarReadMemory(inst, index) != nullptr &&
+					    inst.Arg(1).Resolve().IsImmediate() &&
+					    ValidateRuntimeValue(m_program, Value(&inst)))
+						CollectScalarRead(Value(&inst), inst.Flags<MemoryFlags>().pc);
 				}
 			}
 		}

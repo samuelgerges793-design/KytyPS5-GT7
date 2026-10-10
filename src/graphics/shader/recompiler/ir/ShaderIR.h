@@ -654,6 +654,10 @@ bool  EquivalentValue(const ResourcePlan& program, Value left, Value right);
 Value ResolveInvariantPhi(const ResourcePlan& program, Value value);
 Value ResolveActiveU32(Value value, Value active);
 
+// Experimental: shaders listed in KYTY_HOST_SCALAR_SHADERS read their immediate-offset scalar
+// loads and evaluate their branch conditions on the host instead of keeping them on the GPU.
+[[nodiscard]] bool HostScalarShader(uint64_t shader_hash);
+
 } // namespace Libs::Graphics::ShaderRecompiler::IR
 
 #endif /* EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_RECOMPILER_SHADERIR_H_ */
