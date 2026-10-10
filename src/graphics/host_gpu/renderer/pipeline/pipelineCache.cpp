@@ -348,6 +348,31 @@ struct PipelineCache::ProgramCache {
 		}
 
 		DebugNoteShader(params.hash, static_cast<uint32_t>(stage));
+		if (stage != ShaderType::Compute && DumpShaderInputs(params.hash)) {
+			static std::atomic_int dumps = 0;
+			if (dumps++ < 20) {
+				auto text = fmt::format("lookup {} 0x{:016x} user_data:", static_cast<int>(stage),
+				                        params.hash);
+				for (uint32_t i = 0; i < params.user_data_count; i++) {
+					text += fmt::format(" s{}={:08x}", i, params.user_data[i]);
+				}
+				const uint64_t table = params.user_data_count >= 2
+				                           ? ((uint64_t(params.user_data[1] & 0xffffu) << 32u) |
+				                              params.user_data[0]) &
+				                                 ~uint64_t {3}
+				                           : 0;
+				std::array<uint32_t, 320> words {};
+				if (table != 0 && Libs::LibKernel::Memory::TryReadBacking(table, words.data(),
+				                                                          sizeof(words))) {
+					text += fmt::format("\n  table 0x{:x}:", table);
+					for (uint32_t i = 0; i < words.size(); i++) {
+						if (i % 8 == 0) text += fmt::format("\n   +{:4}:", i * 4);
+						text += fmt::format(" {:08x}", words[i]);
+					}
+				}
+				Log::WriteToConsoleAndLog(text + "\n");
+			}
+		}
 		g_sync_before_shader_read = SpecializationSyncEnabled() || SerializeShader(params.hash);
 		const auto user_data = std::span(params.user_data).first(params.user_data_count);
 		lookup_key.stage           = stage;
