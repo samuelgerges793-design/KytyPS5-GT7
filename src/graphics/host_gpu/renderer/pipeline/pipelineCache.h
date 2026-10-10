@@ -9,7 +9,13 @@
 #include "graphics/shader/shader.h"
 
 #include <cstddef>
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+#include <thread>
+#include <vector>
 #include <filesystem>
 #include <functional>
 #include <memory>
@@ -137,6 +143,8 @@ public:
 		vk::Pipeline            pipeline              = nullptr;
 		vk::DescriptorSetLayout descriptor_set_layout = nullptr;
 		bool                    uses_push_descriptors = false;
+		// False while a background worker is still creating `pipeline`.
+		std::atomic<bool>       ready {true};
 	};
 
 	struct GraphicsPrograms {
@@ -157,7 +165,9 @@ public:
 	                                const HW::ShaderRegisters&   sh,
 	                                ShaderComputeInputInfo&      input_info);
 
-	Pipeline& GetGraphicsPipeline(std::span<const RenderColorInfo>       colors,
+	// Returns nullptr while the pipeline is still being created in the background; the caller
+	// skips that draw (KYTY_SYNC_PIPELINES creates every pipeline before its first draw).
+	Pipeline* GetGraphicsPipeline(std::span<const RenderColorInfo>       colors,
 	                              const RenderDepthInfo&                 depth,
 	                              std::span<const ShaderVertexInputInfo> vertex_info,
 	                              CommandBuffer& command, const ShaderPixelInputInfo* ps_input_info,
@@ -205,6 +215,18 @@ private:
 	uint32_t                              m_pipelines_since_save = 0;
 	std::chrono::steady_clock::time_point m_last_save            = std::chrono::steady_clock::now();
 	void                                  NotePipelineCreated();
+
+	// Background graphics pipeline creation.
+	std::mutex                        m_pipeline_jobs_mutex;
+	std::condition_variable           m_pipeline_jobs_cv;
+	std::condition_variable           m_pipeline_idle_cv;
+	std::deque<std::function<void()>> m_pipeline_jobs;
+	std::vector<std::thread>          m_pipeline_workers;
+	uint32_t                          m_pipeline_jobs_running = 0;
+	bool                              m_pipeline_workers_stop = false;
+	void                              QueuePipelineJob(std::function<void()> job);
+	void                              DrainPipelineJobs();
+	void                              StopPipelineWorkers();
 
 	void InitializeCaches(const std::filesystem::path& directory, const std::string& title_id);
 	void InitializeDriverCache(const std::filesystem::path& path);

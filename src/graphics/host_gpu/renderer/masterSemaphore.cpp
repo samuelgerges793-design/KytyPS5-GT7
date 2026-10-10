@@ -228,7 +228,7 @@ void PerfReport(double fps) {
 	last                 = now;
 	static constexpr const char* Names[] = {"gpu-wait",      "shader-read-sync", "serialized-dispatch",
 	                                        "compile",       "readback",         "pipeline-create",
-	                                        "gpu-idle",      "gpu-blocked"};
+	                                        "gpu-idle",      "gpu-blocked",      "draws-waiting"};
 	std::string text = fmt::format("perf: {:.1f} fps |", fps);
 	for (size_t i = 0; i < g_perf.size(); i++) {
 		const auto ns    = g_perf[i].ns.exchange(0, std::memory_order_relaxed);

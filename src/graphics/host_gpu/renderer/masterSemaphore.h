@@ -61,6 +61,7 @@ enum class PerfCounter {
 	PipelineCreate,
 	GpuThreadIdle,
 	GpuThreadBlocked,
+	DrawsWaitingForPipeline,
 	Count
 };
 void PerfAdd(PerfCounter counter, uint64_t nanoseconds);

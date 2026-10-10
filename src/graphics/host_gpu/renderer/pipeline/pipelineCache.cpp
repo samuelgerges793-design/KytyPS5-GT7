@@ -280,7 +280,6 @@ struct PipelineCache::ProgramCache {
 		SourceEntry(ShaderRecompiler::IR::ResourcePlan plan,
 		            std::unique_ptr<ShaderRecompiler::ShaderSource> call_source)
 		    : call_source(std::move(call_source)), resource_plan(std::move(plan)) {
-			permutations.reserve(8);
 		}
 
 		std::span<const uint32_t> FunctionCode() const {
@@ -319,7 +318,8 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::IR::ResourcePlan           resource_plan;
 		ShaderRecompiler::IR::ResourceSnapshot       resources;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
-		std::vector<Permutation>                    permutations;
+		// A deque keeps permutations in place: background pipeline jobs hold their program info.
+		std::deque<Permutation>                     permutations;
 	};
 
 	struct ProgramKeyHash {
@@ -712,7 +712,8 @@ struct PipelineCache::ProgramCache {
 		}
 		std::optional<SourceEntry> entry;
 		entry.emplace(std::move(*plan), nullptr);
-		entry->permutations = std::move(permutations);
+		entry->permutations.assign(std::make_move_iterator(permutations.begin()),
+		                          std::make_move_iterator(permutations.end()));
 		return entry;
 	}
 
@@ -999,6 +1000,7 @@ PipelineCache::PipelineCache(GraphicContext& graphics, const std::filesystem::pa
 }
 
 PipelineCache::~PipelineCache() {
+	StopPipelineWorkers();
 	Save();
 	auto destroy = [this](const auto& pipelines) {
 		for (const auto& [key, pipeline]: pipelines) {
@@ -1100,6 +1102,8 @@ void PipelineCache::InitializeDriverCache(const std::filesystem::path& cache_pat
 }
 
 void PipelineCache::Save() {
+	// Workers create pipelines through the driver cache that is released below.
+	DrainPipelineJobs();
 	m_program_cache->SaveRecipes();
 	if (m_driver_cache == nullptr) {
 		return;
@@ -1316,7 +1320,7 @@ bool PipelineStaticParameters::operator==(const PipelineStaticParameters& other)
 	return std::memcmp(this, &other, sizeof(*this)) == 0;
 }
 
-PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
+PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(
     std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
     std::span<const ShaderVertexInputInfo> vertex_info, CommandBuffer& command,
     const ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
@@ -1486,7 +1490,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	}
 
 	if (auto iter = m_graphics_pipelines.find(key); iter != m_graphics_pipelines.end()) {
-		return *iter->second;
+		return iter->second->ready.load(std::memory_order_acquire) ? iter->second.get() : nullptr;
 	}
 
 	if (graphics_debug_dump_enabled()) {
@@ -1500,6 +1504,49 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	}
 
 	auto cached = std::make_unique<Pipeline>();
+	// Background creation: the draw is skipped until a worker finishes the pipeline, instead of
+	// stalling the GPU thread for the driver's compile. Small targets (lookup tables, data
+	// passes) and depth-less 1-pixel work are created at once, since later passes read them.
+	static const bool sync_pipelines = std::getenv("KYTY_SYNC_PIPELINES") != nullptr;
+	bool small_target = colors.empty() && !depth.image_id;
+	for (const auto& color: colors) {
+		const auto& extent = color.desc.info.extent;
+		small_target |= uint64_t {extent.width} * extent.height < 256u * 256u;
+	}
+	if (!sync_pipelines && !small_target) {
+		struct Job {
+			PipelineRenderingState             rendering;
+			PipelineVertexInputState           vertex_input;
+			std::vector<ShaderVertexInputInfo> vertex_info;
+			std::optional<ShaderPixelInputInfo> ps_input_info;
+			GraphicsPrograms                   programs;
+			PipelineStaticParameters           static_params;
+		};
+		auto job = std::make_shared<Job>(Job {
+		    .rendering     = rendering,
+		    .vertex_input  = key.vertex_input,
+		    .vertex_info   = {vertex_info.begin(), vertex_info.end()},
+		    .ps_input_info = ps_input_info != nullptr ? std::optional(*ps_input_info) : std::nullopt,
+		    .programs      = programs,
+		    .static_params = static_params,
+		});
+		cached->ready.store(false, std::memory_order_relaxed);
+		auto* target = cached.get();
+		auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
+		EXIT_IF(!inserted);
+		QueuePipelineJob([this, job, target] {
+			PerfScope pipeline_time(PerfCounter::PipelineCreate);
+			CreatePipelineInternal(m_graphics, *target, job->rendering, job->vertex_input,
+			                       job->vertex_info,
+			                       job->ps_input_info ? &*job->ps_input_info : nullptr,
+			                       job->programs, job->static_params, m_driver_cache);
+			EXIT_NOT_IMPLEMENTED(target->pipeline == nullptr);
+			EXIT_NOT_IMPLEMENTED(target->pipeline_layout == nullptr);
+			target->ready.store(true, std::memory_order_release);
+		});
+		NotePipelineCreated();
+		return nullptr;
+	}
 	LogPipelineTrace("CreatePipelineInternal begin", vs_id, ps_id);
 	PerfScope pipeline_time(PerfCounter::PipelineCreate);
 	CreatePipelineInternal(m_graphics, *cached, rendering, key.vertex_input, vertex_info,
@@ -1513,7 +1560,61 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	EXIT_IF(!inserted);
 	NotePipelineCreated();
 
-	return *iter->second;
+	return iter->second.get();
+}
+
+void PipelineCache::QueuePipelineJob(std::function<void()> job) {
+	std::unique_lock lock(m_pipeline_jobs_mutex);
+	if (m_pipeline_workers.empty()) {
+		// The GPU thread and the shader workers keep their cores; pipelines get the rest.
+		const auto hardware = std::max(std::thread::hardware_concurrency(), 4u);
+		const auto count    = std::clamp(hardware / 4u, 2u, 6u);
+		for (uint32_t i = 0; i < count; i++) {
+			m_pipeline_workers.emplace_back([this] {
+				for (;;) {
+					std::function<void()> next;
+					{
+						std::unique_lock worker_lock(m_pipeline_jobs_mutex);
+						m_pipeline_jobs_cv.wait(worker_lock, [this] {
+							return m_pipeline_workers_stop || !m_pipeline_jobs.empty();
+						});
+						if (m_pipeline_jobs.empty()) return;
+						next = std::move(m_pipeline_jobs.front());
+						m_pipeline_jobs.pop_front();
+						m_pipeline_jobs_running++;
+					}
+					next();
+					{
+						std::scoped_lock worker_lock(m_pipeline_jobs_mutex);
+						m_pipeline_jobs_running--;
+					}
+					m_pipeline_idle_cv.notify_all();
+				}
+			});
+		}
+	}
+	m_pipeline_jobs.push_back(std::move(job));
+	lock.unlock();
+	m_pipeline_jobs_cv.notify_one();
+}
+
+void PipelineCache::DrainPipelineJobs() {
+	std::unique_lock lock(m_pipeline_jobs_mutex);
+	m_pipeline_idle_cv.wait(lock, [this] {
+		return m_pipeline_jobs.empty() && m_pipeline_jobs_running == 0;
+	});
+}
+
+void PipelineCache::StopPipelineWorkers() {
+	{
+		std::scoped_lock lock(m_pipeline_jobs_mutex);
+		m_pipeline_workers_stop = true;
+	}
+	m_pipeline_jobs_cv.notify_all();
+	for (auto& worker: m_pipeline_workers) {
+		worker.join();
+	}
+	m_pipeline_workers.clear();
 }
 
 PipelineCache::Pipeline&
