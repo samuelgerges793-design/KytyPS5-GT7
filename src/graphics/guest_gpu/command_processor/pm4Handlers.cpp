@@ -291,8 +291,12 @@ static void HwCtxIgnoreAaMaskRegister([[maybe_unused]] uint32_t cmd_offset,
 
 static void HwCtxIgnoreAlphaToMaskRegister([[maybe_unused]] uint32_t value) {}
 
-static void HwCtxIgnoreDisabledUserClipPlane(CommandProcessor& cp, uint32_t value) {
-	EXIT_NOT_IMPLEMENTED(value != 0 || cp.GetCtx().GetClipControl().user_clip_planes != 0);
+// User clip plane coefficients are not applied (see ClipCheck); GT7 writes them in races.
+static void HwCtxIgnoreDisabledUserClipPlane([[maybe_unused]] CommandProcessor& cp, uint32_t value) {
+	static std::atomic_bool logged {false};
+	if (value != 0 && !logged.exchange(true)) {
+		Log::WriteToConsoleAndLog("PM4: user clip plane coefficients written; clip planes are not applied\n");
+	}
 }
 
 static void HwCtxIgnoreDrawPayloadControl([[maybe_unused]] uint32_t value) {}
