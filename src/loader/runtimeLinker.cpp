@@ -659,6 +659,57 @@ static bool IsReadableRange(uint64_t addr, uint64_t size) {
 // Diagnostics: lets the fault report name the module an address belongs to.
 static RuntimeLinker* g_fault_linker = nullptr;
 
+// Experimental crash guard (KYTY_NO_CALL_GUARD disables): guest code that calls through a null
+// or garbage function pointer faults on executing the target. When the return address on top
+// of the stack lies in guest code just after a call instruction, finish the call as if it
+// returned 0 instead of terminating.
+static bool LooksLikeCallBefore(uint64_t ret) {
+	if (!IsReadableRange(ret - 8, 8)) return false;
+	const auto* bytes = reinterpret_cast<const uint8_t*>(ret);
+	if (bytes[-5] == 0xe8) return true; // call rel32
+	// call r/m64: FF /2 with a 0, 1, 4 or 5-byte displacement and an optional SIB byte.
+	for (const int length: {2, 3, 4, 6, 7}) {
+		if (bytes[-length] == 0xff && ((bytes[-length + 1] >> 3u) & 7u) == 2u) return true;
+		if (length >= 3 && (bytes[-length] & 0xf0u) == 0x40u && bytes[-length + 1] == 0xff &&
+		    ((bytes[-length + 2] >> 3u) & 7u) == 2u)
+			return true;
+	}
+	return false;
+}
+
+static bool TryRecoverBadGuestCall(const Common::HostException::ExceptionInfo& info) {
+#ifdef _WIN32
+	static const bool enabled = std::getenv("KYTY_NO_CALL_GUARD") == nullptr;
+	if (!enabled || info.type != Common::HostException::ExceptionType::AccessViolation ||
+	    info.access_violation_type != Common::HostException::AccessViolationType::Execute ||
+	    info.exception_address != info.access_violation_vaddr || g_fault_linker == nullptr ||
+	    info.native_context == nullptr || !IsReadableRange(info.rsp, sizeof(uint64_t))) {
+		return false;
+	}
+	const auto ret     = *reinterpret_cast<const uint64_t*>(info.rsp);
+	const auto* caller = g_fault_linker->FindProgramByAddr(ret);
+	if (caller == nullptr || !LooksLikeCallBefore(ret)) {
+		return false;
+	}
+	static std::atomic_int reports = 0;
+	if (reports++ < 32) {
+		std::printf("call guard: guest called 0x%016" PRIx64 " from %s+0x%" PRIx64
+		            "; returning 0\n",
+		            info.exception_address, caller->file_name.filename().string().c_str(),
+		            ret - caller->base_vaddr);
+		std::fflush(stdout);
+	}
+	auto* context = static_cast<CONTEXT*>(info.native_context);
+	context->Rip  = ret;
+	context->Rsp += sizeof(uint64_t);
+	context->Rax  = 0;
+	return true;
+#else
+	(void)info;
+	return false;
+#endif
+}
+
 static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_info) {
 	const auto* info = &exception_info;
 
@@ -680,6 +731,9 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
 			return true;
 		}
+	}
+	if (TryRecoverBadGuestCall(*info)) {
+		return true;
 	}
 	// Report whatever guest context can be read safely before terminating: which guest thread
 	// faulted, the register file, the faulting code bytes and the top of its stack.
