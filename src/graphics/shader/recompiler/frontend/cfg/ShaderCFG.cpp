@@ -1,18 +1,14 @@
 #include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
 
 #include "common/assert.h"
-#include "common/logging/log.h"
 
 #include <algorithm>
-#include <atomic>
 #include <fmt/format.h>
 #include <iterator>
 #include <deque>
 #include <list>
 #include <map>
 #include <span>
-#include <utility>
-#include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::CFG {
 namespace {
@@ -1698,59 +1694,20 @@ uint32_t FindScalarDefinition(const Decoder::Program& program, const Graph& grap
 		return block.inst_begin <= before && before < block.inst_end;
 	});
 	EXIT_IF(found == graph.blocks.end());
-	// Every path back from `before` must reach the same definition (or the entry, meaning user
-	// data); paths through merges are searched separately and must agree.
-	constexpr uint32_t        Unset  = UINT32_MAX - 1u;
-	uint32_t                  result = Unset;
-	std::vector<uint32_t>     visited;
-	std::vector<std::pair<const BasicBlock*, uint32_t>> pending {{&*found, before}};
-	while (!pending.empty()) {
-		auto [block, from] = pending.back();
-		pending.pop_back();
-		uint32_t reached = Unset;
-		for (uint32_t i = from; i > block->inst_begin;) {
+	const auto* block = &*found;
+	for (size_t depth = 0; depth < graph.blocks.size(); ++depth) {
+		for (uint32_t i = before; i > block->inst_begin;) {
 			const auto& inst = program.instructions[--i];
-			if (inst.opcode == Opcode::S_SWAPPC_B64 && !MayWriteScalarRegister(inst, code)) {
-				// Experimental: assume the earlier callee preserves the traced register (the RDNA
-				// calling convention keeps s30 and above). Log the program so this can be checked.
-				static std::atomic_int reports = 0;
-				if (reports++ < 4) {
-					Log::WriteToConsoleAndLog(fmt::format(
-					    "warning: tracing s{} back from instruction {} crosses the call at pc "
-					    "0x{:08x}; assuming the callee preserves it{}\n{}",
-					    code, before, inst.pc, code < 30u ? " (UNSAFE: below s30)" : "",
-					    reports == 1 ? Decoder::ProgramToString(program) : std::string()));
-				}
-				continue;
-			}
-			if (MayWriteScalarRegister(inst, code)) {
-				reached = i;
-				break;
-			}
+			EXIT_IF(inst.opcode == Opcode::S_SWAPPC_B64);
+			if (MayWriteScalarRegister(inst, code)) return i;
 		}
-		if (reached == Unset && block->id == graph.entry_block) reached = UINT32_MAX;
-		if (reached != Unset) {
-			if (result != Unset && result != reached) {
-				EXIT("scalar shader call source s%u has different definitions on merging paths "
-				     "(instructions %u and %u)\n",
-				     code, result, reached);
-			}
-			result = reached;
-			continue;
-		}
-		EXIT_IF(block->predecessors.empty());
-		for (const auto predecessor: block->predecessors) {
-			if (std::ranges::find(visited, predecessor) != visited.end()) continue;
-			visited.push_back(predecessor);
-			const auto* previous = graph.FindBlock(predecessor);
-			EXIT_IF(previous == nullptr);
-			pending.emplace_back(previous, previous->inst_end);
-		}
+		if (block->id == graph.entry_block) return UINT32_MAX;
+		EXIT_IF(block->predecessors.size() != 1u);
+		block = graph.FindBlock(block->predecessors[0]);
+		EXIT_IF(block == nullptr);
+		before = block->inst_end;
 	}
-	if (result == Unset) {
-		EXIT("scalar shader call source has cyclic reaching definitions");
-	}
-	return result;
+	EXIT("scalar shader call source has cyclic reaching definitions");
 }
 
 std::string BranchConditionToString(BranchCondition condition) {
