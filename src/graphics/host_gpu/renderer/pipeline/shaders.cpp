@@ -23,10 +23,14 @@
 #include <atomic>
 #include <bit>
 #include <chrono>
+#include <cstdio>
+#include <ctime>
 #include <fmt/format.h>
 #include <limits>
+#include <mutex>
 #include <span>
 #include <vector>
+#include <xxhash.h>
 
 namespace Libs::Graphics {
 
@@ -45,7 +49,7 @@ public:
 
 	const void* Chain() const { return &m_info; }
 
-	void Report(const char* kind) const {
+	void Report(const char* kind, uint64_t fingerprint) const {
 		const auto ns = static_cast<uint64_t>(
 		    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
 		                                                         m_start)
@@ -59,17 +63,63 @@ public:
 		PerfAdd(hit ? PerfCounter::PipelineCacheHit : PerfCounter::PipelineCacheMiss, ns);
 		static std::atomic<uint32_t> logged {0};
 		if (!hit && ns > 50'000'000ull && logged.fetch_add(1, std::memory_order_relaxed) < 40) {
-			Log::WriteToConsoleAndLog(fmt::format("pipeline cache miss: {} {:.0f} ms{}\n", kind,
-			                                      static_cast<double>(ns) / 1e6,
+			Log::WriteToConsoleAndLog(fmt::format("pipeline cache miss: {} {:016x} {:.0f} ms{}\n", kind,
+			                                      fingerprint, static_cast<double>(ns) / 1e6,
 			                                      valid ? "" : " (driver gave no feedback)"));
 		}
+		WriteFingerprint(kind, fingerprint, hit, ns);
 	}
 
 private:
+	// One line per created pipeline in _gt7_pipelines_<time>.txt: comparing two runs shows whether
+	// a pipeline that missed was already created before (the cache lost it) or is new content.
+	static void WriteFingerprint(const char* kind, uint64_t fingerprint, bool hit, uint64_t ns) {
+		static std::mutex mutex;
+		static FILE*      file = [] {
+			const auto now = std::time(nullptr);
+			std::tm    local {};
+			localtime_s(&local, &now);
+			char name[64] = {};
+			std::strftime(name, sizeof(name), "_gt7_pipelines_%Y%m%d_%H%M%S.txt", &local);
+			return std::fopen(name, "w");
+		}();
+		if (file == nullptr) return;
+		std::scoped_lock lock(mutex);
+		std::fprintf(file, "%s %016llx %s %.1f\n", hit ? "hit " : "miss", static_cast<unsigned long long>(fingerprint),
+		             kind, static_cast<double>(ns) / 1e6);
+		std::fflush(file);
+	}
+
 	vk::PipelineCreationFeedback           m_feedback {};
 	vk::PipelineCreationFeedbackCreateInfo m_info {};
 	std::chrono::steady_clock::time_point  m_start = std::chrono::steady_clock::now();
 };
+
+// Identifies a graphics pipeline by content (SPIR-V and state), so it is stable across runs.
+uint64_t GraphicsPipelineFingerprint(const PipelineRenderingState&          rendering,
+                                     const PipelineVertexInputState&        vertex_input,
+                                     const PipelineCache::GraphicsPrograms& programs,
+                                     const PipelineStaticParameters& static_params, bool ps_active) {
+	uint64_t   hash = 0;
+	const auto mix  = [&hash](uint64_t value) { hash = XXH3_64bits_withSeed(&value, sizeof(value), hash); };
+	for (const auto& program: programs.vertex) mix(program.spirv_hash);
+	mix(ps_active ? programs.pixel.spirv_hash : 0);
+	mix(rendering.color_count);
+	for (uint32_t i = 0; i < rendering.color_count; i++) mix(static_cast<uint64_t>(rendering.color_formats[i]));
+	mix(static_cast<uint64_t>(rendering.depth_format));
+	mix(static_cast<uint64_t>(rendering.stencil_format));
+	mix(vertex_input.binding_count);
+	for (uint32_t i = 0; i < vertex_input.binding_count; i++) {
+		mix(vertex_input.bindings[i].stride);
+		mix(vertex_input.bindings[i].instance ? 1u : 0u);
+	}
+	mix(vertex_input.attribute_count);
+	for (uint32_t i = 0; i < vertex_input.attribute_count; i++) {
+		mix(vertex_input.attributes[i].offset);
+		mix(vertex_input.attributes[i].binding);
+	}
+	return XXH3_64bits_withSeed(&static_params, sizeof(static_params), hash);
+}
 
 } // namespace
 
@@ -592,7 +642,8 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	pipeline_info.pNext = feedback.Chain();
 	result = graphics.device.createGraphicsPipelines(driver_cache, 1, &pipeline_info, nullptr,
 	                                                 &pipeline.pipeline);
-	feedback.Report("graphics");
+	feedback.Report("graphics", GraphicsPipelineFingerprint(rendering, vertex_input, programs,
+	                                                       static_params, ps_active));
 	if (graphics_debug_dump_enabled()) {
 		LOGF("PipelineTrace: vkCreateGraphicsPipelines done result=%s pipeline=%p\n",
 		     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));
@@ -612,7 +663,8 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                             const ShaderComputeInputInfo& input_info,
-                            vk::ShaderModule compute_module, vk::PipelineCache driver_cache) {
+                            vk::ShaderModule compute_module, vk::PipelineCache driver_cache,
+                            uint64_t spirv_hash) {
 	EXIT_IF(compute_module == nullptr);
 
 	vk::PipelineShaderStageCreateInfo                     comp_shader_stage_info {};
@@ -666,7 +718,7 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	info.pNext = feedback.Chain();
 	result = graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr,
 	                                                &pipeline.pipeline);
-	feedback.Report("compute");
+	feedback.Report("compute", spirv_hash ^ (uint64_t {input_info.stage.program->wave_size} << 56u));
 	LOGF("PipelineTrace: vkCreateComputePipelines done result=%s pipeline=%p\n",
 	     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);

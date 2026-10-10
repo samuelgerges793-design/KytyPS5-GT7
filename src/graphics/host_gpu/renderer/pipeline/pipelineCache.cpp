@@ -586,7 +586,10 @@ struct PipelineCache::ProgramCache {
 		    .function_code  = {function_code.begin(), function_code.end()},
 		    .specialization = std::move(specialization),
 		    .program        = std::move(result.program).TakeCompiledInfo(),
-		    .handle         = {.id = 0, .module = module},
+		    .handle         = {.id         = 0,
+		                       .module     = module,
+		                       .spirv_hash = XXH3_64bits(result.spirv.data(),
+		                                                 result.spirv.size() * sizeof(uint32_t))},
 		};
 	}
 
@@ -1904,7 +1907,8 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 
 	auto cached = std::make_unique<Pipeline>();
 	PerfScope pipeline_time(PerfCounter::PipelineCreate);
-	CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module, m_driver_cache);
+	CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module, m_driver_cache,
+	                       compute_program.spirv_hash);
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);

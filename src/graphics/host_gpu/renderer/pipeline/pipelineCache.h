@@ -104,6 +104,8 @@ struct PipelineVertexInputState {
 struct ShaderProgram {
 	uint64_t         id     = 0;
 	vk::ShaderModule module = nullptr;
+	// Content hash of the SPIR-V: the same across runs when the generated code is the same.
+	uint64_t         spirv_hash = 0;
 
 	explicit operator bool() const { return id != 0 && module != nullptr; }
 };
@@ -246,7 +248,8 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
                             vk::PipelineCache                      driver_cache);
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                             const ShaderComputeInputInfo& input_info,
-                            vk::ShaderModule compute_module, vk::PipelineCache driver_cache);
+                            vk::ShaderModule compute_module, vk::PipelineCache driver_cache,
+                            uint64_t spirv_hash = 0);
 
 } // namespace Libs::Graphics
 

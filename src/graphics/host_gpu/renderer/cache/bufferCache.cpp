@@ -14,8 +14,10 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cinttypes>
 #include <cstring>
+#include <fmt/format.h>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -443,10 +445,19 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 
 // Uploads read guest memory through its unprotected backing: a page another range keeps
 // read-protected for GPU-dirty data must not fault while the tracker runs its upload callback.
+// A buffer can extend past the game's mappings (stream growth reserves room ahead), so a range
+// may cross an unmapped gap; the sparse read fills gaps with zeros instead of faulting on them.
 static void ReadUploadSource(uint8_t* dst, uint64_t address, uint64_t size) {
-	if (!Libs::LibKernel::Memory::TryReadBacking(address, dst, size)) {
-		std::memcpy(dst, reinterpret_cast<const void*>(address), size);
+	if (Libs::LibKernel::Memory::TryReadBacking(address, dst, size) ||
+	    Libs::LibKernel::Memory::TryReadSparseBacking(address, dst, size)) {
+		return;
 	}
+	static std::atomic<uint32_t> logged {0};
+	if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "BufferCache: upload reads guest memory directly at 0x{:x} size 0x{:x}\n", address, size));
+	}
+	std::memcpy(dst, reinterpret_cast<const void*>(address), size);
 }
 
 vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
