@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <cstdlib>
 #include <functional>
 #include <optional>
 #include <type_traits>
@@ -123,7 +124,32 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block) {
 				EmitReturn(ctx);
 				return;
 			}
-			const auto condition = ctx.Def(block->condition);
+			auto condition = ctx.Def(block->condition);
+			if (const auto guard = ctx.state.loop_watchdogs.find(block);
+			    guard != ctx.state.loop_watchdogs.end()) {
+				// Leave the loop through its existing exit once the counter passes the limit.
+				auto&      builder = ctx.state.builder;
+				const auto loaded  = builder.AllocateId();
+				const auto counted = builder.AllocateId();
+				const auto over    = builder.AllocateId();
+				const auto guarded = builder.AllocateId();
+				builder.AddFunction(spv::OpLoad, TypeU32(ctx.state), loaded, guard->second);
+				builder.AddFunction(spv::OpIAdd, TypeU32(ctx.state), counted, loaded,
+				                    ConstantU32(ctx.state, 1));
+				builder.AddFunction(spv::OpStore, guard->second, counted);
+				builder.AddFunction(spv::OpUGreaterThan, TypeBool(ctx.state), over, counted,
+				                    ConstantU32(ctx.state, 1u << 20u));
+				if (term.merge_block == true_block) {
+					builder.AddFunction(spv::OpLogicalOr, TypeBool(ctx.state), guarded, condition,
+					                    over);
+				} else {
+					const auto stay = builder.AllocateId();
+					builder.AddFunction(spv::OpLogicalNot, TypeBool(ctx.state), stay, over);
+					builder.AddFunction(spv::OpLogicalAnd, TypeBool(ctx.state), guarded, condition,
+					                    stay);
+				}
+				condition = guarded;
+			}
 			emit_merge();
 			ctx.state.builder.AddFunction(spv::OpBranchConditional, condition,
 			                              true_block->Definition(), false_block->Definition());
@@ -715,6 +741,23 @@ void EmitProgram(EmitterState& state) {
 			                          lane.scratch_u32_variable, spv::StorageClassFunction);
 		}
 	}
+	state.loop_watchdogs.clear();
+	static const bool watchdog = std::getenv("KYTY_NO_LOOP_WATCHDOG") == nullptr;
+	if (watchdog && !state.program.dispatcher_fallback) {
+		for (const auto* block: program.blocks) {
+			const auto& term = block->terminator;
+			if (term.loop_header && term.kind == CFG::TerminatorKind::ConditionalBranch &&
+			    term.merge_block != nullptr && term.continue_block != nullptr &&
+			    !block->condition.IsEmpty() &&
+			    (term.merge_block == term.true_block || term.merge_block == term.false_block)) {
+				const auto counter = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpVariable,
+				                          TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
+				                          counter, spv::StorageClassFunction);
+				state.loop_watchdogs.emplace(block, counter);
+			}
+		}
+	}
 	if (state.gds_variable != 0) {
 		state.gds_length = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpArrayLength, TypeU32(state), state.gds_length,
@@ -734,6 +777,9 @@ void EmitProgram(EmitterState& state) {
 		const auto index = EmitAddU32(state, group_x, EmitBinaryU32(state, spv::OpIMul, row, count_x));
 		state.lds_base_dwords = EmitBinaryU32(state, spv::OpIMul, index,
 		                                     ConstantU32(state, LdsDwordCount(state)));
+	}
+	for (const auto& [block, counter]: state.loop_watchdogs) {
+		state.builder.AddFunction(spv::OpStore, counter, ConstantU32(state, 0));
 	}
 	EmitMemoryOffsets(state);
 	if (program.blocks.empty()) {
