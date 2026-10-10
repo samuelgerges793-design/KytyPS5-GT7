@@ -1015,18 +1015,10 @@ void PipelineCache::InitializeCaches(const std::filesystem::path& directory,
 		return;
 	}
 	m_program_cache->Load(directory / (title_id + ".shaders.bin"),
-	                      CacheSignature("KytySC1", KYTY_GRAPHICS_CACHE_VERSION,
+	                      // Development builds keep their recipes: each one is only compile
+	                      // input, and lookups still check the key and specialization.
+	                      CacheSignature("KytySC1", "gt7-dev",
 	                                     m_graphics.GetPhysicalDeviceProperties()));
-	const std::string_view git_hash     = KYTY_GIT_HASH;
-	const std::string_view git_revision = KYTY_GIT_REVISION;
-	if (git_hash == "unknown" || git_revision == "unknown") {
-		PipelineCacheLog("Vulkan pipeline cache: disabled (unknown git revision)");
-		return;
-	}
-	if (git_hash.ends_with("-dirty")) {
-		PipelineCacheLog("Vulkan pipeline cache: disabled (dirty build)");
-		return;
-	}
 	InitializeDriverCache(directory / (title_id + ".bin"));
 }
 
