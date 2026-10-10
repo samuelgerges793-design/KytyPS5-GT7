@@ -821,6 +821,7 @@ struct PipelineCache::ProgramCache {
 			auto& job             = iter->second;
 			if (inserted) {
 				job.state = Job::State::Taken;
+				NoteRecipeMiss(key);
 				return programs.end();
 			}
 			switch (job.state) {
@@ -866,6 +867,50 @@ struct PipelineCache::ProgramCache {
 			permutation.handle.id = ++next_shader_id;
 		}
 		return programs.emplace(key, std::move(*result)).first;
+	}
+
+	// A key with no recorded recipe, while recipes of the same shader exist: logs how the key
+	// differs from the closest one, to find state that changes between runs. Under job_mutex.
+	void NoteRecipeMiss(const ProgramKey& key) {
+		if (!VariantLog::Get().Enabled()) return;
+		static uint32_t logged = 0;
+		const ProgramKey* closest = nullptr;
+		size_t            closest_diffs = SIZE_MAX;
+		for (const auto& [other, job]: jobs) {
+			if (other.stage != key.stage || other.hash != key.hash || &other == &key ||
+			    other == key || job.state == Job::State::Taken) {
+				continue;
+			}
+			size_t diffs = (other.user_data_count != key.user_data_count) +
+			               (other.code_size != key.code_size) +
+			               (other.static_state.size() != key.static_state.size()) * 100u;
+			for (size_t i = 0; i < std::min(other.static_state.size(), key.static_state.size()); i++) {
+				diffs += other.static_state[i] != key.static_state[i];
+			}
+			if (diffs < closest_diffs) {
+				closest       = &other;
+				closest_diffs = diffs;
+			}
+		}
+		if (closest == nullptr || logged >= 300) return;
+		logged++;
+		std::string text = fmt::format("recipe miss: {} 0x{:016x}:", static_cast<int>(key.stage), key.hash);
+		if (closest->user_data_count != key.user_data_count) {
+			text += fmt::format(" user_data_count({}->{})", closest->user_data_count, key.user_data_count);
+		}
+		if (closest->code_size != key.code_size) {
+			text += fmt::format(" code_size({}->{})", closest->code_size, key.code_size);
+		}
+		if (closest->static_state.size() != key.static_state.size()) {
+			text += fmt::format(" static_size({}->{})", closest->static_state.size(), key.static_state.size());
+		}
+		uint32_t shown = 0;
+		for (size_t i = 0; i < std::min(closest->static_state.size(), key.static_state.size()); i++) {
+			if (closest->static_state[i] != key.static_state[i] && shown++ < 8) {
+				text += fmt::format(" word{}({:x}->{:x})", i, closest->static_state[i], key.static_state[i]);
+			}
+		}
+		Log::WriteToConsoleAndLog(text + "\n");
 	}
 
 	// Wakes once the job has ended, whether its result is still there (Done) or adopted (Taken).
