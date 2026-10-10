@@ -12,6 +12,7 @@
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
+#include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
@@ -430,9 +431,11 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		}
 	}
 
-	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
-	DebugNoteDispatch(thread_group_x, thread_group_y, thread_group_z, false, 0);
-	vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
+	if (!ShaderRecompiler::SkipRuntimeCallShader(program.shader_hash)) {
+		vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
+		DebugNoteDispatch(thread_group_x, thread_group_y, thread_group_z, false, 0);
+		vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
+	}
 
 	// The removed host fence also ordered read-only dispatches before later writers.
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
@@ -497,9 +500,11 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	                              vk::PipelineStageFlagBits::eTransfer,
 	                          vk::PipelineStageFlagBits::eDrawIndirect, {},
 	                          1, &barrier, 0, nullptr, 0, nullptr);
-	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
-	DebugNoteDispatch(0, 0, 0, true, args_addr);
-	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
+	if (!ShaderRecompiler::SkipRuntimeCallShader(program.shader_hash)) {
+		vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
+		DebugNoteDispatch(0, 0, 0, true, args_addr);
+		vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
+	}
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	ResetBindings();
 	if (DebugSyncSubmitEnabled()) {

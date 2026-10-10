@@ -62,6 +62,11 @@ struct ShaderSource {
 
 [[nodiscard]] const ShaderSource::Call* FindCall(const ShaderSource& source, uint32_t instruction);
 
+// Experimental: shaders whose calls pick their callee at runtime. Their dispatches are skipped
+// unless KYTY_RUN_RUNTIME_CALL_SHADERS is set.
+void               MarkRuntimeCallShader(uint64_t shader_hash);
+[[nodiscard]] bool SkipRuntimeCallShader(uint64_t shader_hash);
+
 [[nodiscard]] ShaderSource PrepareShaderSource(std::span<const uint32_t> code,
 	                                           const CompileOptions& options);
 const Decoder::Program& RefreshShaderSource(ShaderSource& source, const IR::SrtRuntime& runtime);

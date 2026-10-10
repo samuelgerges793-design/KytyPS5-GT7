@@ -19,6 +19,9 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
+#include <unordered_set>
+#include <mutex>
 #include <atomic>
 #include <chrono>
 #include <fmt/format.h>
@@ -671,6 +674,23 @@ void PrepareCallTarget(ShaderSource& source, const CompileOptions& options) {
 
 } // namespace
 
+namespace {
+std::mutex                   g_runtime_call_mutex;
+std::unordered_set<uint64_t> g_runtime_call_shaders;
+} // namespace
+
+void MarkRuntimeCallShader(uint64_t shader_hash) {
+	std::scoped_lock lock(g_runtime_call_mutex);
+	g_runtime_call_shaders.insert(shader_hash);
+}
+
+bool SkipRuntimeCallShader(uint64_t shader_hash) {
+	static const bool run = std::getenv("KYTY_RUN_RUNTIME_CALL_SHADERS") != nullptr;
+	if (run) return false;
+	std::scoped_lock lock(g_runtime_call_mutex);
+	return g_runtime_call_shaders.contains(shader_hash);
+}
+
 ShaderSource PrepareShaderSource(std::span<const uint32_t> code, const CompileOptions& options) {
 	EXIT_IF(code.empty());
 	ShaderSource source;
@@ -703,6 +723,7 @@ ShaderSource PrepareShaderSource(std::span<const uint32_t> code, const CompileOp
 					inst.src_count = 0;
 				}
 			}
+			MarkRuntimeCallShader(options.shader_hash);
 			source.decoded.has_swap_pc = false;
 			source.calls.clear();
 			source.call_targets = {};
