@@ -21,6 +21,8 @@
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <fmt/format.h>
+#include <string>
 #include <array>
 #include <atomic>
 #include <cstdio>
@@ -741,6 +743,13 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			const auto  dump_begin = (offset > 8 ? offset - 8 : 0);
 			const auto  dump_end   = std::min<uint32_t>(total_dw, offset + 16);
 			auto* const base       = packet - offset;
+			std::string text = fmt::format("unknown PM4 packet at offset 0x{:05x} of {} dwords, buffer 0x{:x}:",
+			                               offset, total_dw, reinterpret_cast<uint64_t>(base));
+			for (uint32_t i = dump_begin; i < dump_end; i++) {
+				text += fmt::format("{}{:05x}{} {:08x}", i % 4 == 0 ? "\n  " : "  ", i,
+				                    i == offset ? "*" : " ", base[i]);
+			}
+			Log::WriteToConsoleAndLog(text + "\n");
 			for (uint32_t i = dump_begin; i < dump_end; i++) {
 				LOGF("\t%05" PRIx32 "%s %08" PRIx32 "\n", i, (i == offset ? ":" : " "), base[i]);
 			}
