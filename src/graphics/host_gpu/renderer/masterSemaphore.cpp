@@ -141,6 +141,29 @@ void DebugPrintHostBacktrace(const char* reason) {
 #endif
 }
 
+namespace {
+
+std::vector<uint64_t> ParseHashList(const char* name) {
+	std::vector<uint64_t> list;
+	if (const char* env = std::getenv(name); env != nullptr) {
+		const std::string text(env);
+		size_t start = 0;
+		while (start < text.size()) {
+			const auto end = std::min(text.find(',', start), text.size());
+			if (end > start) list.push_back(std::stoull(text.substr(start, end - start), nullptr, 16));
+			start = end + 1;
+		}
+	}
+	return list;
+}
+
+} // namespace
+
+bool DumpShaderInputs(uint64_t hash) {
+	static const std::vector<uint64_t> hashes = ParseHashList("KYTY_DUMP_SHADERS");
+	return !hashes.empty() && std::ranges::find(hashes, hash) != hashes.end();
+}
+
 bool SerializeShader(uint64_t hash) {
 	static const std::vector<uint64_t> hashes = [] {
 		std::vector<uint64_t> list;

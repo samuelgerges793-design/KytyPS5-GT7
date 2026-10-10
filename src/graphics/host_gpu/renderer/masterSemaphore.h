@@ -50,6 +50,8 @@ bool DebugSyncSubmitEnabled();
 // Shaders listed in KYTY_SERIALIZE_SHADERS (comma-separated hashes) wait for recorded GPU work
 // before their setup reads guest memory, and their dispatches run on their own.
 bool SerializeShader(uint64_t hash);
+// Compute shaders listed in KYTY_DUMP_SHADERS log their user data and the table at s[0:1].
+bool DumpShaderInputs(uint64_t hash);
 // VK_NV_device_diagnostic_checkpoints markers, enabled with KYTY_CHECKPOINTS=1.
 void  DebugSetCheckpointsEnabled(bool enabled);
 bool  DebugCheckpointsEnabled();

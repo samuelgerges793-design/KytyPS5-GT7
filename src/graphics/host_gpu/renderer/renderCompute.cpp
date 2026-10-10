@@ -24,6 +24,7 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
 #include "kernel/eventQueue.h"
+#include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 
@@ -432,6 +433,31 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		}
 	}
 
+	if (DumpShaderInputs(program.shader_hash)) {
+		static std::atomic_int dumps = 0;
+		if (dumps++ < 20) {
+			const auto& user = cs_regs.cs_user_sgpr;
+			auto text = fmt::format("dispatch CS 0x{:016x} groups={}x{}x{} user_data:",
+			                        program.shader_hash, thread_group_x, thread_group_y,
+			                        thread_group_z);
+			for (uint32_t i = 0; i < user.count && i < HW::UserSgprInfo::SGPRS_MAX; i++) {
+				text += fmt::format(" s{}={:08x}", i, user.value[i]);
+			}
+			const uint64_t table =
+			    ((uint64_t(user.value[1] & 0xffffu) << 32u) | user.value[0]) & ~uint64_t {3};
+			std::array<uint32_t, 96> words {};
+			if (user.count >= 2 && table != 0 &&
+			    Libs::LibKernel::Memory::TryReadBacking(table, words.data(),
+			                                             sizeof(words))) {
+				text += fmt::format("\n  table 0x{:x}:", table);
+				for (uint32_t i = 0; i < words.size(); i++) {
+					if (i % 8 == 0) text += fmt::format("\n   +{:3}:", i * 4);
+					text += fmt::format(" {:08x}", words[i]);
+				}
+			}
+			Log::WriteToConsoleAndLog(text + "\n");
+		}
+	}
 	if (!ShaderRecompiler::SkipRuntimeCallShader(program.shader_hash)) {
 		vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 		DebugNoteDispatch(thread_group_x, thread_group_y, thread_group_z, false, 0);
