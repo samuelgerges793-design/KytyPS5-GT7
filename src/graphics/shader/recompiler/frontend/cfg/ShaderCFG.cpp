@@ -4,11 +4,14 @@
 
 #include <algorithm>
 #include <fmt/format.h>
+#include <functional>
 #include <iterator>
 #include <deque>
 #include <list>
 #include <map>
+#include <set>
 #include <span>
+#include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::CFG {
 namespace {
@@ -1688,26 +1691,56 @@ bool MayWriteScalarRegister(const Decoder::Instruction& inst, uint32_t code) {
 }
 
 uint32_t FindScalarDefinition(const Decoder::Program& program, const Graph& graph,
-                              uint32_t before, uint32_t code) {
+                              uint32_t before, uint32_t code,
+                              const std::function<bool(uint32_t)>& confirm) {
 	EXIT_IF(before >= program.instructions.size());
 	const auto found = std::ranges::find_if(graph.blocks, [before](const auto& block) {
 		return block.inst_begin <= before && before < block.inst_end;
 	});
 	EXIT_IF(found == graph.blocks.end());
-	const auto* block = &*found;
-	for (size_t depth = 0; depth < graph.blocks.size(); ++depth) {
-		for (uint32_t i = before; i > block->inst_begin;) {
+	using BlockT = std::remove_cvref_t<decltype(*found)>;
+
+	std::set<uint32_t> defs;     // definitions found (UINT32_MAX = comes from outside shader)
+	std::set<uint32_t> visited;  // blocks already fully scanned
+	std::vector<std::pair<const BlockT*, uint32_t>> work;
+	work.emplace_back(&*found, before);
+
+	while (!work.empty()) {
+		auto [block, from] = work.back();
+		work.pop_back();
+		bool done = false;
+		for (uint32_t i = from; i > block->inst_begin;) {
 			const auto& inst = program.instructions[--i];
-			EXIT_IF(inst.opcode == Opcode::S_SWAPPC_B64);
-			if (MayWriteScalarRegister(inst, code)) return i;
+			if (!MayWriteScalarRegister(inst, code)) {
+				continue;
+			}
+			if (confirm && !confirm(i)) {
+				continue;  // false positive "dst + 1"
+			}
+			defs.insert(i);
+			done = true;
+			break;
 		}
-		if (block->id == graph.entry_block) return UINT32_MAX;
-		EXIT_IF(block->predecessors.size() != 1u);
-		block = graph.FindBlock(block->predecessors[0]);
-		EXIT_IF(block == nullptr);
-		before = block->inst_end;
+		if (done) continue;
+		if (block->id == graph.entry_block) {
+			defs.insert(UINT32_MAX);
+			continue;
+		}
+		EXIT_IF(block->predecessors.empty());
+		for (auto p: block->predecessors) {
+			const auto* pb = graph.FindBlock(p);
+			EXIT_IF(pb == nullptr);
+			if (!visited.insert(static_cast<uint32_t>(pb->id)).second) continue;
+			work.emplace_back(pb, pb->inst_end);
+		}
 	}
-	EXIT("scalar shader call source has cyclic reaching definitions");
+	if (defs.size() != 1u) {
+		printf("FSD: s%u from %u has %zu distinct definitions:", code, before, defs.size());
+		for (auto d: defs) printf(" %d", d == UINT32_MAX ? -1 : (int)d);
+		printf("\n");
+	}
+	EXIT_NOT_IMPLEMENTED(defs.size() != 1u);
+	return *defs.begin();
 }
 
 std::string BranchConditionToString(BranchCondition condition) {

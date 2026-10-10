@@ -54,11 +54,13 @@ struct ShaderSource {
 	std::vector<uint32_t> code;
 	Decoder::Program decoded;
 	IR::ResourcePlan call_targets;
-	std::optional<Call> call;
+	std::vector<Call> calls;
 	std::optional<Linked> linked;
 	uint64_t revision = 0;
 	std::vector<std::pair<uint64_t, uint64_t>> reads;
 };
+
+[[nodiscard]] const ShaderSource::Call* FindCall(const ShaderSource& source, uint32_t instruction);
 
 [[nodiscard]] ShaderSource PrepareShaderSource(std::span<const uint32_t> code,
 	                                           const CompileOptions& options);
