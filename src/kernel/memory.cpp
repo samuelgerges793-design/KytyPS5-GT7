@@ -22,6 +22,8 @@
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
+#include <unordered_set>
+#include <fmt/format.h>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -891,6 +893,16 @@ bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 			return false;
 		}
 		auto& buffers = GetGpuResources().GetBufferCache();
+		if (GetGpuResources().GetTextureCache().HasGpuModifiedImageInRegion(vaddr, size)) {
+			static std::mutex                  logged_mutex;
+			static std::unordered_set<uint64_t> logged;
+			std::scoped_lock                    lock(logged_mutex);
+			if (logged.size() < 64 && logged.insert(vaddr >> 12u).second) {
+				Log::WriteToConsoleAndLog(fmt::format(
+				    "stale-risk: shader setup read 0x{:x} (+{}) overlaps a GPU-written image\n",
+				    vaddr, size));
+			}
+		}
 		if (buffers.HasGpuDirtyBytes(vaddr, size)) {
 			buffers.ReadMemory(vaddr, size);
 		}
