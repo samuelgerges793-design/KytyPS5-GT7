@@ -1734,13 +1734,8 @@ uint32_t FindScalarDefinition(const Decoder::Program& program, const Graph& grap
 			work.emplace_back(pb, pb->inst_end);
 		}
 	}
-	if (defs.size() != 1u) {
-		printf("FSD: s%u from %u has %zu distinct definitions:", code, before, defs.size());
-		for (auto d: defs) printf(" %d", d == UINT32_MAX ? -1 : (int)d);
-		printf("\n");
-	}
-	EXIT_NOT_IMPLEMENTED(defs.size() != 1u);
-	return *defs.begin();
+	EXIT_IF(defs.empty());
+	return defs.size() == 1u ? *defs.begin() : AmbiguousScalarDefinition;
 }
 
 std::string BranchConditionToString(BranchCondition condition) {

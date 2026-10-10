@@ -603,6 +603,7 @@ void PrepareCallTarget(ShaderSource& source, const CompileOptions& options) {
 			    if (!p.ready) throw DynamicCallTarget {};  // circular dependency
 			    return p.values.contains(code);
 		    });
+		if (index == CFG::AmbiguousScalarDefinition) throw DynamicCallTarget {};
 		if (index == UINT32_MAX) {
 			if (code < query.user_data_base || code - query.user_data_base >= query.user_data_count)
 				throw DynamicCallTarget {};

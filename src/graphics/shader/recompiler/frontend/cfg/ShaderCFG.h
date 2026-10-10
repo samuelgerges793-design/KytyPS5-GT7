@@ -115,6 +115,8 @@ struct Graph {
 
 Graph       BuildGraph(const Decoder::Program& program);
 bool MayWriteScalarRegister(const Decoder::Instruction& inst, uint32_t code);
+// Returned by FindScalarDefinition when different paths define the register.
+inline constexpr uint32_t AmbiguousScalarDefinition = UINT32_MAX - 1u;
 uint32_t FindScalarDefinition(const Decoder::Program& program, const Graph& graph,
                               uint32_t before, uint32_t code,
                               const std::function<bool(uint32_t)>& confirm = {});
