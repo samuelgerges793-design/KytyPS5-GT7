@@ -1866,8 +1866,11 @@ bool TextureCache::ReadbackGpuWrites(uint64_t address, uint64_t size) {
 			static std::atomic_int reports = 0;
 			if (reports++ < 16) {
 				Log::WriteToConsoleAndLog(fmt::format(
-				    "stale-risk: cannot copy back image 0x{:x} (+{}) for a shader setup read{}",
-				    owner->info.data.address, owner->info.data.size, "\n"));
+				    "stale-risk: cannot copy back image 0x{:x} (+{}) for a shader setup read "
+				    "(depth={} tiled={} buffer_modified={} cpu_dirty={})\n",
+				    owner->info.data.address, owner->info.data.size, owner->depth_id ? 1 : 0,
+				    owner->info.IsTiled() ? 1 : 0, owner->IsBufferModified() ? 1 : 0,
+				    owner->IsCpuDirty() ? 1 : 0));
 			}
 		}
 	}
