@@ -90,7 +90,9 @@ constexpr size_t   PTHREAD_STACK_DEFAULT   = 0x100000;
 constexpr size_t   GUEST_PTHREAD_STACK_MIN = 0x4000;
 constexpr size_t   PTHREAD_STACK_PAGE      = 0x4000;
 constexpr size_t   PTHREAD_STACK_INITIAL   = 0x200000;
-constexpr size_t   PTHREAD_STACK_EXTRA     = 0x100000;
+// Host code (HLE calls, unwinding through Kyty frames) runs on guest stacks; an overflow there
+// cannot even report itself, so leave generous headroom.
+constexpr size_t   PTHREAD_STACK_EXTRA     = 0x400000;
 constexpr uint64_t PTHREAD_STACK_TOP       = 0x7efff8000ull;
 constexpr uint64_t PTHREAD_STACK_BOTTOM    = 0x0000040000ull;
 constexpr uint32_t SIGNAL_APC_POLL_MICROS  = 10000;
