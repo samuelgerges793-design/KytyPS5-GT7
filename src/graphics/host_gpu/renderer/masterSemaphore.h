@@ -68,6 +68,9 @@ enum class PerfCounter {
 	// Guest CPU accesses to protected pages (time includes any GPU readback and wait).
 	CpuReadFault,
 	CpuWriteFault,
+	// CPU writes to GPU-written buffer pages: synchronous readbacks, and ones skipped.
+	WriteReadback,
+	WriteReadbackSkipped,
 	Count
 };
 void PerfAdd(PerfCounter counter, uint64_t nanoseconds);

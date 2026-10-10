@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/masterSemaphore.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -16,9 +17,11 @@
 #include <algorithm>
 #include <atomic>
 #include <cinttypes>
+#include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
 #include <memory>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -285,6 +288,22 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		if (is_write && !IsRegionRegistered(vaddr, size)) {
 			return;
 		}
+		// Experimental (KYTY_NO_WRITE_READBACK): a CPU write to a GPU-written page drops the
+		// GPU's data on that page instead of downloading it and waiting for the GPU. Faster,
+		// but GPU-written bytes the CPU does not overwrite are lost.
+		static const bool skip_write_readback = std::getenv("KYTY_NO_WRITE_READBACK") != nullptr;
+		if (is_write && skip_write_readback) {
+			m_memory_tracker.ForEachDownloadRange<false>(
+			    vaddr, size, [&](uint64_t address, uint64_t bytes) noexcept {
+				    m_gpu_modified_ranges.Subtract(address, bytes);
+			    });
+			m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
+			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+			PerfAdd(PerfCounter::WriteReadbackSkipped, 0);
+			return;
+		}
+		std::optional<PerfScope> write_readback;
+		if (is_write) write_readback.emplace(PerfCounter::WriteReadback);
 		auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
 
 		if (DownloadBufferMemory<false>(buffer, vaddr, size)) {
