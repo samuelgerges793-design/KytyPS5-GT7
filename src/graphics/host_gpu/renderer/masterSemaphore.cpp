@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <atomic>
 #include <cstdint>
 #include <cstdlib>
@@ -164,6 +165,53 @@ bool DumpShaderInputs(uint64_t hash) {
 	return !hashes.empty() && std::ranges::find(hashes, hash) != hashes.end();
 }
 
+namespace {
+
+struct PerfTotals {
+	std::atomic<uint64_t> ns {0};
+	std::atomic<uint64_t> count {0};
+};
+std::array<PerfTotals, static_cast<size_t>(PerfCounter::Count)> g_perf;
+
+uint64_t PerfNow() {
+	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                                 std::chrono::steady_clock::now().time_since_epoch())
+	                                 .count());
+}
+
+} // namespace
+
+void PerfAdd(PerfCounter counter, uint64_t nanoseconds) {
+	auto& totals = g_perf[static_cast<size_t>(counter)];
+	totals.ns.fetch_add(nanoseconds, std::memory_order_relaxed);
+	totals.count.fetch_add(1, std::memory_order_relaxed);
+}
+
+PerfScope::PerfScope(PerfCounter counter): m_counter(counter), m_start(PerfNow()) {}
+
+PerfScope::~PerfScope() {
+	PerfAdd(m_counter, PerfNow() - m_start);
+}
+
+void PerfReport(double fps) {
+	static uint64_t last = PerfNow();
+	const auto      now  = PerfNow();
+	if (now - last < 5'000'000'000ull) return;
+	const double seconds = static_cast<double>(now - last) / 1e9;
+	last                 = now;
+	static constexpr const char* Names[] = {"gpu-wait", "shader-read-sync", "serialized-dispatch",
+	                                        "compile", "readback"};
+	std::string text = fmt::format("perf: {:.1f} fps |", fps);
+	for (size_t i = 0; i < g_perf.size(); i++) {
+		const auto ns    = g_perf[i].ns.exchange(0, std::memory_order_relaxed);
+		const auto count = g_perf[i].count.exchange(0, std::memory_order_relaxed);
+		text += fmt::format(" {} {:.0f} ms/s ({:.0f}/s) |", Names[i],
+		                    static_cast<double>(ns) / 1e6 / seconds,
+		                    static_cast<double>(count) / seconds);
+	}
+	Log::WriteToConsoleAndLog(text + "\n");
+}
+
 bool SerializeShader(uint64_t hash) {
 	static const std::vector<uint64_t> hashes = [] {
 		std::vector<uint64_t> list;
@@ -292,6 +340,7 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	wait_info.pSemaphores    = &m_semaphore;
 	wait_info.pValues        = &tick;
 
+	PerfScope  perf(PerfCounter::GpuWait);
 	const auto result = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
 	if (result != vk::Result::eSuccess) {
 		DebugReportNotedShaders("waitSemaphores failed", KnownGpuTick());

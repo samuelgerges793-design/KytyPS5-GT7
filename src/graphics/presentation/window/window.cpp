@@ -13,6 +13,7 @@
 #include "common/timer.h"
 #include "common/stringUtils.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/masterSemaphore.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -741,8 +742,10 @@ void WindowContext::Run() {
 		if (elapsed >= title_interval_ms) {
 			const auto frames = loop.presented_frames.load(std::memory_order_relaxed);
 			if (frames != 0) {
-				UpdateTitle(frames, static_cast<double>(frames - title_frames) * 1000.0 /
-				                        static_cast<double>(elapsed));
+				const auto fps = static_cast<double>(frames - title_frames) * 1000.0 /
+				                 static_cast<double>(elapsed);
+				UpdateTitle(frames, fps);
+				PerfReport(fps);
 			}
 			title_time   = now;
 			title_frames = frames;

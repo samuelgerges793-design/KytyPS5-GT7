@@ -470,7 +470,10 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	if (DebugSyncSubmitEnabled() || SerializeShader(program.shader_hash)) {
 		// Experimental: one dispatch per submit, so a lost device names its shader.
 		const auto sync_start = std::chrono::steady_clock::now();
-		m_context.GetCommandScheduler().FlushAndWait();
+		{
+			PerfScope perf(PerfCounter::SerializedDispatch);
+			m_context.GetCommandScheduler().FlushAndWait();
+		}
 		const auto sync_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
 		                         std::chrono::steady_clock::now() - sync_start)
 		                         .count();
@@ -545,7 +548,10 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	if (DebugSyncSubmitEnabled() || SerializeShader(program.shader_hash)) {
 		// Experimental: one dispatch per submit, so a lost device names its shader.
 		const auto sync_start = std::chrono::steady_clock::now();
-		m_context.GetCommandScheduler().FlushAndWait();
+		{
+			PerfScope perf(PerfCounter::SerializedDispatch);
+			m_context.GetCommandScheduler().FlushAndWait();
+		}
 		const auto sync_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
 		                         std::chrono::steady_clock::now() - sync_start)
 		                         .count();

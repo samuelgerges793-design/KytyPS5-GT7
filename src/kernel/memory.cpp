@@ -6,6 +6,7 @@
 #include "common/threads.h"
 #include "common/virtualMemory.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/renderer/masterSemaphore.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
@@ -889,6 +890,7 @@ void SyncGpuForShaderReads() {
 	if (g_gpu_resources == nullptr || !Graphics::GuestGpu::IsGpuThread()) {
 		return;
 	}
+	Graphics::PerfScope perf(Graphics::PerfCounter::ShaderReadSync);
 	auto& scheduler = GetGpuResources().GetCommandScheduler();
 	scheduler.EndRendering();
 	scheduler.Wait(scheduler.CurrentTick());
@@ -920,6 +922,7 @@ bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 			}
 		}
 		if (buffers.HasGpuDirtyBytes(vaddr, size)) {
+			Graphics::PerfScope perf(Graphics::PerfCounter::Readback);
 			buffers.ReadMemory(vaddr, size);
 		}
 	}

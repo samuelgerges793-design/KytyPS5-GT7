@@ -510,6 +510,7 @@ struct PipelineCache::ProgramCache {
 			}
 		}
 
+		PerfScope  compile_time(PerfCounter::CommandThreadCompile);
 		const auto options    = MakeOptions(params.hash, user_data, params.back_code, input_info);
 		const auto stage_name = GetStageNames(stage).name;
 		DumpShaderOriginal(stage_name, options.shader_hash, params.code);
