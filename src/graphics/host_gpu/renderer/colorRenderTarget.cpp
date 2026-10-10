@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cinttypes>
 #include <bit>
 
 namespace Libs::Graphics {
@@ -73,14 +74,23 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	}
 	uint32_t sample_log2 = rt.attrib.num_fragments;
 	uint32_t samples     = render_sample_count(sample_log2);
-	if (samples == 0 || (rt.attrib.num_samples != rt.attrib.num_fragments &&
-	!(rt.attrib.num_samples > rt.attrib.num_fragments &&
-	  !rt.info.fmask_compression_enable && !rt.info.fmask_data_compression_disable &&
-	  !rt.info.fmask_one_frag_mode && !rt.info.cmask_fast_clear_enable &&
-	  !rt.info.dcc_compression_enable && rt.cmask.addr == 0 && rt.fmask.addr == 0 &&
-	  rt.dcc_addr.addr == 0))) {
+	if (samples == 0 || rt.attrib.num_samples < rt.attrib.num_fragments) {
 		EXIT("unsupported render-target sample configuration: samples=%u fragments=%u\n",
 		     rt.attrib.num_samples, rt.attrib.num_fragments);
+	}
+	if (rt.attrib.num_samples > rt.attrib.num_fragments) {
+		// Experimental: EQAA renders as plain MSAA with one sample per colour fragment. FMASK and
+		// CMASK are left unexpanded, as they already are for ordinary multisampled targets.
+		static std::atomic_int reports = 0;
+		if (reports++ < 4) {
+			LOGF_COLOR(Log::Color::BrightYellow,
+			           "warning: EQAA colour target samples=%u fragments=%u fmask_comp=%d "
+			           "cmask_clear=%d dcc=%d fmask=0x%" PRIx64 " cmask=0x%" PRIx64 "\n",
+			           rt.attrib.num_samples, rt.attrib.num_fragments,
+			           rt.info.fmask_compression_enable ? 1 : 0,
+			           rt.info.cmask_fast_clear_enable ? 1 : 0,
+			           rt.info.dcc_compression_enable ? 1 : 0, rt.fmask.addr, rt.cmask.addr);
+		}
 	}
 	const uint32_t levels = rt.attrib2.num_mip_levels + 1u;
 	if (levels == 0 || levels > 16 || rt.view.current_mip_level >= levels) {
