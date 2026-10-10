@@ -85,6 +85,12 @@ or graphical glitches, so please include the version you tested when reporting a
 Testing games and submitting detailed bug reports are useful ways to contribute. Search existing
 issues first, then use the **Game Emulation Status Report** template and attach the complete log file.
 
+**Pull requests for general fixes, architectural changes, or refactoring that do not address a concrete bug or launch problem in a specific game will be automatically closed.**
+
+**Large, unfocused commits or pull requests that bundle unrelated changes without a clear purpose or game-related benefit will also be automatically closed.**
+
+Keep each PR focused. Name the affected game, describe the exact problem, and provide evidence showing what the change fixes.
+
 Code contributions should be focused, build successfully on the platforms they touch, and include
 relevant tests where practical. Windows is the primary target, so a change that alters shared code
 should not regress it; changes confined to a platform's own code paths only need to build there. Because KytyPS5 is still evolving quickly, consider opening an issue before
