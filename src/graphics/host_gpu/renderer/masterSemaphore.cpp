@@ -4,6 +4,11 @@
 #include "common/logging/log.h"
 #include "graphics/host_gpu/graphicContext.h"
 
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#endif
+
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
@@ -115,6 +120,22 @@ void DebugClearNotedShaders() {
 	g_recording.clear();
 	g_submitted.clear();
 	g_last_noted = SIZE_MAX;
+}
+
+void DebugPrintHostBacktrace(const char* reason) {
+#ifdef _WIN32
+	void*        frames[64] {};
+	const USHORT count = RtlCaptureStackBackTrace(0, 64, frames, nullptr);
+	const auto   base  = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+	std::string  text  = fmt::format("--- host backtrace ({}), image base 0x{:x} ---\n", reason, base);
+	for (USHORT i = 0; i < count; i++) {
+		const auto address = reinterpret_cast<uintptr_t>(frames[i]);
+		text += fmt::format("  #{:02} rva=0x{:x}\n", i, address - base);
+	}
+	Log::WriteToConsoleAndLog(text);
+#else
+	(void)reason;
+#endif
 }
 
 bool DebugSyncSubmitEnabled() {

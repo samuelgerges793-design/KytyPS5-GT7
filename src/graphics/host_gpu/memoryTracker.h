@@ -16,6 +16,9 @@
 
 namespace Libs::Graphics {
 
+// Experimental diagnostics: prints the host call stack as offsets into the emulator image.
+void DebugPrintHostBacktrace(const char* reason);
+
 class MemoryTracker final {
 public:
 	explicit MemoryTracker(PageManager& page_manager);
@@ -109,6 +112,7 @@ private:
 
 	void CheckNotInUploadCallback() const noexcept {
 		if (s_upload_owner == this) {
+			DebugPrintHostBacktrace("memory tracker re-entered from upload callback");
 			EXIT("memory tracker re-entered from upload callback\n");
 		}
 	}
