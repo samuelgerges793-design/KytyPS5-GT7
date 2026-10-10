@@ -2,6 +2,7 @@
 
 #include "graphics/guest_gpu/hardwareContext.h"
 
+#include <cstdlib>
 #include <initializer_list>
 
 namespace Libs::Graphics {
@@ -45,7 +46,8 @@ BlendMappingSupport ClassifyBlendMapping(const HW::BlendControl&                
 	// Experimental: equations that differ only in a ZERO/ONE alpha source factor (such as
 	// "src + dst * Sa" fog) use the colour equation for every channel. The colour channels
 	// are exact; only the moved logical alpha gets the colour source factor.
-	if (blend.separate_alpha_blend && blend.alpha_srcblend != blend.color_srcblend &&
+	static const bool approximate = std::getenv("KYTY_NO_SHARED_ALPHA_BLEND") == nullptr;
+	if (approximate && blend.separate_alpha_blend && blend.alpha_srcblend != blend.color_srcblend &&
 	    blend.alpha_destblend == blend.color_destblend &&
 	    blend.alpha_comb_fcn == blend.color_comb_fcn &&
 	    (blend.alpha_srcblend == static_cast<uint8_t>(Prospero::BlendFactor::kZero) ||
