@@ -64,6 +64,10 @@ public:
 	[[nodiscard]] bool IsRegionRegistered(uint64_t address, uint64_t size);
 	// Diagnostic: an image whose GPU writes have not reached guest memory overlaps the range.
 	[[nodiscard]] bool HasGpuModifiedImageInRegion(uint64_t address, uint64_t size);
+	// Experimental: records copies of images in the range with GPU writes not yet in guest
+	// memory. Returns true when the caller must wait for the current tick and its deferred
+	// write-backs before reading.
+	[[nodiscard]] bool ReadbackGpuWrites(uint64_t address, uint64_t size);
 
 	[[nodiscard]] bool IsMeta(uint64_t address);
 	[[nodiscard]] bool IsMetaCleared(uint64_t address, uint32_t slice);

@@ -118,7 +118,15 @@ public:
 	}
 
 	[[nodiscard]] bool IsGpuModified() const noexcept { return m_gpu_modified; }
-	void               MarkGpuModified() noexcept { m_gpu_modified = true; }
+	void               MarkGpuModified() noexcept {
+		m_gpu_modified = true;
+		m_gpu_write_serial++;
+	}
+	// Experimental: GPU writes newer than the last copy back to guest memory.
+	[[nodiscard]] bool HasUnsyncedGpuWrites() const noexcept {
+		return m_gpu_modified && m_gpu_write_serial != m_synced_write_serial;
+	}
+	void MarkGpuWritesSynced() noexcept { m_synced_write_serial = m_gpu_write_serial; }
 	void               ClearGpuModified() noexcept { m_gpu_modified = false; }
 
 	[[nodiscard]] bool IsBufferModified() const noexcept { return m_buffer_modified; }
@@ -170,6 +178,8 @@ private:
 	bool              m_maybe_cpu_dirty  = false;
 	bool              m_maybe_hash_valid = false;
 	bool              m_gpu_modified     = false;
+	uint64_t          m_gpu_write_serial    = 0;
+	uint64_t          m_synced_write_serial = 0;
 	bool              m_buffer_modified  = false;
 };
 

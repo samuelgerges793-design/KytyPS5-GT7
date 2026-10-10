@@ -1848,6 +1848,32 @@ bool TextureCache::HasGpuModifiedImageInRegion(uint64_t address, uint64_t size) 
 	return false;
 }
 
+bool TextureCache::ReadbackGpuWrites(uint64_t address, uint64_t size) {
+	if (!GuestRange {address, size}.Valid()) {
+		return false;
+	}
+	std::scoped_lock lock {m_lock};
+	bool             recorded = false;
+	for (const auto id: FindImagesInRegion(address, size, false)) {
+		auto* owner = m_slot_images.try_get(id);
+		if (owner == nullptr || !owner->registered || !owner->HasUnsyncedGpuWrites()) {
+			continue;
+		}
+		if (DownloadImageMemory(id)) {
+			owner->MarkGpuWritesSynced();
+			recorded = true;
+		} else {
+			static std::atomic_int reports = 0;
+			if (reports++ < 16) {
+				Log::WriteToConsoleAndLog(fmt::format(
+				    "stale-risk: cannot copy back image 0x{:x} (+{}) for a shader setup read{}",
+				    owner->info.data.address, owner->info.data.size, "\n"));
+			}
+		}
+	}
+	return recorded;
+}
+
 bool TextureCache::IsRegionRegistered(uint64_t address, uint64_t size) {
 	std::scoped_lock lock {m_lock};
 	return !FindImagesInRegion(address, size, false).empty();

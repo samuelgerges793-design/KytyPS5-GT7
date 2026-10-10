@@ -893,7 +893,15 @@ bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 			return false;
 		}
 		auto& buffers = GetGpuResources().GetBufferCache();
-		if (GetGpuResources().GetTextureCache().HasGpuModifiedImageInRegion(vaddr, size)) {
+		static const bool image_readback = std::getenv("KYTY_NO_SETUP_IMAGE_READBACK") == nullptr;
+		if (image_readback && GetGpuResources().GetTextureCache().ReadbackGpuWrites(vaddr, size)) {
+			// The copies were recorded in the current tick; their guest writes run after it.
+			auto&      scheduler = GetGpuResources().GetCommandScheduler();
+			const auto tick      = scheduler.CurrentTick();
+			scheduler.EndRendering();
+			scheduler.Wait(tick);
+			scheduler.WaitPriorityOperations(tick);
+		} else if (GetGpuResources().GetTextureCache().HasGpuModifiedImageInRegion(vaddr, size)) {
 			static std::mutex                  logged_mutex;
 			static std::unordered_set<uint64_t> logged;
 			std::scoped_lock                    lock(logged_mutex);
