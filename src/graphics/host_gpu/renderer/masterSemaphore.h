@@ -65,12 +65,17 @@ enum class PerfCounter {
 	// Driver pipeline cache result per created pipeline (time = creation time).
 	PipelineCacheHit,
 	PipelineCacheMiss,
+	// Guest CPU accesses to protected pages (time includes any GPU readback and wait).
+	CpuReadFault,
+	CpuWriteFault,
 	Count
 };
 void PerfAdd(PerfCounter counter, uint64_t nanoseconds);
 void PerfReport(double fps);
 // Background compile threads yield to the game and GPU threads.
 void LowerCurrentThreadPriority();
+// Tallies a guest page fault by page; the perf report lists the busiest pages.
+void NoteFaultPage(uint64_t vaddr, bool write, uint64_t ns);
 class PerfScope {
 public:
 	explicit PerfScope(PerfCounter counter);

@@ -7,7 +7,10 @@
 #include "graphics/presentation/videoOut.h"
 #include "libs/errno.h"
 
+#include "graphics/host_gpu/renderer/masterSemaphore.h"
+
 #include <algorithm>
+#include <chrono>
 
 namespace Libs::Graphics {
 
@@ -62,12 +65,17 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	if (!IsMapped(fault_vaddr, fault_size)) {
 		return false;
 	}
+	const auto start = std::chrono::steady_clock::now();
 	if (access == PageFaultAccess::Write) {
 		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
 	} else {
 		m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
 	}
+	NoteFaultPage(fault_vaddr, access == PageFaultAccess::Write,
+	              static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                                        std::chrono::steady_clock::now() - start)
+	                                        .count()));
 	return true;
 }
 

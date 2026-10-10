@@ -189,6 +189,12 @@ struct WaitSite {
 std::mutex                       g_wait_sites_mutex;
 std::unordered_map<uintptr_t, WaitSite> g_wait_sites;
 
+struct FaultPage {
+	uint64_t reads = 0, writes = 0, ns = 0;
+};
+std::mutex                              g_fault_pages_mutex;
+std::unordered_map<uint64_t, FaultPage> g_fault_pages;
+
 void NoteWaitSite(uint64_t ns) {
 #ifdef _WIN32
 	void*      frames[4] {};
@@ -229,7 +235,8 @@ void PerfReport(double fps) {
 	static constexpr const char* Names[] = {"gpu-wait",      "shader-read-sync", "serialized-dispatch",
 	                                        "compile",       "readback",         "pipeline-create",
 	                                        "gpu-idle",      "gpu-blocked",      "draws-waiting",
-	                                        "pipe-cache-hit", "pipe-cache-miss"};
+	                                        "pipe-cache-hit", "pipe-cache-miss",
+	                                        "cpu-read-fault", "cpu-write-fault"};
 	std::string text = fmt::format("perf: {:.1f} fps |", fps);
 	for (size_t i = 0; i < g_perf.size(); i++) {
 		const auto ns    = g_perf[i].ns.exchange(0, std::memory_order_relaxed);
@@ -249,7 +256,26 @@ void PerfReport(double fps) {
 			                    static_cast<double>(sites[i].second.ns) / 1e6, sites[i].second.count);
 		}
 	}
+	{
+		std::scoped_lock lock(g_fault_pages_mutex);
+		std::vector<std::pair<uint64_t, FaultPage>> pages(g_fault_pages.begin(), g_fault_pages.end());
+		g_fault_pages.clear();
+		std::ranges::sort(pages, [](const auto& a, const auto& b) { return a.second.ns > b.second.ns; });
+		if (!pages.empty()) text += fmt::format(" | fault pages ({}):", pages.size());
+		for (size_t i = 0; i < pages.size() && i < 5; i++) {
+			text += fmt::format(" 0x{:x} r{}/w{} {:.0f}ms", pages[i].first, pages[i].second.reads,
+			                    pages[i].second.writes, static_cast<double>(pages[i].second.ns) / 1e6);
+		}
+	}
 	Log::WriteToConsoleAndLog(text + "\n");
+}
+
+void NoteFaultPage(uint64_t vaddr, bool write, uint64_t ns) {
+	PerfAdd(write ? PerfCounter::CpuWriteFault : PerfCounter::CpuReadFault, ns);
+	std::scoped_lock lock(g_fault_pages_mutex);
+	auto&            page = g_fault_pages[vaddr & ~uint64_t {0xfff}];
+	(write ? page.writes : page.reads)++;
+	page.ns += ns;
 }
 
 void LowerCurrentThreadPriority() {
