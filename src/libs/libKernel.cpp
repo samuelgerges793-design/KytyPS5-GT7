@@ -30,9 +30,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <random>
 #include <string>
 #include <thread>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -2497,10 +2500,45 @@ static void FiberRestoreContext(FiberCpuContext* ctx, uint64_t ret) {
 
 [[noreturn]] static KYTY_SYSV_ABI void FiberStartTrampoline(FiberObject* fiber);
 
+// Games size fiber stacks for their own code, but Kyty's host code runs on the same stack when
+// a fiber calls into the emulator; an overflow there kills the process without a report. Run
+// each fiber on a host stack with headroom instead (KYTY_FIBER_GUEST_STACK keeps the game's).
+static uintptr_t FiberStackTop(FiberObject* fiber) {
+	const auto guest_top = reinterpret_cast<uintptr_t>(fiber->addr_context) +
+	                       static_cast<uintptr_t>(fiber->size_context);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	static const bool guest_stack = std::getenv("KYTY_FIBER_GUEST_STACK") != nullptr;
+	if (guest_stack) {
+		return guest_top;
+	}
+	constexpr size_t kHeadroom = 0x200000;
+	const size_t     size = (static_cast<size_t>(fiber->size_context) + kHeadroom + 0xffffu) &
+	                    ~static_cast<size_t>(0xffffu);
+	static std::mutex                                                 mutex;
+	static std::unordered_map<FiberObject*, std::pair<void*, size_t>> stacks;
+	std::scoped_lock                                                  lock(mutex);
+	auto&                                                             entry = stacks[fiber];
+	if (entry.first != nullptr && entry.second < size) {
+		VirtualFree(entry.first, 0, MEM_RELEASE);
+		entry = {};
+	}
+	if (entry.first == nullptr) {
+		entry.first  = VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+		entry.second = size;
+		if (entry.first == nullptr) {
+			entry = {};
+			return guest_top;
+		}
+	}
+	return reinterpret_cast<uintptr_t>(entry.first) + entry.second;
+#else
+	return guest_top;
+#endif
+}
+
 [[noreturn]] static KYTY_SYSV_ABI void FiberStartOnGuestStack(FiberObject* fiber) {
 	FiberCpuContext ctx {};
-	const auto      stack_top = reinterpret_cast<uintptr_t>(fiber->addr_context) +
-	                            static_cast<uintptr_t>(fiber->size_context);
+	const auto      stack_top = FiberStackTop(fiber);
 	auto            rsp       = (stack_top & ~static_cast<uintptr_t>(0x0f));
 	rsp -= sizeof(uint64_t);
 	*reinterpret_cast<uint64_t*>(rsp) = 0;
