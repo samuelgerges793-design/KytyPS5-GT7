@@ -42,6 +42,21 @@ BlendMappingSupport ClassifyBlendMapping(const HW::BlendControl&                
 			default: break;
 		}
 	}
+	// Experimental: equations that differ only in a ZERO/ONE alpha source factor (such as
+	// "src + dst * Sa" fog) use the colour equation for every channel. The colour channels
+	// are exact; only the moved logical alpha gets the colour source factor.
+	if (blend.separate_alpha_blend && blend.alpha_srcblend != blend.color_srcblend &&
+	    blend.alpha_destblend == blend.color_destblend &&
+	    blend.alpha_comb_fcn == blend.color_comb_fcn &&
+	    (blend.alpha_srcblend == static_cast<uint8_t>(Prospero::BlendFactor::kZero) ||
+	     blend.alpha_srcblend == static_cast<uint8_t>(Prospero::BlendFactor::kOne))) {
+		HW::BlendControl shared = blend;
+		shared.separate_alpha_blend = false;
+		const auto support          = ClassifyBlendMapping(shared, mapping);
+		if (support == BlendMappingSupport::SourceAlpha) {
+			return support;
+		}
+	}
 	// Moving alpha requires the same equation for all channels.
 	if (blend.separate_alpha_blend && (blend.alpha_srcblend != blend.color_srcblend ||
 	                                   blend.alpha_destblend != blend.color_destblend ||
