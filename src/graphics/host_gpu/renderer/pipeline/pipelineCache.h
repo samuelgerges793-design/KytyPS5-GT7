@@ -210,6 +210,9 @@ private:
 	void InitializeDriverCache(const std::filesystem::path& path);
 };
 
+// Experimental: true once when the current draw's pixel shader is listed in KYTY_SKIP_SHADERS.
+bool TakeSkippedDraw();
+
 void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pixel_program_id);
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                             const PipelineRenderingState&          rendering,

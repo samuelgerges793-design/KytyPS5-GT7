@@ -141,6 +141,8 @@ bool MaterializeFresh(const ShaderRecompiler::IR::ResourcePlan& plan,
 	return ok;
 }
 
+thread_local bool g_skip_draw = false;
+
 bool SpecializationSyncEnabled() {
 	static const bool enabled = std::getenv("KYTY_SPEC_SYNC") != nullptr;
 	return enabled;
@@ -225,6 +227,10 @@ bool ValidateShaderSpirv(const char* label, uint64_t shader_hash,
 }
 
 } // namespace
+
+bool TakeSkippedDraw() {
+	return std::exchange(g_skip_draw, false);
+}
 
 std::size_t PipelineCache::GraphicsPipelineKeyHash::operator()(const GraphicsPipelineKey& key) const {
 	std::size_t hash = 0;
@@ -447,6 +453,9 @@ struct PipelineCache::ProgramCache {
 		const auto stage           = GetStage(input_info);
 
 		DebugNoteShader(params.hash, static_cast<uint32_t>(stage));
+		if (stage == ShaderType::Pixel && ShaderRecompiler::SkipRuntimeCallShader(params.hash)) {
+			g_skip_draw = true;
+		}
 		if (stage != ShaderType::Compute && DumpShaderInputs(params.hash)) {
 			static std::atomic_int dumps = 0;
 			if (dumps++ < 20) {
