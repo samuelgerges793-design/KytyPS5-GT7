@@ -82,6 +82,31 @@ bool InitializeThreadSignalStack() {
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 
+// Last chance: a host crash nothing handled. Report where it happened before the process dies.
+static LONG WINAPI LastChanceFilter(PEXCEPTION_POINTERS exception) noexcept {
+	const auto  base   = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+	const auto* record = exception->ExceptionRecord;
+	const auto  pc     = reinterpret_cast<uintptr_t>(record->ExceptionAddress);
+	printf("--- Host crash ---\ncode=0x%08lx pc=0x%llx (rva=0x%llx) thread=%lu", record->ExceptionCode,
+	       static_cast<unsigned long long>(pc), static_cast<unsigned long long>(pc - base),
+	       GetCurrentThreadId());
+	if (record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && record->NumberParameters >= 2) {
+		printf(" access=%llu address=0x%llx",
+		       static_cast<unsigned long long>(record->ExceptionInformation[0]),
+		       static_cast<unsigned long long>(record->ExceptionInformation[1]));
+	}
+	printf("\n");
+	void*        frames[32] {};
+	const USHORT count = RtlCaptureStackBackTrace(0, 32, frames, nullptr);
+	for (USHORT i = 0; i < count; i++) {
+		const auto address = reinterpret_cast<uintptr_t>(frames[i]);
+		printf("  #%02u rva=0x%llx\n", static_cast<unsigned>(i),
+		       static_cast<unsigned long long>(address - base));
+	}
+	fflush(stdout);
+	return EXCEPTION_CONTINUE_SEARCH;
+}
+
 static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) noexcept {
 	auto* exception_record = exception->ExceptionRecord;
 
@@ -292,6 +317,7 @@ bool InstallHandler(Handler handler) {
 	g_handler.store(handler, std::memory_order_release);
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	SetUnhandledExceptionFilter(LastChanceFilter);
 	if (AddVectoredExceptionHandler(0, ExceptionFilter) == nullptr) {
 		g_handler.store(nullptr, std::memory_order_release);
 		g_install_state.store(0, std::memory_order_release);
