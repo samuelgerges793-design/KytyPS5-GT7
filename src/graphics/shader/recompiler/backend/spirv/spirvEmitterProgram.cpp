@@ -385,9 +385,26 @@ void EmitDispatcherFunction(ValueEmitContext& ctx, const DispatcherFunctionState
 	const auto next_pc = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpPhi, TypeU32(state), pc, initial_pc, initial_parent, next_pc,
 	                          dispatcher.continue_label);
-	const auto done = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpIEqual, TypeBool(state), done, pc,
+	// Experimental watchdog: count executed guest blocks and leave once a runaway loop passes
+	// 2^21 of them, instead of hanging the GPU (KYTY_NO_LOOP_WATCHDOG disables).
+	static const bool watchdog = std::getenv("KYTY_NO_LOOP_WATCHDOG") == nullptr;
+	const auto steps      = state.builder.AllocateId();
+	const auto next_steps = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpPhi, TypeU32(state), steps, ConstantU32(state, 0),
+	                          initial_parent, next_steps, dispatcher.continue_label);
+	state.builder.AddFunction(spv::OpIAdd, TypeU32(state), next_steps, steps,
+	                          ConstantU32(state, 1));
+	const auto finished = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpIEqual, TypeBool(state), finished, pc,
 	                          ConstantU32(ctx.state, UINT32_MAX));
+	auto done = finished;
+	if (watchdog) {
+		const auto runaway = state.builder.AllocateId();
+		done               = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpUGreaterThan, TypeBool(state), runaway, next_steps,
+		                          ConstantU32(state, 1u << 21u));
+		state.builder.AddFunction(spv::OpLogicalOr, TypeBool(state), done, finished, runaway);
+	}
 	state.builder.AddFunction(spv::OpLoopMerge, dispatcher.merge_label, dispatcher.continue_label,
 	                          spv::LoopControlMaskNone);
 	state.builder.AddFunction(spv::OpBranchConditional, done, dispatcher.merge_label,
