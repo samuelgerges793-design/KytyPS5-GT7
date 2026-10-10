@@ -47,6 +47,9 @@ void DebugCompletedUpTo(uint64_t tick);
 void DebugReportNotedShaders(const char* reason, uint64_t completed_tick);
 void DebugClearNotedShaders();
 bool DebugSyncSubmitEnabled();
+// Shaders listed in KYTY_SERIALIZE_SHADERS (comma-separated hashes) wait for recorded GPU work
+// before their setup reads guest memory, and their dispatches run on their own.
+bool SerializeShader(uint64_t hash);
 
 } // namespace Libs::Graphics
 

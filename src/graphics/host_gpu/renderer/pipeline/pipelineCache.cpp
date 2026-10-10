@@ -112,7 +112,7 @@ void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
 thread_local bool g_sync_before_shader_read = false;
 
 bool SpecializationSyncEnabled() {
-	static const bool enabled = std::getenv("KYTY_NO_SPEC_SYNC") == nullptr;
+	static const bool enabled = std::getenv("KYTY_SPEC_SYNC") != nullptr;
 	return enabled;
 }
 
@@ -348,7 +348,7 @@ struct PipelineCache::ProgramCache {
 		}
 
 		DebugNoteShader(params.hash, static_cast<uint32_t>(stage));
-		g_sync_before_shader_read = SpecializationSyncEnabled();
+		g_sync_before_shader_read = SpecializationSyncEnabled() || SerializeShader(params.hash);
 		const auto user_data = std::span(params.user_data).first(params.user_data_count);
 		lookup_key.stage           = stage;
 		lookup_key.hash            = params.hash;

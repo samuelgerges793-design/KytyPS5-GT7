@@ -441,7 +441,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	// The removed host fence also ordered read-only dispatches before later writers.
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	ResetBindings();
-	if (DebugSyncSubmitEnabled()) {
+	if (DebugSyncSubmitEnabled() || SerializeShader(program.shader_hash)) {
 		// Experimental: one dispatch per submit, so a lost device names its shader.
 		const auto sync_start = std::chrono::steady_clock::now();
 		m_context.GetCommandScheduler().FlushAndWait();
@@ -516,7 +516,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	ResetBindings();
-	if (DebugSyncSubmitEnabled()) {
+	if (DebugSyncSubmitEnabled() || SerializeShader(program.shader_hash)) {
 		// Experimental: one dispatch per submit, so a lost device names its shader.
 		const auto sync_start = std::chrono::steady_clock::now();
 		m_context.GetCommandScheduler().FlushAndWait();
