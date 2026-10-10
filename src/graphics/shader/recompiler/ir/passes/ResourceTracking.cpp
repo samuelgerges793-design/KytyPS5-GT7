@@ -32,7 +32,11 @@ bool HostScalarShader(uint64_t shader_hash) {
 		}
 		return list;
 	}();
-	return !hashes.empty() && std::ranges::find(hashes, shader_hash) != hashes.end();
+	static const bool all = [] {
+		const char* env = std::getenv("KYTY_HOST_SCALAR_SHADERS");
+		return env != nullptr && std::string(env) == "all";
+	}();
+	return all || (!hashes.empty() && std::ranges::find(hashes, shader_hash) != hashes.end());
 }
 
 namespace {
