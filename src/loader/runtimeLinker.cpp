@@ -656,6 +656,9 @@ static bool IsReadableRange(uint64_t addr, uint64_t size) {
 	return true;
 }
 
+// Diagnostics: lets the fault report name the module an address belongs to.
+static RuntimeLinker* g_fault_linker = nullptr;
+
 static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_info) {
 	const auto* info = &exception_info;
 
@@ -704,13 +707,24 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			}
 			std::printf("\n");
 		}
-		if (IsReadableRange(info->rsp, 32 * sizeof(uint64_t))) {
+		int stack_words = 32;
+		while (stack_words > 0 && !IsReadableRange(info->rsp, stack_words * sizeof(uint64_t))) {
+			stack_words--;
+		}
+		if (stack_words > 0) {
 			const auto* stack = reinterpret_cast<const uint64_t*>(info->rsp);
-			std::printf("stack:");
-			for (int i = 0; i < 32; i++) {
-				std::printf("%s %016" PRIx64, (i % 4 == 0) ? "\n " : "", stack[i]);
+			std::printf("stack (%d words, module-relative where known):\n", stack_words);
+			for (int i = 0; i < stack_words; i++) {
+				std::printf("  [rsp+0x%02x] %016" PRIx64, i * 8, stack[i]);
+				if (auto* program = g_fault_linker != nullptr
+				                        ? g_fault_linker->FindProgramByAddr(stack[i])
+				                        : nullptr;
+				    program != nullptr) {
+					const auto name = program->file_name.filename().string();
+					std::printf("  %s+0x%" PRIx64, name.c_str(), stack[i] - program->base_vaddr);
+				}
+				std::printf("\n");
 			}
-			std::printf("\n");
 		}
 		std::fflush(stdout);
 	}
@@ -1168,6 +1182,7 @@ void RuntimeLinker::UnloadProgram(Program* program) {
 }
 
 RuntimeLinker::RuntimeLinker(): m_symbols(std::make_unique<SymbolDatabase>()) {
+	g_fault_linker = this;
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 }
 
