@@ -725,7 +725,13 @@ void EmitProgram(EmitterState& state) {
 		dispatch.merge_label        = state.builder.AllocateId();
 		ctx.dispatcher_spills       = &dispatch.spills[0];
 		if (state.lane_count == 2) {
-			for (const auto& [inst, id]: dispatch.spills[0]) {
+			// Allocate in the low half's id order: map order follows addresses, which change
+			// between runs, and the SPIR-V must not (the driver's pipeline cache keys on it).
+			std::vector<std::pair<uint32_t, const IR::Inst*>> ordered;
+			ordered.reserve(dispatch.spills[0].size());
+			for (const auto& [inst, id]: dispatch.spills[0]) ordered.emplace_back(id, inst);
+			std::ranges::sort(ordered);
+			for (const auto& [id, inst]: ordered) {
 				dispatch.spills[1].emplace(inst, state.builder.AllocateId());
 			}
 			high.dispatcher_spills = &dispatch.spills[1];
@@ -909,8 +915,11 @@ void EmitProgram(EmitterState& state) {
 		state.lds_base_dwords = EmitBinaryU32(state, spv::OpIMul, index,
 		                                     ConstantU32(state, LdsDwordCount(state)));
 	}
-	for (const auto& [block, counter]: state.loop_watchdogs) {
-		state.builder.AddFunction(spv::OpStore, counter, ConstantU32(state, 0));
+	// Program order, not map order: the map follows addresses, which change between runs.
+	for (const auto* block: program.blocks) {
+		if (const auto guard = state.loop_watchdogs.find(block); guard != state.loop_watchdogs.end()) {
+			state.builder.AddFunction(spv::OpStore, guard->second, ConstantU32(state, 0));
+		}
 	}
 	EmitMemoryOffsets(state);
 	if (program.blocks.empty()) {

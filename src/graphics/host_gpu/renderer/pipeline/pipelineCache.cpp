@@ -32,6 +32,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <deque>
 #include <fmt/format.h>
 #include <functional>
@@ -370,6 +371,57 @@ void DiffSpecialization(const ShaderRecompiler::IR::ResourceSpecialization& from
 	}
 }
 
+uint64_t SpecializationHash(const ShaderRecompiler::IR::ResourceSpecialization& specialization) {
+	uint64_t   hash = 0;
+	const auto mix  = [&hash](uint64_t value) { hash = XXH3_64bits_withSeed(&value, sizeof(value), hash); };
+	for (const auto& b: specialization.buffers) {
+		mix(b.packed_stride);
+		mix(static_cast<uint64_t>(b.descriptor_format));
+		mix(b.descriptor_swizzle);
+		mix(b.zero_stride_oob ? 1u : 0u);
+		mix(b.indirect_root);
+		mix(b.indirect_mapping_offset);
+		mix(b.indirect_search_iterations);
+	}
+	mix(0xffffffffu);
+	for (const auto& i: specialization.images) {
+		mix(static_cast<uint64_t>(i.numeric_class));
+		mix(static_cast<uint64_t>(i.dimension));
+		mix(i.mip_count);
+		mix(static_cast<uint64_t>(i.conversion_format));
+		mix(i.shader_swizzle);
+		mix(i.indirect_root);
+		mix(i.indirect_mapping_offset);
+		mix(i.indirect_search_iterations);
+		mix((i.cube ? 1u : 0u) | (i.fmask ? 2u : 0u));
+	}
+	return hash;
+}
+
+// One line per compiled program in _gt7_spirv_<time>.txt: the same shader, specialization and
+// push-data layout should give the same SPIR-V hash in every run.
+void WriteSpirvManifest(const ShaderRecompiler::CompileOptions&             options,
+                        const ShaderRecompiler::IR::ResourceSpecialization& specialization,
+                        uint32_t push_data_start, const std::vector<uint32_t>& spirv) {
+	static std::mutex mutex;
+	static FILE*      file = [] {
+		const auto now = std::time(nullptr);
+		std::tm    local {};
+		localtime_s(&local, &now);
+		char name[64] = {};
+		std::strftime(name, sizeof(name), "_gt7_spirv_%Y%m%d_%H%M%S.txt", &local);
+		return std::fopen(name, "w");
+	}();
+	if (file == nullptr) return;
+	const auto spirv_hash = XXH3_64bits(spirv.data(), spirv.size() * sizeof(uint32_t));
+	std::scoped_lock lock(mutex);
+	std::fprintf(file, "%d %016llx %u %016llx %016llx %zu\n", static_cast<int>(options.stage),
+	             static_cast<unsigned long long>(options.shader_hash), push_data_start,
+	             static_cast<unsigned long long>(SpecializationHash(specialization)),
+	             static_cast<unsigned long long>(spirv_hash), spirv.size());
+	std::fflush(file);
+}
+
 } // namespace
 
 bool TakeSkippedDraw() {
@@ -575,6 +627,7 @@ struct PipelineCache::ProgramCache {
 			     options.shader_hash);
 		}
 		DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
+		WriteSpirvManifest(options, specialization, push_data_start_dword, result.spirv);
 		if (const auto guards = ShaderRecompiler::LastWaterfallLoopGuards(); guards != 0) {
 			Log::WriteToConsoleAndLog(fmt::format("watchdog: {} 0x{:016x} waterfall loop exits capped ({})\n",
 			                                      stage_name, options.shader_hash, guards));
@@ -960,6 +1013,30 @@ struct PipelineCache::ProgramCache {
 					permutation = CompileRecipe<ShaderComputeInputInfo>(*recipe, plan);
 					break;
 				default: permutation = CompileRecipe<ShaderVertexInputInfo>(*recipe, plan); break;
+			}
+			// Determinism check: the same recipe must give the same SPIR-V, or the driver's
+			// pipeline cache can never match a pipeline from an earlier run.
+			static std::atomic<int> checks_left {200};
+			if (permutation && checks_left.fetch_sub(1, std::memory_order_relaxed) > 0) {
+				std::optional<ShaderRecompiler::IR::ResourcePlan> scratch_plan;
+				std::optional<Permutation>                        again;
+				switch (recipe->stage) {
+					case ShaderType::Pixel:
+						again = CompileRecipe<ShaderPixelInputInfo>(*recipe, scratch_plan);
+						break;
+					case ShaderType::Compute:
+						again = CompileRecipe<ShaderComputeInputInfo>(*recipe, scratch_plan);
+						break;
+					default: again = CompileRecipe<ShaderVertexInputInfo>(*recipe, scratch_plan); break;
+				}
+				if (again) {
+					if (again->handle.spirv_hash != permutation->handle.spirv_hash) {
+						Log::WriteToConsoleAndLog(fmt::format(
+						    "determinism: {} 0x{:016x} compiled twice gives different SPIR-V\n",
+						    static_cast<int>(recipe->stage), recipe->hash));
+					}
+					device.destroyShaderModule(again->handle.module, nullptr);
+				}
 			}
 			if (!permutation) {
 				// The draw compiles the key itself.
