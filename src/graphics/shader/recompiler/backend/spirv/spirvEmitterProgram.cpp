@@ -140,9 +140,8 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block) {
 				builder.AddFunction(spv::OpStore, guard->second, counted);
 				// Graphics stages run per pixel or vertex, so a lower cap keeps a runaway loop
 				// within the GPU timeout.
-				// Graphics stages share one budget across all of their loops.
 				const auto limit = ctx.state.program.stage == ShaderType::Compute ? 1u << 16u
-				                                                                  : 1u << 11u;
+				                                                                  : 1u << 10u;
 				builder.AddFunction(spv::OpUGreaterThan, TypeBool(ctx.state), over, counted,
 				                    ConstantU32(ctx.state, limit));
 				// The exit is the merge target: the header's own merge, for a back-edge block the
@@ -813,17 +812,10 @@ void EmitProgram(EmitterState& state) {
 				guarded = true;
 			}
 			if (guarded) {
-				// Per pixel or vertex, nested loops multiply: graphics stages count every guarded
-				// branch against one invocation-wide budget.
-				uint32_t counter = 0;
-				if (state.program.stage != ShaderType::Compute && !state.loop_watchdogs.empty()) {
-					counter = state.loop_watchdogs.begin()->second;
-				} else {
-					counter = state.builder.AllocateId();
-					state.builder.AddFunction(
-					    spv::OpVariable, TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
-					    counter, spv::StorageClassFunction);
-				}
+				const auto counter = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpVariable,
+				                          TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
+				                          counter, spv::StorageClassFunction);
 				state.loop_watchdogs.emplace(block, counter);
 			}
 		}
