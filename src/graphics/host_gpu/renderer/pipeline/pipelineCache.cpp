@@ -1838,11 +1838,14 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(
 void PipelineCache::QueuePipelineJob(std::function<void()> job) {
 	std::unique_lock lock(m_pipeline_jobs_mutex);
 	if (m_pipeline_workers.empty()) {
-		// The GPU thread and the shader workers keep their cores; pipelines get the rest.
+		// The driver compiles each new pipeline on one thread (about a second for GT7's large
+		// pixel shaders), so throughput scales with workers; they run below normal priority so
+		// the game and GPU threads keep their time.
 		const auto hardware = std::max(std::thread::hardware_concurrency(), 4u);
-		const auto count    = std::clamp(hardware / 4u, 2u, 6u);
+		const auto count    = std::clamp(hardware / 2u + 2u, 2u, 12u);
 		for (uint32_t i = 0; i < count; i++) {
 			m_pipeline_workers.emplace_back([this] {
+				LowerCurrentThreadPriority();
 				for (;;) {
 					std::function<void()> next;
 					{

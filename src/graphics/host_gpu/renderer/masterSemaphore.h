@@ -69,6 +69,8 @@ enum class PerfCounter {
 };
 void PerfAdd(PerfCounter counter, uint64_t nanoseconds);
 void PerfReport(double fps);
+// Background compile threads yield to the game and GPU threads.
+void LowerCurrentThreadPriority();
 class PerfScope {
 public:
 	explicit PerfScope(PerfCounter counter);

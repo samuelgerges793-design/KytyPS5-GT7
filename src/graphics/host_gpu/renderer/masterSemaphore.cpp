@@ -252,6 +252,12 @@ void PerfReport(double fps) {
 	Log::WriteToConsoleAndLog(text + "\n");
 }
 
+void LowerCurrentThreadPriority() {
+#if defined(_WIN32)
+	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+#endif
+}
+
 bool SerializeShader(uint64_t hash) {
 	static const std::vector<uint64_t> hashes = [] {
 		std::vector<uint64_t> list;
