@@ -8,6 +8,7 @@
 #include <functional>
 #include <optional>
 #include <type_traits>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 
@@ -139,7 +140,13 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block) {
 				builder.AddFunction(spv::OpStore, guard->second, counted);
 				builder.AddFunction(spv::OpUGreaterThan, TypeBool(ctx.state), over, counted,
 				                    ConstantU32(ctx.state, 1u << 20u));
-				if (term.merge_block == true_block) {
+				// The exit is the merge target: the header's own merge, or for a back-edge block the
+				// target that is not a loop header.
+				const bool exit_is_true =
+				    term.loop_header ? term.merge_block == true_block
+				                     : false_block->terminator.loop_header &&
+				                           false_block->terminator.merge_block == true_block;
+				if (exit_is_true) {
 					builder.AddFunction(spv::OpLogicalOr, TypeBool(ctx.state), guarded, condition,
 					                    over);
 				} else {
@@ -744,12 +751,31 @@ void EmitProgram(EmitterState& state) {
 	state.loop_watchdogs.clear();
 	static const bool watchdog = std::getenv("KYTY_NO_LOOP_WATCHDOG") == nullptr;
 	if (watchdog && !state.program.dispatcher_fallback) {
+		std::unordered_map<const IR::Block*, const IR::Block*> loop_merges;
 		for (const auto* block: program.blocks) {
+			if (block->terminator.loop_header && block->terminator.merge_block != nullptr) {
+				loop_merges.emplace(block, block->terminator.merge_block);
+			}
+		}
+		const auto exits_loop = [&](const IR::Block* block) {
 			const auto& term = block->terminator;
-			if (term.loop_header && term.kind == CFG::TerminatorKind::ConditionalBranch &&
-			    term.merge_block != nullptr && term.continue_block != nullptr &&
-			    !block->condition.IsEmpty() &&
-			    (term.merge_block == term.true_block || term.merge_block == term.false_block)) {
+			if (term.kind != CFG::TerminatorKind::ConditionalBranch || block->condition.IsEmpty() ||
+			    term.true_block == nullptr || term.false_block == nullptr) {
+				return false;
+			}
+			if (term.loop_header) {
+				return term.merge_block != nullptr && term.continue_block != nullptr &&
+				       (term.merge_block == term.true_block || term.merge_block == term.false_block);
+			}
+			for (const auto [header, other]: {std::pair {term.true_block, term.false_block},
+			                                  std::pair {term.false_block, term.true_block}}) {
+				const auto found = loop_merges.find(header);
+				if (found != loop_merges.end() && found->second == other) return true;
+			}
+			return false;
+		};
+		for (const auto* block: program.blocks) {
+			if (exits_loop(block)) {
 				const auto counter = state.builder.AllocateId();
 				state.builder.AddFunction(spv::OpVariable,
 				                          TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
