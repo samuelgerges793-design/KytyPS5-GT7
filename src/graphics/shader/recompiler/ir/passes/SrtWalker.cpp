@@ -489,6 +489,9 @@ bool SrtWalker::EvaluateExtract(const Inst& inst, uint64_t& result) {
 	return false;
 }
 
+// Set when an evaluation refused a null-page read.
+static thread_local bool g_null_page_read = false;
+
 bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 	const auto flags = inst.Flags<SrtReadFlags>();
 	if (flags.index >= m_program.memory_info.size()) {
