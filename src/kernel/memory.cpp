@@ -24,6 +24,7 @@
 #include <shared_mutex>
 #include <unordered_set>
 #include <fmt/format.h>
+#include <utility>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -878,6 +879,12 @@ bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 	       g_guest_address_space->TryReadBacking(vaddr, data, size);
 }
 
+static thread_local bool g_setup_image_readback = false;
+
+bool TakeSetupImageReadback() {
+	return std::exchange(g_setup_image_readback, false);
+}
+
 void SyncGpuForShaderReads() {
 	if (g_gpu_resources == nullptr || !Graphics::GuestGpu::IsGpuThread()) {
 		return;
@@ -901,6 +908,7 @@ bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 			scheduler.EndRendering();
 			scheduler.Wait(tick);
 			scheduler.WaitPriorityOperations(tick);
+			g_setup_image_readback = true;
 		} else if (GetGpuResources().GetTextureCache().HasGpuModifiedImageInRegion(vaddr, size)) {
 			static std::mutex                  logged_mutex;
 			static std::unordered_set<uint64_t> logged;

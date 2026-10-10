@@ -111,6 +111,19 @@ void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
 // the GPU work recorded so far, so values written by earlier dispatches are not read stale.
 thread_local bool g_sync_before_shader_read = false;
 
+// A setup read that copied GPU-written images back mixes old and new values; read it again.
+bool MaterializeFresh(const ShaderRecompiler::IR::ResourcePlan& plan,
+                      const ShaderRecompiler::IR::SrtRuntime& runtime,
+                      ShaderRecompiler::IR::ResourceSnapshot& snapshot,
+                      ShaderRecompiler::IR::ResourceSpecialization& specialization) {
+	(void)Libs::LibKernel::Memory::TakeSetupImageReadback();
+	bool ok = ShaderRecompiler::IR::MaterializeResources(plan, runtime, snapshot, specialization);
+	if (Libs::LibKernel::Memory::TakeSetupImageReadback()) {
+		ok = ShaderRecompiler::IR::MaterializeResources(plan, runtime, snapshot, specialization);
+	}
+	return ok;
+}
+
 bool SpecializationSyncEnabled() {
 	static const bool enabled = std::getenv("KYTY_SPEC_SYNC") != nullptr;
 	return enabled;
@@ -263,8 +276,7 @@ struct PipelineCache::ProgramCache {
 		template <bool HasCalls>
 		Permutation* FindPermutation(const ShaderRecompiler::IR::SrtRuntime& runtime,
 		                             uint32_t push_data_cursor) {
-			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
-			    resource_plan, runtime, resources, specialization));
+			EXIT_IF(!MaterializeFresh(resource_plan, runtime, resources, specialization));
 			for (auto& candidate: permutations) {
 				const auto& layout = candidate.program.bindings;
 				if (layout.push_data_start_dword != ShaderRecompiler::IR::PushData::StartFor(
@@ -468,9 +480,8 @@ struct PipelineCache::ProgramCache {
 			auto retained = !source.calls.empty() ? std::make_unique<ShaderRecompiler::ShaderSource>(std::move(source)) : nullptr;
 			entry = programs.try_emplace(lookup_key,
 			    ShaderRecompiler::IR::ExtractResourcePlan(translated.program), std::move(retained)).first;
-			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
-			    entry->second.resource_plan, runtime, entry->second.resources,
-			    entry->second.specialization));
+			EXIT_IF(!MaterializeFresh(entry->second.resource_plan, runtime,
+			                          entry->second.resources, entry->second.specialization));
 		} else if (source_changed) {
 			entry->second.resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
 			if (const auto* permutation = entry->second.FindPermutation<true>(runtime, push_data_cursor)) {

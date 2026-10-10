@@ -117,6 +117,8 @@ bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size)
 bool                   TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size);
 // Experimental: submits the GPU work recorded so far and waits for it (GPU thread only).
 void                   SyncGpuForShaderReads();
+// True once after a shader setup read copied GPU-written images back to guest memory.
+bool                   TakeSetupImageReadback();
 bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size);
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);
 void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept;
