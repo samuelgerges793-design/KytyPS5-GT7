@@ -28,7 +28,9 @@
 #include <functional>
 #include <map>
 #include <span>
+#include <string>
 #include <utility>
+#include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler {
 
@@ -685,6 +687,21 @@ void MarkRuntimeCallShader(uint64_t shader_hash) {
 }
 
 bool SkipRuntimeCallShader(uint64_t shader_hash) {
+	// Experimental: KYTY_SKIP_SHADERS=hash1,hash2 also skips the listed compute dispatches.
+	static const std::vector<uint64_t> skipped = [] {
+		std::vector<uint64_t> list;
+		if (const char* env = std::getenv("KYTY_SKIP_SHADERS"); env != nullptr) {
+			const std::string text(env);
+			size_t            start = 0;
+			while (start < text.size()) {
+				const auto end = std::min(text.find(',', start), text.size());
+				if (end > start) list.push_back(std::stoull(text.substr(start, end - start), nullptr, 16));
+				start = end + 1;
+			}
+		}
+		return list;
+	}();
+	if (std::ranges::find(skipped, shader_hash) != skipped.end()) return true;
 	static const bool run = std::getenv("KYTY_RUN_RUNTIME_CALL_SHADERS") != nullptr;
 	if (run) return false;
 	std::scoped_lock lock(g_runtime_call_mutex);
