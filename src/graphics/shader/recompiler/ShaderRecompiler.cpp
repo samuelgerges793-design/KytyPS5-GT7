@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <fmt/format.h>
 #include <functional>
@@ -479,6 +480,9 @@ const ShaderSource::Call* FindCall(const ShaderSource& s, uint32_t instruction) 
 	return nullptr;
 }
 
+// Thrown when a call target depends on values only known while the shader runs.
+struct DynamicCallTarget {};
+
 void PrepareCallTarget(ShaderSource& source, const CompileOptions& options) {
 	using namespace IR;
 	source.calls.clear();
@@ -591,16 +595,16 @@ void PrepareCallTarget(ShaderSource& source, const CompileOptions& options) {
 		const auto index = CFG::FindScalarDefinition(
 		    source.decoded, graph, before, code, [&](uint32_t i) {
 			    const auto& p = EnsureProducer(i);
-			    EXIT_NOT_IMPLEMENTED(!p.ready);  // circular dependency
+			    if (!p.ready) throw DynamicCallTarget {};  // circular dependency
 			    return p.values.contains(code);
 		    });
 		if (index == UINT32_MAX) {
-			EXIT_IF(code < query.user_data_base ||
-			        code - query.user_data_base >= query.user_data_count);
+			if (code < query.user_data_base || code - query.user_data_base >= query.user_data_count)
+				throw DynamicCallTarget {};
 			return IREmitter(&block).GetUserData(static_cast<ScalarReg>(code));
 		}
 		auto& producer = EnsureProducer(index);
-		EXIT_IF(!producer.ready || !producer.values.contains(code));
+		if (!producer.ready || !producer.values.contains(code)) throw DynamicCallTarget {};
 		return producer.values.at(code).Resolve();
 	};
 	for (auto& c: source.calls) {
@@ -641,7 +645,7 @@ void PrepareCallTarget(ShaderSource& source, const CompileOptions& options) {
 				printf("TARGET NOT VALID: call@%u reg=s%u\n", c.instruction, call.src0.reg + i);
 				DumpValue(value, 0);
 			}
-			EXIT_IF(!ValidateRuntimeValue(query, value, RuntimeValueType::Integer));
+			if (!ValidateRuntimeValue(query, value, RuntimeValueType::Integer)) throw DynamicCallTarget {};
 			auto& root = query.value_storage.emplace_back(ValueOpcode::ReferenceU32);
 			root.SetArg(0, value);
 			c.target[i] = Value(&root);
@@ -681,7 +685,31 @@ ShaderSource PrepareShaderSource(std::span<const uint32_t> code, const CompileOp
 		Decoder::DecodeProgram(code, source.decoded);
 	}
 	if (source.decoded.has_swap_pc) {
-		PrepareCallTarget(source, options);
+		try {
+			PrepareCallTarget(source, options);
+		} catch (const DynamicCallTarget&) {
+			// Experimental stopgap: the callee is chosen while the shader runs, which is not
+			// supported yet. Turn each call into a no-op as if the callee returned immediately.
+			static std::atomic_int reports = 0;
+			if (reports++ < 16) {
+				Log::WriteToConsoleAndLog(fmt::format(
+				    "warning: {} shader 0x{:016x} calls a runtime-selected function; skipping its "
+				    "calls\n",
+				    StageName(options.stage), options.shader_hash));
+			}
+			for (auto& inst: source.decoded.instructions) {
+				if (inst.opcode == Decoder::Opcode::S_SWAPPC_B64) {
+					inst.opcode    = Decoder::Opcode::S_NOP;
+					inst.src_count = 0;
+				}
+			}
+			source.decoded.has_swap_pc = false;
+			source.calls.clear();
+			source.call_targets = {};
+			source.linked.reset();
+			source.reads.clear();
+			return source;
+		}
 		source.code.assign(code.begin(), code.end());
 		source.decoded.code = source.code;
 	}
