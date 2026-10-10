@@ -703,6 +703,19 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			continue;
 		}
 
+		// GT7 submits command buffers whose tail is zero-filled; treat zero dwords as padding.
+		if (packet_header == 0u) {
+			static std::atomic<uint32_t> zero_log_count {0};
+			if (zero_log_count.fetch_add(1) < 8) {
+				Log::WriteToConsoleAndLog(fmt::format(
+				    "PM4: skipping zero padding at offset 0x{:05x} of {} dwords\n",
+				    cursor.offset_dw, total_dw));
+			}
+			cursor.offset_dw++;
+			execution.m_made_progress = true;
+			continue;
+		}
+
 		EXIT_NOT_IMPLEMENTED(remaining_dw < 2);
 
 		if (GraphicsRunDebugDumpEnabled()) {
