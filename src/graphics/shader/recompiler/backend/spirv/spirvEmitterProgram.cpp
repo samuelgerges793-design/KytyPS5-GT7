@@ -815,8 +815,6 @@ void EmitProgram(EmitterState& state) {
 			if (guarded) {
 				// Per pixel or vertex, nested loops multiply: graphics stages count every guarded
 				// branch against one invocation-wide budget.
-				static uint32_t shared_unused = 0;
-				(void)shared_unused;
 				uint32_t counter = 0;
 				if (state.program.stage != ShaderType::Compute && !state.loop_watchdogs.empty()) {
 					counter = state.loop_watchdogs.begin()->second;
