@@ -1,8 +1,10 @@
 #include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
 
 #include "common/assert.h"
+#include "common/logging/log.h"
 
 #include <algorithm>
+#include <atomic>
 #include <fmt/format.h>
 #include <iterator>
 #include <deque>
@@ -1708,7 +1710,19 @@ uint32_t FindScalarDefinition(const Decoder::Program& program, const Graph& grap
 		uint32_t reached = Unset;
 		for (uint32_t i = from; i > block->inst_begin;) {
 			const auto& inst = program.instructions[--i];
-			EXIT_IF(inst.opcode == Opcode::S_SWAPPC_B64);
+			if (inst.opcode == Opcode::S_SWAPPC_B64 && !MayWriteScalarRegister(inst, code)) {
+				// Experimental: assume the earlier callee preserves the traced register (the RDNA
+				// calling convention keeps s30 and above). Log the program so this can be checked.
+				static std::atomic_int reports = 0;
+				if (reports++ < 4) {
+					Log::WriteToConsoleAndLog(fmt::format(
+					    "warning: tracing s{} back from instruction {} crosses the call at pc "
+					    "0x{:08x}; assuming the callee preserves it{}\n{}",
+					    code, before, inst.pc, code < 30u ? " (UNSAFE: below s30)" : "",
+					    reports == 1 ? Decoder::ProgramToString(program) : std::string()));
+				}
+				continue;
+			}
 			if (MayWriteScalarRegister(inst, code)) {
 				reached = i;
 				break;

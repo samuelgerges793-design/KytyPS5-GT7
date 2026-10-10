@@ -79,7 +79,9 @@ std::string DriverCacheSignature(const vk::PhysicalDeviceProperties& properties)
 		uuid[i * 2]     = hex[properties.pipelineCacheUUID[i] >> 4u];
 		uuid[i * 2 + 1] = hex[properties.pipelineCacheUUID[i] & 0xfu];
 	}
-	return fmt::format("KytyPC1:{}:{:08x}:{:08x}:{:08x}:{}\n", KYTY_GIT_REVISION,
+	// Development builds share one cache: the driver matches entries by the exact shader and
+	// state, so translation changes miss instead of reusing stale pipelines.
+	return fmt::format("KytyPC1:{}:{:08x}:{:08x}:{:08x}:{}\n", "gt7-dev",
 	                   properties.vendorID, properties.deviceID, properties.driverVersion, uuid);
 }
 
