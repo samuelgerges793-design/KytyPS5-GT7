@@ -33,12 +33,31 @@ static int KYTY_SYSV_ABI UsbdHandleEventsTimeout() {
 	return OK;
 }
 
+// No USB devices are emulated: the list is empty but must still be a valid, null-terminated
+// array, because games walk it instead of trusting the returned count.
+static int KYTY_SYSV_ABI UsbdGetDeviceList(void*** list) {
+	PRINT_NAME();
+
+	static void* empty_list[1] = {nullptr};
+	if (list == nullptr) {
+		return LibKernel::KERNEL_ERROR_EINVAL;
+	}
+	*list = empty_list;
+	return 0;
+}
+
+static void KYTY_SYSV_ABI UsbdFreeDeviceList(void** /*list*/, int /*unref_devices*/) {
+	PRINT_NAME();
+}
+
 } // namespace Usbd
 
 LIB_DEFINE(InitUsbd_1) {
 	LIB_FUNC("TOhg7P6kTH4", Usbd::UsbdInit);
 	LIB_FUNC("Fq6+0Fm55xU", Usbd::UsbdExit);
 	LIB_FUNC("+wU6CGuZcWk", Usbd::UsbdHandleEventsTimeout);
+	LIB_FUNC("8qB9Ar4P5nc", Usbd::UsbdGetDeviceList);
+	LIB_FUNC("EQ6SCLMqzkM", Usbd::UsbdFreeDeviceList);
 }
 
 } // namespace Libs
