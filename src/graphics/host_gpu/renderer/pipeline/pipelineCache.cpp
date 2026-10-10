@@ -658,7 +658,7 @@ struct PipelineCache::ProgramCache {
 		DumpShaderOriginal(stage_name, recipe.hash, recipe.code);
 		const auto source = ShaderRecompiler::PrepareShaderSource(recipe.code, options);
 		// A SWAPPC program links guest functions that the record does not hold.
-		if (source.call) {
+		if (!source.calls.empty()) {
 			return std::nullopt;
 		}
 		auto translated = ShaderRecompiler::TranslateProgram(source.decoded, options);
