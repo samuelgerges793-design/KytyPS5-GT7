@@ -5,6 +5,7 @@
 #include "common/profiler.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/masterSemaphore.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
@@ -19,12 +20,58 @@
 #include "graphics/shader/shader.h"
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
+#include <chrono>
+#include <fmt/format.h>
 #include <limits>
 #include <span>
 #include <vector>
 
 namespace Libs::Graphics {
+
+namespace {
+
+// Asks the driver whether its pipeline cache supplied a pipeline, and times the creation. Both
+// go to the perf report; a steady stream of misses means pipelines are new to the cache.
+class PipelineCacheFeedback {
+public:
+	explicit PipelineCacheFeedback(const void* next) {
+		m_info.pNext                     = next;
+		m_info.pPipelineCreationFeedback = &m_feedback;
+	}
+	PipelineCacheFeedback(const PipelineCacheFeedback&)            = delete;
+	PipelineCacheFeedback& operator=(const PipelineCacheFeedback&) = delete;
+
+	const void* Chain() const { return &m_info; }
+
+	void Report(const char* kind) const {
+		const auto ns = static_cast<uint64_t>(
+		    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
+		                                                         m_start)
+		        .count());
+		const bool valid = (m_feedback.flags & vk::PipelineCreationFeedbackFlagBits::eValid) ==
+		                   vk::PipelineCreationFeedbackFlagBits::eValid;
+		const bool hit =
+		    valid && (m_feedback.flags &
+		              vk::PipelineCreationFeedbackFlagBits::eApplicationPipelineCacheHit) ==
+		                 vk::PipelineCreationFeedbackFlagBits::eApplicationPipelineCacheHit;
+		PerfAdd(hit ? PerfCounter::PipelineCacheHit : PerfCounter::PipelineCacheMiss, ns);
+		static std::atomic<uint32_t> logged {0};
+		if (!hit && ns > 50'000'000ull && logged.fetch_add(1, std::memory_order_relaxed) < 40) {
+			Log::WriteToConsoleAndLog(fmt::format("pipeline cache miss: {} {:.0f} ms{}\n", kind,
+			                                      static_cast<double>(ns) / 1e6,
+			                                      valid ? "" : " (driver gave no feedback)"));
+		}
+	}
+
+private:
+	vk::PipelineCreationFeedback           m_feedback {};
+	vk::PipelineCreationFeedbackCreateInfo m_info {};
+	std::chrono::steady_clock::time_point  m_start = std::chrono::steady_clock::now();
+};
+
+} // namespace
 
 // IDK: maybe we can remove it?
 constexpr uint8_t kTemporaryVertexAttribFormat113 =
@@ -541,8 +588,11 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		     (with_depth ? "true" : "false"), (static_params.blend_enable[0] ? "true" : "false"),
 		     dynamic_state.dynamicStateCount);
 	}
+	PipelineCacheFeedback feedback(pipeline_info.pNext);
+	pipeline_info.pNext = feedback.Chain();
 	result = graphics.device.createGraphicsPipelines(driver_cache, 1, &pipeline_info, nullptr,
 	                                                 &pipeline.pipeline);
+	feedback.Report("graphics");
 	if (graphics_debug_dump_enabled()) {
 		LOGF("PipelineTrace: vkCreateGraphicsPipelines done result=%s pipeline=%p\n",
 		     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));
@@ -612,8 +662,11 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 
 	LOGF("PipelineTrace: vkCreateComputePipelines begin layout=%p\n",
 	     static_cast<void*>(pipeline.pipeline_layout));
+	PipelineCacheFeedback feedback(info.pNext);
+	info.pNext = feedback.Chain();
 	result = graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr,
 	                                                &pipeline.pipeline);
+	feedback.Report("compute");
 	LOGF("PipelineTrace: vkCreateComputePipelines done result=%s pipeline=%p\n",
 	     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);

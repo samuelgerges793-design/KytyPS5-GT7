@@ -36,13 +36,16 @@
 #include <fmt/format.h>
 #include <functional>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <span>
 #include <spirv-tools/libspirv.hpp>
 #include <stop_token>
+#include <string>
 #include <string_view>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 #include <xxhash.h>
@@ -224,6 +227,147 @@ bool ValidateShaderSpirv(const char* label, uint64_t shader_hash,
 	           label, shader_hash, messages.c_str());
 	LOGF("%s\n", text.c_str());
 	return false;
+}
+
+// Why new shader variants and pipelines keep appearing: each compile and each pipeline creation
+// records the reasons it was needed, logged per event (first few hundred) and summarized per
+// shader every minute. KYTY_NO_VARIANT_LOG turns it off.
+class VariantLog {
+public:
+	static VariantLog& Get() {
+		static VariantLog log;
+		return log;
+	}
+
+	bool Enabled() const { return m_enabled; }
+
+	void NoteShader(uint64_t hash, ShaderType stage, const std::vector<std::string>& reasons) {
+		if (!m_enabled) return;
+		std::scoped_lock lock(m_mutex);
+		auto& entry = m_shaders[hash];
+		entry.stage = stage;
+		entry.variants++;
+		for (const auto& reason: reasons) entry.reasons[reason]++;
+		if (m_shader_lines++ < 400) {
+			std::string text = fmt::format("variant: {} 0x{:016x} #{}:", static_cast<int>(stage), hash,
+			                               entry.variants);
+			for (const auto& reason: reasons) text += " " + reason;
+			Log::WriteToConsoleAndLog(text + "\n");
+		}
+		MaybeSummarize();
+	}
+
+	void NotePipeline(const std::vector<std::string>& reasons) {
+		if (!m_enabled) return;
+		std::scoped_lock lock(m_mutex);
+		m_pipelines++;
+		for (const auto& reason: reasons) m_pipeline_reasons[reason]++;
+		if (m_pipeline_lines++ < 300) {
+			std::string text = "pipeline variant:";
+			for (const auto& reason: reasons) text += " " + reason;
+			Log::WriteToConsoleAndLog(text + "\n");
+		}
+		MaybeSummarize();
+	}
+
+private:
+	struct ShaderStats {
+		ShaderType                      stage    = ShaderType::Unknown;
+		uint32_t                        variants = 0;
+		std::map<std::string, uint32_t> reasons;
+	};
+
+	static std::string TopReasons(const std::map<std::string, uint32_t>& reasons, size_t count) {
+		std::vector<std::pair<std::string, uint32_t>> sorted(reasons.begin(), reasons.end());
+		std::ranges::sort(sorted, [](const auto& a, const auto& b) { return a.second > b.second; });
+		std::string text;
+		for (size_t i = 0; i < sorted.size() && i < count; i++) {
+			text += fmt::format(" {}x{}", sorted[i].first, sorted[i].second);
+		}
+		return text;
+	}
+
+	void MaybeSummarize() {
+		const auto now = std::chrono::steady_clock::now();
+		if (now - m_last_summary < std::chrono::seconds(60)) return;
+		m_last_summary = now;
+		std::vector<std::pair<uint64_t, const ShaderStats*>> sorted;
+		std::map<std::string, uint32_t>                       all_reasons;
+		uint32_t                                              total = 0;
+		for (const auto& [hash, stats]: m_shaders) {
+			sorted.emplace_back(hash, &stats);
+			total += stats.variants;
+			for (const auto& [reason, count]: stats.reasons) {
+				// Per-slot reasons are pooled by field: "image3.mip_count" -> "image.mip_count".
+				std::string pooled = reason;
+				const auto  dot    = pooled.find('.');
+				if (dot != std::string::npos) {
+					auto start = dot;
+					while (start > 0 && std::isdigit(static_cast<unsigned char>(pooled[start - 1]))) start--;
+					pooled.erase(start, dot - start);
+				}
+				all_reasons[pooled] += count;
+			}
+		}
+		std::ranges::sort(sorted, [](const auto& a, const auto& b) { return a.second->variants > b.second->variants; });
+		std::string text = fmt::format("variant summary: {} shader compiles over {} shaders, reasons:{}\n", total,
+		                               m_shaders.size(), TopReasons(all_reasons, 12));
+		text += fmt::format("  {} pipelines, reasons:{}\n", m_pipelines, TopReasons(m_pipeline_reasons, 12));
+		for (size_t i = 0; i < sorted.size() && i < 15; i++) {
+			text += fmt::format("  {} 0x{:016x} variants={}{}\n", static_cast<int>(sorted[i].second->stage),
+			                    sorted[i].first, sorted[i].second->variants,
+			                    TopReasons(sorted[i].second->reasons, 4));
+		}
+		Log::WriteToConsoleAndLog(text);
+	}
+
+	bool                                       m_enabled = std::getenv("KYTY_NO_VARIANT_LOG") == nullptr;
+	std::mutex                                 m_mutex;
+	std::unordered_map<uint64_t, ShaderStats>  m_shaders;
+	std::map<std::string, uint32_t>            m_pipeline_reasons;
+	uint32_t                                   m_pipelines     = 0;
+	uint32_t                                   m_shader_lines   = 0;
+	uint32_t                                   m_pipeline_lines = 0;
+	std::chrono::steady_clock::time_point      m_last_summary = std::chrono::steady_clock::now();
+};
+
+// The specialization fields that differ between an existing variant and the one being compiled.
+void DiffSpecialization(const ShaderRecompiler::IR::ResourceSpecialization& from,
+                        const ShaderRecompiler::IR::ResourceSpecialization& to,
+                        std::vector<std::string>&                           reasons) {
+	const auto field = [&reasons](const char* kind, size_t slot, const char* name, auto a, auto b) {
+		if (a != b) {
+			reasons.push_back(fmt::format("{}{}.{}({}->{})", kind, slot, name,
+			                              static_cast<uint64_t>(a), static_cast<uint64_t>(b)));
+		}
+	};
+	if (from.buffers.size() != to.buffers.size()) reasons.emplace_back("buffer-count");
+	for (size_t i = 0; i < std::min(from.buffers.size(), to.buffers.size()); i++) {
+		const auto& a = from.buffers[i];
+		const auto& b = to.buffers[i];
+		field("buffer", i, "stride", a.packed_stride, b.packed_stride);
+		field("buffer", i, "format", a.descriptor_format, b.descriptor_format);
+		field("buffer", i, "swizzle", a.descriptor_swizzle, b.descriptor_swizzle);
+		field("buffer", i, "zero_stride_oob", a.zero_stride_oob, b.zero_stride_oob);
+		field("buffer", i, "indirect_root", a.indirect_root, b.indirect_root);
+		field("buffer", i, "indirect_offset", a.indirect_mapping_offset, b.indirect_mapping_offset);
+		field("buffer", i, "indirect_search", a.indirect_search_iterations, b.indirect_search_iterations);
+	}
+	if (from.images.size() != to.images.size()) reasons.emplace_back("image-count");
+	for (size_t i = 0; i < std::min(from.images.size(), to.images.size()); i++) {
+		const auto& a = from.images[i];
+		const auto& b = to.images[i];
+		field("image", i, "numeric_class", a.numeric_class, b.numeric_class);
+		field("image", i, "dimension", a.dimension, b.dimension);
+		field("image", i, "mip_count", a.mip_count, b.mip_count);
+		field("image", i, "conversion_format", a.conversion_format, b.conversion_format);
+		field("image", i, "swizzle", a.shader_swizzle, b.shader_swizzle);
+		field("image", i, "indirect_root", a.indirect_root, b.indirect_root);
+		field("image", i, "indirect_offset", a.indirect_mapping_offset, b.indirect_mapping_offset);
+		field("image", i, "indirect_search", a.indirect_search_iterations, b.indirect_search_iterations);
+		field("image", i, "cube", a.cube, b.cube);
+		field("image", i, "fmask", a.fmask, b.fmask);
+	}
 }
 
 } // namespace
@@ -519,6 +663,9 @@ struct PipelineCache::ProgramCache {
 			}
 		}
 
+		if (VariantLog::Get().Enabled()) {
+			NoteVariantReasons(entry, source_changed, push_data_cursor);
+		}
 		PerfScope  compile_time(PerfCounter::CommandThreadCompile);
 		const auto options    = MakeOptions(params.hash, user_data, params.back_code, input_info);
 		const auto stage_name = GetStageNames(stage).name;
@@ -583,6 +730,70 @@ struct PipelineCache::ProgramCache {
 		            counts[static_cast<size_t>(ShaderType::TessellationControl)],
 		            counts[static_cast<size_t>(ShaderType::TessellationEvaluation)]);
 		return permutation.handle;
+	}
+
+	// Records why the shader in `lookup_key` needs a new variant (see VariantLog). For a new key
+	// the existing key of the same shader shows which static state changed; for a known key, the
+	// closest recorded variant shows which specialization fields changed.
+	void NoteVariantReasons(ProgramMap::iterator entry, bool source_changed,
+	                        uint32_t push_data_cursor) {
+		std::vector<std::string> reasons;
+		if (entry == programs.end()) {
+			const ProgramKey* sibling = nullptr;
+			for (const auto& [key, source]: programs) {
+				if (key.stage == lookup_key.stage && key.hash == lookup_key.hash) {
+					sibling = &key;
+					break;
+				}
+			}
+			if (sibling == nullptr) {
+				reasons.emplace_back("first-use");
+			} else if (sibling->user_data_count != lookup_key.user_data_count ||
+			           sibling->code_size != lookup_key.code_size) {
+				reasons.emplace_back("code-or-user-data-size");
+			} else if (sibling->static_state.size() != lookup_key.static_state.size()) {
+				reasons.emplace_back("static-state-size");
+			} else {
+				for (size_t i = 0; i < sibling->static_state.size() && reasons.size() < 4; i++) {
+					if (sibling->static_state[i] != lookup_key.static_state[i]) {
+						reasons.push_back(fmt::format("static-word{}({:x}->{:x})", i,
+						                              sibling->static_state[i],
+						                              lookup_key.static_state[i]));
+					}
+				}
+			}
+		} else if (source_changed) {
+			reasons.emplace_back("call-target-code-changed");
+		} else if (entry->second.permutations.empty()) {
+			reasons.emplace_back("first-use");
+		} else {
+			const auto&              current = entry->second;
+			std::vector<std::string> best;
+			bool                     have_best = false;
+			for (const auto& candidate: current.permutations) {
+				std::vector<std::string> diff;
+				const auto& layout = candidate.program.bindings;
+				const auto  start  = ShaderRecompiler::IR::PushData::StartFor(
+                    push_data_cursor, layout.ShaderDataDwords());
+				if (layout.push_data_start_dword != start) {
+					diff.push_back(fmt::format("push-data-start({}->{})", layout.push_data_start_dword, start));
+				}
+				DiffSpecialization(candidate.specialization, current.specialization, diff);
+				if (current.call_source && !std::ranges::equal(candidate.function_code, current.FunctionCode())) {
+					diff.emplace_back("call-target-code");
+				}
+				if (!have_best || diff.size() < best.size()) {
+					best      = std::move(diff);
+					have_best = true;
+				}
+			}
+			reasons = best.empty() ? std::vector<std::string> {"unknown"} : std::move(best);
+			if (reasons.size() > 6) {
+				reasons.resize(6);
+				reasons.emplace_back("...");
+			}
+		}
+		VariantLog::Get().NoteShader(lookup_key.hash, lookup_key.stage, reasons);
 	}
 
 	// `programs` and `lookup_key` belong to the one thread that looks programs up (the GPU thread);
@@ -1491,6 +1702,64 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(
 
 	if (auto iter = m_graphics_pipelines.find(key); iter != m_graphics_pipelines.end()) {
 		return iter->second->ready.load(std::memory_order_acquire) ? iter->second.get() : nullptr;
+	}
+
+	if (VariantLog::Get().Enabled()) {
+		std::vector<std::string>   reasons;
+		const GraphicsPipelineKey* same_programs = nullptr;
+		bool                       same_vs = false, same_ps = false;
+		for (const auto& [other, pipeline]: m_graphics_pipelines) {
+			const bool vs = other.vertex_shader_ids == key.vertex_shader_ids;
+			const bool ps = other.ps_shader_id == key.ps_shader_id;
+			same_vs |= vs;
+			same_ps |= ps;
+			if (vs && ps) {
+				same_programs = &other;
+				break;
+			}
+		}
+		if (same_programs == nullptr) {
+			reasons.emplace_back(!same_vs && !same_ps ? "new-vs+ps" : !same_vs ? "new-vs" : "new-ps");
+		} else {
+			const auto& other = *same_programs;
+			if (!(other.rendering == key.rendering)) {
+				if (other.rendering.color_count != key.rendering.color_count) reasons.emplace_back("color-count");
+				else if (other.rendering.color_formats != key.rendering.color_formats) reasons.emplace_back("color-format");
+				if (other.rendering.depth_format != key.rendering.depth_format ||
+				    other.rendering.stencil_format != key.rendering.stencil_format) {
+					reasons.emplace_back("depth-format");
+				}
+			}
+			if (!(other.vertex_input == key.vertex_input)) {
+				bool stride = other.vertex_input.binding_count != key.vertex_input.binding_count;
+				bool offset = other.vertex_input.attribute_count != key.vertex_input.attribute_count;
+				for (size_t i = 0; i < key.vertex_input.bindings.size(); i++) {
+					stride |= !(other.vertex_input.bindings[i] == key.vertex_input.bindings[i]);
+					offset |= !(other.vertex_input.attributes[i] == key.vertex_input.attributes[i]);
+				}
+				if (stride) reasons.emplace_back("vertex-stride");
+				if (offset) reasons.emplace_back("vertex-attribute-offset");
+			}
+			const auto& a = other.static_params;
+			const auto& b = key.static_params;
+			const auto  differs = [](const auto& x, const auto& y) { return std::memcmp(&x, &y, sizeof(x)) != 0; };
+			if (a.topology != b.topology || a.primitive_restart_enable != b.primitive_restart_enable) reasons.emplace_back("topology");
+			if (a.samples != b.samples || a.sample_shading_enable != b.sample_shading_enable) reasons.emplace_back("samples");
+			if (differs(a.color_mask, b.color_mask)) reasons.emplace_back("color-mask");
+			if (a.cull_front != b.cull_front || a.cull_back != b.cull_back || a.face != b.face ||
+			    a.polygon_mode != b.polygon_mode || a.provoking_vtx_last != b.provoking_vtx_last) {
+				reasons.emplace_back("raster");
+			}
+			if (a.negative_one_to_one != b.negative_one_to_one || a.depth_clip_enable != b.depth_clip_enable) reasons.emplace_back("clip");
+			if (differs(a.blend_enable, b.blend_enable) || differs(a.color_srcblend, b.color_srcblend) ||
+			    differs(a.color_destblend, b.color_destblend) || differs(a.color_comb_fcn, b.color_comb_fcn) ||
+			    differs(a.alpha_srcblend, b.alpha_srcblend) || differs(a.alpha_destblend, b.alpha_destblend) ||
+			    differs(a.alpha_comb_fcn, b.alpha_comb_fcn) || differs(a.separate_alpha_blend, b.separate_alpha_blend)) {
+				reasons.emplace_back("blend");
+			}
+			if (reasons.empty()) reasons.emplace_back("unknown");
+		}
+		VariantLog::Get().NotePipeline(reasons);
 	}
 
 	if (graphics_debug_dump_enabled()) {

@@ -62,6 +62,9 @@ enum class PerfCounter {
 	GpuThreadIdle,
 	GpuThreadBlocked,
 	DrawsWaitingForPipeline,
+	// Driver pipeline cache result per created pipeline (time = creation time).
+	PipelineCacheHit,
+	PipelineCacheMiss,
 	Count
 };
 void PerfAdd(PerfCounter counter, uint64_t nanoseconds);
