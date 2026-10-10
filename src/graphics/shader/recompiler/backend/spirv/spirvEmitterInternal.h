@@ -21,6 +21,7 @@
 #include <type_traits>
 #include <unordered_map>
 #include <utility>
+#include <unordered_set>
 #include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
@@ -143,6 +144,9 @@ struct EmitterState {
 	std::unordered_map<const IR::Block*, uint32_t> loop_watchdogs;
 	// Watchdog-guarded blocks that break out of a loop body, with whether "true" is the exit.
 	std::unordered_map<const IR::Block*, bool> loop_watchdog_breaks;
+	// Guarded blocks of waterfall loops (one pass per distinct lane value, so at most a wave's
+	// lanes): these get a cap just above the wave size instead of the stage's general cap.
+	std::unordered_set<const IR::Block*> loop_watchdog_waterfalls;
 	uint32_t                   subgroup_local_invocation_id_variable = 0;
 	uint32_t                   per_vertex_variable                   = 0;
 	uint32_t                   point_size_variable                   = 0;

@@ -575,6 +575,10 @@ struct PipelineCache::ProgramCache {
 			     options.shader_hash);
 		}
 		DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
+		if (const auto guards = ShaderRecompiler::LastWaterfallLoopGuards(); guards != 0) {
+			Log::WriteToConsoleAndLog(fmt::format("watchdog: {} 0x{:016x} waterfall loop exits capped ({})\n",
+			                                      stage_name, options.shader_hash, guards));
+		}
 
 		const auto module = CompileSPV(result.spirv, device);
 		EXIT_IF(module == nullptr);

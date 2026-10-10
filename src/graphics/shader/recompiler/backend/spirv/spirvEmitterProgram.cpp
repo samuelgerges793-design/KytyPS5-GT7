@@ -12,6 +12,16 @@
 #include <unordered_set>
 #include <utility>
 
+namespace Libs::Graphics::ShaderRecompiler {
+namespace {
+thread_local uint32_t g_last_waterfall_guards = 0;
+} // namespace
+
+uint32_t LastWaterfallLoopGuards() {
+	return g_last_waterfall_guards;
+}
+} // namespace Libs::Graphics::ShaderRecompiler
+
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
 
@@ -140,8 +150,9 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block) {
 				builder.AddFunction(spv::OpStore, guard->second, counted);
 				// Graphics stages run per pixel or vertex, so a lower cap keeps a runaway loop
 				// within the GPU timeout.
-				const auto limit = ctx.state.program.stage == ShaderType::Compute ? 1u << 16u
-				                                                                  : 1u << 10u;
+				const auto limit = ctx.state.loop_watchdog_waterfalls.contains(block) ? 256u
+				                   : ctx.state.program.stage == ShaderType::Compute ? 1u << 16u
+				                                                                    : 1u << 10u;
 				builder.AddFunction(spv::OpUGreaterThan, TypeBool(ctx.state), over, counted,
 				                    ConstantU32(ctx.state, limit));
 				// The exit is the merge target: the header's own merge, for a back-edge block the
@@ -773,6 +784,8 @@ void EmitProgram(EmitterState& state) {
 	}
 	state.loop_watchdogs.clear();
 	state.loop_watchdog_breaks.clear();
+	state.loop_watchdog_waterfalls.clear();
+	g_last_waterfall_guards = 0;
 	static const bool watchdog = std::getenv("KYTY_NO_LOOP_WATCHDOG") == nullptr;
 	if (watchdog && !state.program.dispatcher_fallback) {
 		std::unordered_map<const IR::Block*, const IR::Block*> loop_merges;
@@ -800,6 +813,58 @@ void EmitProgram(EmitterState& state) {
 			}
 			return false;
 		};
+		// Waterfall loops: a ReadFirstLane of x compared against x picks one lane value per pass.
+		// Loops span the blocks from their header up to their merge in program order.
+		std::unordered_map<const IR::Block*, size_t> block_index;
+		for (size_t i = 0; i < program.blocks.size(); i++) block_index.emplace(program.blocks[i], i);
+		const auto is_waterfall_body = [&](size_t first, size_t last) {
+			for (size_t i = first; i < last; i++) {
+				for (const auto& inst: program.blocks[i]->Instructions()) {
+					if (inst.GetOpcode() != IR::ValueOpcode::ReadFirstLane || inst.NumArgs() == 0) continue;
+					const auto source = inst.Arg(0);
+					for (size_t j = first; j < last; j++) {
+						for (const auto& user: program.blocks[j]->Instructions()) {
+							if (user.NumArgs() < 2) continue;
+							bool uses_first = false, uses_source = false;
+							for (size_t a = 0; a < user.NumArgs(); a++) {
+								const auto arg = user.Arg(a);
+								uses_first |= arg.TryInstruction() == &inst;
+								uses_source |= arg == source;
+							}
+							if (uses_first && uses_source) return true;
+						}
+					}
+				}
+			}
+			return false;
+		};
+		std::vector<std::pair<size_t, size_t>> waterfall_ranges;
+		for (const auto& [header, merge]: loop_merges) {
+			const auto first = block_index.find(header);
+			const auto last  = block_index.find(merge);
+			if (first != block_index.end() && last != block_index.end() && first->second < last->second &&
+			    is_waterfall_body(first->second, last->second)) {
+				waterfall_ranges.emplace_back(first->second, last->second);
+			}
+		}
+		const auto in_waterfall = [&](const IR::Block* block) {
+			const auto index = block_index.at(block);
+			// The innermost loop around the block decides; an inner ordinary loop keeps its cap.
+			size_t best_size = SIZE_MAX;
+			bool   waterfall  = false;
+			for (const auto& [header, merge]: loop_merges) {
+				const auto first = block_index.find(header);
+				const auto last  = block_index.find(merge);
+				if (first == block_index.end() || last == block_index.end() || index < first->second ||
+				    index >= last->second || last->second - first->second >= best_size) {
+					continue;
+				}
+				best_size  = last->second - first->second;
+				waterfall  = std::ranges::find(waterfall_ranges, std::pair {first->second, last->second}) !=
+				            waterfall_ranges.end();
+			}
+			return waterfall;
+		};
 		for (const auto* block: program.blocks) {
 			const auto& term = block->terminator;
 			bool guarded = exits_loop(block);
@@ -817,6 +882,10 @@ void EmitProgram(EmitterState& state) {
 				                          TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
 				                          counter, spv::StorageClassFunction);
 				state.loop_watchdogs.emplace(block, counter);
+				if (!waterfall_ranges.empty() && in_waterfall(block)) {
+					state.loop_watchdog_waterfalls.insert(block);
+					g_last_waterfall_guards++;
+				}
 			}
 		}
 	}

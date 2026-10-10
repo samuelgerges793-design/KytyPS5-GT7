@@ -66,6 +66,8 @@ struct ShaderSource {
 // unless KYTY_RUN_RUNTIME_CALL_SHADERS is set.
 void               MarkRuntimeCallShader(uint64_t shader_hash);
 [[nodiscard]] bool SkipRuntimeCallShader(uint64_t shader_hash);
+// Waterfall loop guards emitted by this thread's last SPIR-V emission (diagnostics).
+[[nodiscard]] uint32_t LastWaterfallLoopGuards();
 
 [[nodiscard]] ShaderSource PrepareShaderSource(std::span<const uint32_t> code,
 	                                           const CompileOptions& options);
