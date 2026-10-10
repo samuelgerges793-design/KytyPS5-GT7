@@ -141,6 +141,8 @@ struct EmitterState {
 	// Experimental loop watchdog: per-invocation iteration counters for loop headers that already
 	// branch to their merge block (KYTY_NO_LOOP_WATCHDOG disables).
 	std::unordered_map<const IR::Block*, uint32_t> loop_watchdogs;
+	// Watchdog-guarded blocks that break out of a loop body, with whether "true" is the exit.
+	std::unordered_map<const IR::Block*, bool> loop_watchdog_breaks;
 	uint32_t                   subgroup_local_invocation_id_variable = 0;
 	uint32_t                   per_vertex_variable                   = 0;
 	uint32_t                   point_size_variable                   = 0;

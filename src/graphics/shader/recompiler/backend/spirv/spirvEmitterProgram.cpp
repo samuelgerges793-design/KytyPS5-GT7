@@ -138,14 +138,20 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block) {
 				builder.AddFunction(spv::OpIAdd, TypeU32(ctx.state), counted, loaded,
 				                    ConstantU32(ctx.state, 1));
 				builder.AddFunction(spv::OpStore, guard->second, counted);
+				// Graphics stages run per pixel or vertex, so a lower cap keeps a runaway loop
+				// within the GPU timeout.
+				const auto limit = ctx.state.program.stage == ShaderType::Compute ? 1u << 16u
+				                                                                  : 1u << 10u;
 				builder.AddFunction(spv::OpUGreaterThan, TypeBool(ctx.state), over, counted,
-				                    ConstantU32(ctx.state, 1u << 16u));
-				// The exit is the merge target: the header's own merge, or for a back-edge block the
-				// target that is not a loop header.
+				                    ConstantU32(ctx.state, limit));
+				// The exit is the merge target: the header's own merge, for a back-edge block the
+				// target that is not a loop header, or for a break the loop's merge block.
+				const auto brk = ctx.state.loop_watchdog_breaks.find(block);
 				const bool exit_is_true =
-				    term.loop_header ? term.merge_block == true_block
-				                     : false_block->terminator.loop_header &&
-				                           false_block->terminator.merge_block == true_block;
+				    brk != ctx.state.loop_watchdog_breaks.end() ? brk->second
+				    : term.loop_header ? term.merge_block == true_block
+				                       : false_block->terminator.loop_header &&
+				                             false_block->terminator.merge_block == true_block;
 				if (exit_is_true) {
 					builder.AddFunction(spv::OpLogicalOr, TypeBool(ctx.state), guarded, condition,
 					                    over);
@@ -766,12 +772,15 @@ void EmitProgram(EmitterState& state) {
 		}
 	}
 	state.loop_watchdogs.clear();
+	state.loop_watchdog_breaks.clear();
 	static const bool watchdog = std::getenv("KYTY_NO_LOOP_WATCHDOG") == nullptr;
 	if (watchdog && !state.program.dispatcher_fallback) {
 		std::unordered_map<const IR::Block*, const IR::Block*> loop_merges;
+		std::unordered_set<const IR::Block*>                   merge_blocks;
 		for (const auto* block: program.blocks) {
 			if (block->terminator.loop_header && block->terminator.merge_block != nullptr) {
 				loop_merges.emplace(block, block->terminator.merge_block);
+				merge_blocks.insert(block->terminator.merge_block);
 			}
 		}
 		const auto exits_loop = [&](const IR::Block* block) {
@@ -792,7 +801,17 @@ void EmitProgram(EmitterState& state) {
 			return false;
 		};
 		for (const auto* block: program.blocks) {
-			if (exits_loop(block)) {
+			const auto& term = block->terminator;
+			bool guarded = exits_loop(block);
+			if (!guarded && !term.loop_header &&
+			    term.kind == CFG::TerminatorKind::ConditionalBranch && !block->condition.IsEmpty() &&
+			    term.true_block != nullptr && term.false_block != nullptr &&
+			    merge_blocks.contains(term.true_block) != merge_blocks.contains(term.false_block)) {
+				// A break out of a loop body: exits that only lanes running out of work take.
+				state.loop_watchdog_breaks.emplace(block, merge_blocks.contains(term.true_block));
+				guarded = true;
+			}
+			if (guarded) {
 				const auto counter = state.builder.AllocateId();
 				state.builder.AddFunction(spv::OpVariable,
 				                          TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
