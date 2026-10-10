@@ -9,6 +9,7 @@
 #include "graphics/shader/shader.h"
 
 #include <cstddef>
+#include <chrono>
 #include <filesystem>
 #include <memory>
 #include <span>
@@ -106,6 +107,8 @@ public:
 	~PipelineCache();
 	KYTY_CLASS_NO_COPY(PipelineCache);
 	void Save();
+	// Writes the driver cache without releasing it, so crashes keep earlier compiles.
+	bool WriteDriverCache();
 
 	struct Pipeline {
 		vk::PipelineLayout      pipeline_layout       = nullptr;
@@ -176,6 +179,10 @@ private:
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
 	                                                        m_graphics_pipelines;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
+
+	uint32_t                              m_pipelines_since_save = 0;
+	std::chrono::steady_clock::time_point m_last_save            = std::chrono::steady_clock::now();
+	void                                  NotePipelineCreated();
 
 	void InitializeDriverCache();
 };

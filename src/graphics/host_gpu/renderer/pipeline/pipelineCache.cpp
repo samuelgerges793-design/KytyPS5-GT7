@@ -589,6 +589,26 @@ void PipelineCache::Save() {
 	if (m_driver_cache == nullptr) {
 		return;
 	}
+	WriteDriverCache();
+	m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
+	m_driver_cache = nullptr;
+}
+
+void PipelineCache::NotePipelineCreated() {
+	// Save periodically: the final save only runs when the window closes normally.
+	m_pipelines_since_save++;
+	const auto now = std::chrono::steady_clock::now();
+	if (m_pipelines_since_save >= 50 && now - m_last_save >= std::chrono::seconds(30)) {
+		WriteDriverCache();
+		m_pipelines_since_save = 0;
+		m_last_save            = now;
+	}
+}
+
+bool PipelineCache::WriteDriverCache() {
+	if (m_driver_cache == nullptr) {
+		return false;
+	}
 
 	size_t               size = 0;
 	vk::Result           result;
@@ -610,7 +630,7 @@ void PipelineCache::Save() {
 	    size > std::numeric_limits<uint32_t>::max()) {
 		PipelineCacheLog("Vulkan pipeline cache: save failed ({}, {} bytes)",
 		                 vk::to_string(result), size);
-		return;
+		return false;
 	}
 	payload.resize(size);
 	auto       prefix       = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
@@ -618,7 +638,7 @@ void PipelineCache::Save() {
 	prefix.append(reinterpret_cast<const char*>(&payload_hash), sizeof(payload_hash));
 	if (!Common::File::CreateDirectories(m_driver_cache_path.parent_path())) {
 		PipelineCacheLog("Vulkan pipeline cache: failed to create cache directory");
-		return;
+		return false;
 	}
 	auto temp_path = m_driver_cache_path;
 	temp_path += ".tmp";
@@ -635,12 +655,11 @@ void PipelineCache::Save() {
 	    !Common::File::RenameFile(temp_path, m_driver_cache_path)) {
 		PipelineCacheLog("Vulkan pipeline cache: failed to write {}",
 		                 Common::PathToString(m_driver_cache_path));
-		return;
+		return false;
 	}
 	PipelineCacheLog("Vulkan pipeline cache: saved {} bytes to {}", payload.size(),
 	                 Common::PathToString(m_driver_cache_path));
-	m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
-	m_driver_cache = nullptr;
+	return true;
 }
 
 PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
@@ -954,6 +973,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 
 	auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
 	EXIT_IF(!inserted);
+	NotePipelineCreated();
 
 	return *iter->second;
 }
@@ -982,6 +1002,7 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 
 	auto [iter, inserted] = m_compute_pipelines.emplace(compute_program.id, std::move(cached));
 	EXIT_IF(!inserted);
+	NotePipelineCreated();
 
 	return *iter->second;
 }
