@@ -139,7 +139,7 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block) {
 				                    ConstantU32(ctx.state, 1));
 				builder.AddFunction(spv::OpStore, guard->second, counted);
 				builder.AddFunction(spv::OpUGreaterThan, TypeBool(ctx.state), over, counted,
-				                    ConstantU32(ctx.state, 1u << 20u));
+				                    ConstantU32(ctx.state, 1u << 16u));
 				// The exit is the merge target: the header's own merge, or for a back-edge block the
 				// target that is not a loop header.
 				const bool exit_is_true =
