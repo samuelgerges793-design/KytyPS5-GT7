@@ -112,6 +112,56 @@ void EmitMemoryOffsets(EmitterState& state) {
 			    state, word, ConstantU32(state, lane * 8u), ConstantU32(state, 8u));
 		}
 	}
+	const auto& bindings = state.program.bindings;
+	if (bindings.write_track_dword != IR::PushData::NoStart) {
+		for (uint32_t i = 0; i < count; ++i) {
+			if (((bindings.tracked_writes >> i) & 1u) != 0) {
+				state.write_track_info[i] = EmitShaderDataDwordLoad(state, bindings.write_track_dword + i);
+			}
+		}
+	}
+}
+
+void EmitWriteTrackMark(EmitterState& state, uint32_t descriptor, uint32_t byte) {
+	if (descriptor >= IR::ShaderInfo::MaxBuffers ||
+	    ((state.program.bindings.tracked_writes >> descriptor) & 1u) == 0) {
+		return;
+	}
+	const auto info = state.write_track_info[descriptor];
+	if (info == 0 || state.write_tracker_variable == 0) {
+		EXIT("write tracking was not prepared at function entry\n");
+	}
+	state.emitted_write_marks |= uint64_t {1} << descriptor;
+	const auto tracked = Binary(state, spv::OpINotEqual, TypeBool(state), info,
+	                            ConstantU32(state, IR::WriteTrackUntracked));
+	EmitIfCondition(state, tracked, [&]() {
+		const auto low  = Binary(state, spv::OpBitwiseAnd, TypeU32(state), info, ConstantU32(state, 0xfffu));
+		const auto base = Binary(state, spv::OpShiftRightLogical, TypeU32(state), info, ConstantU32(state, 12u));
+		const auto page = Binary(state, spv::OpShiftRightLogical, TypeU32(state),
+		                         Binary(state, spv::OpIAdd, TypeU32(state), low, byte),
+		                         ConstantU32(state, 12u));
+		auto       bit  = Binary(state, spv::OpIAdd, TypeU32(state), base, page);
+		bit = Select(state, TypeU32(state),
+		             Binary(state, spv::OpULessThan, TypeBool(state), bit, ConstantU32(state, IR::WriteTrackerBits)),
+		             bit, ConstantU32(state, IR::WriteTrackerBits - 1u));
+		const auto word = Binary(state, spv::OpShiftRightLogical, TypeU32(state), bit, ConstantU32(state, 5u));
+		const auto mask = Binary(state, spv::OpShiftLeftLogical, TypeU32(state), ConstantU32(state, 1u),
+		                         Binary(state, spv::OpBitwiseAnd, TypeU32(state), bit, ConstantU32(state, 31u)));
+		const auto pointer = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state), pointer,
+		                          state.write_tracker_variable, ConstantU32(state, 0), word);
+		const auto old = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, TypeU32(state), old, pointer);
+		// A stale load only costs a redundant atomic.
+		const auto clear = Binary(state, spv::OpIEqual, TypeBool(state),
+		                          Binary(state, spv::OpBitwiseAnd, TypeU32(state), old, mask),
+		                          ConstantU32(state, 0u));
+		EmitIfCondition(state, clear, [&]() {
+			state.builder.AddFunction(spv::OpAtomicOr, TypeU32(state), state.builder.AllocateId(), pointer,
+			                          ConstantU32(state, spv::ScopeDevice),
+			                          ConstantU32(state, spv::MemorySemanticsMaskNone), mask);
+		});
+	});
 }
 
 uint32_t LdsDwordCount(const EmitterState& state) {
@@ -169,6 +219,7 @@ MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState& state,
 	state.builder.AddFunction(spv::OpAccessChain, buffer.pointer_type, access.object_pointer,
 	                          buffer.variable, ConstantU32(state, array_index));
 	access.byte_offset = state.memory_byte_offsets[array_index];
+	access.descriptor  = mem.kind == IR::ResourceKind::Buffer ? array_index : UINT32_MAX;
 	access.length      = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpArrayLength, TypeU32(state), access.length,
 	                          access.object_pointer, 0);
@@ -249,6 +300,13 @@ uint32_t EmitMemoryElementPointer(EmitterState& state, const MemoryResourceAcces
 		state.builder.AddFunction(spv::OpAccessChain, TypeU32ElementPointer(state, storage_class),
 		                          pointer, access.object_pointer, index);
 		return pointer;
+	}
+	if (access.write && access.kind == IR::ResourceKind::Buffer) {
+		EmitWriteTrackMark(state, access.descriptor,
+		                   Binary(state, spv::OpShiftLeftLogical, TypeU32(state), index,
+		                          ConstantU32(state, access.element_bits == 8u    ? 0u
+		                                             : access.element_bits == 16u ? 1u
+		                                                                          : 2u)));
 	}
 	return EmitStorageBufferElementPointer(state, access, index,
 	                                       TypeStorageBufferElementPointer(state, access.element_bits));

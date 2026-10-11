@@ -240,6 +240,20 @@ void DefineDescriptors(EmitterState& state) {
 		bindings.dispatch_thread_dword = bindings.memory_offset_dword;
 		bindings.memory_offset_dword += 3u;
 	}
+	bindings.write_track_dword = IR::PushData::NoStart;
+	bindings.tracked_writes    = 0;
+	if (IR::WriteTrackingEnabled()) {
+		for (const auto& buffer: info.buffers) {
+			if (buffer.written && buffer.descriptor_index != UINT32_MAX) {
+				bindings.tracked_writes |= uint64_t {1} << buffer.descriptor_index;
+			}
+		}
+		if (bindings.tracked_writes != 0) {
+			bindings.write_track_dword = bindings.memory_offset_dword + (buffer_count + 3u) / 4u;
+		}
+	}
+	counts[static_cast<size_t>(Kind::WriteTracker)] =
+	    bindings.write_track_dword != IR::PushData::NoStart;
 	bindings.push_data_start_dword =
 	    IR::PushData::StartFor(bindings.push_data_start_dword, bindings.ShaderDataDwords());
 	counts[static_cast<size_t>(Kind::ShaderData)] =
@@ -297,6 +311,10 @@ void DefineDescriptors(EmitterState& state) {
 			case IR::DescriptorBindingKind::FaultBuffer:
 				state.fault_buffer_variable =
 				    Define(StorageBufferType(state, state.storage_buffers[2]), "fault_buffer");
+				break;
+			case IR::DescriptorBindingKind::WriteTracker:
+				state.write_tracker_variable =
+				    Define(StorageBufferType(state, state.storage_buffers[2]), "write_tracker");
 				break;
 			case IR::DescriptorBindingKind::ShaderData:
 				state.shader_data_storage_variable =

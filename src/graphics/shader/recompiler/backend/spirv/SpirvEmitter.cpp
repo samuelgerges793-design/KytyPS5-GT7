@@ -169,6 +169,8 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 	expected[static_cast<size_t>(Kind::SharedMemory)] = uses_lds && lds_storage;
 	expected[static_cast<size_t>(Kind::BdaPagetable)] = program.info.uses_dma;
 	expected[static_cast<size_t>(Kind::FaultBuffer)] = program.info.uses_dma;
+	expected[static_cast<size_t>(Kind::WriteTracker)] =
+	    program.bindings.write_track_dword != IR::PushData::NoStart;
 	expected[static_cast<size_t>(Kind::FlattenedSrt)] = uses_flattened_srt;
 	expected[static_cast<size_t>(Kind::ShaderData)] =
 	    program.bindings.ShaderDataDwords() != 0 && !program.bindings.UsesPushData();
@@ -188,6 +190,10 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 	    (has_dispatch_threads && (program.stage != ShaderType::Compute ||
 	                              program.bindings.dispatch_thread_dword != registers.size())) ||
 	    program.bindings.memory_offset_dword != registers.size() + (has_dispatch_threads ? 3u : 0u) ||
+	    (program.bindings.write_track_dword != IR::PushData::NoStart &&
+	     program.bindings.write_track_dword !=
+	         program.bindings.memory_offset_dword +
+	             (program.bindings.descriptor_counts[static_cast<size_t>(Kind::Buffers)] + 3u) / 4u) ||
 	    !std::is_sorted(registers.begin(), registers.end()) ||
 	    std::adjacent_find(registers.begin(), registers.end()) != registers.end()) {
 		Fail(program, "native shader-data layout is inconsistent");
@@ -225,6 +231,8 @@ std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo inp
 	ValidateNativeProgram(program, program.stage == ShaderType::Compute &&
 	                                   input_info.compute != nullptr && input_info.compute->lds_storage);
 	EmitProgram(state);
+	// A written descriptor whose stores took no marking path stays conservatively whole-marked.
+	program.bindings.tracked_writes &= state.emitted_write_marks;
 	state.builder.AddEntryPoint(ExecutionModelForStage(state.program.stage), state.main_func,
 	                            "main", state.interface_variables);
 

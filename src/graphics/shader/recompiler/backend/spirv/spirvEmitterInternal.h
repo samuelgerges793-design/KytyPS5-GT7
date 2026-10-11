@@ -113,6 +113,11 @@ struct EmitterState {
 	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> memory_byte_offsets {};
 	uint32_t                                         bda_pagetable_variable  = 0;
 	uint32_t                                         fault_buffer_variable   = 0;
+	uint32_t                                         write_tracker_variable  = 0;
+	// Per tracked buffer descriptor: its shader-data write-tracking dword (loaded at entry).
+	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> write_track_info {};
+	// Tracked descriptors that got at least one write mark.
+	uint64_t                                         emitted_write_marks     = 0;
 	uint32_t                                         bda_pointer_function    = 0;
 	uint32_t                                         bvh_intersect_function  = 0;
 	uint32_t                                         gds_variable            = 0;
@@ -419,7 +424,12 @@ struct MemoryResourceAccess {
 	uint32_t              byte_offset      = 0;
 	uint32_t              element_bits     = 32;
 	spv::MemoryAccessMask memory_access    = spv::MemoryAccessMaskNone;
+	uint32_t              descriptor       = UINT32_MAX; // Buffer descriptor index.
+	bool                  write            = false;      // Element pointers are store targets.
 };
+
+// Sets the write-tracker bit of the guest page holding byte `byte` of a tracked descriptor.
+void EmitWriteTrackMark(EmitterState& state, uint32_t descriptor, uint32_t byte);
 
 uint32_t EmitIndirectResourceIndex(EmitterState& state, uint32_t key, uint32_t mapping_offset,
                                    uint32_t search_iterations, uint32_t default_resource);

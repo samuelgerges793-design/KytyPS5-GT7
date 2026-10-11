@@ -57,10 +57,13 @@ public:
 	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false);
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
-	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBuffer(uint64_t vaddr, uint64_t size,
-	                                                        bool     is_written,
-	                                                        bool     is_texel_buffer = false,
-	                                                        BufferId id              = {});
+	// write_track_base (written shader bindings only): receives the write-tracker bit of vaddr's
+	// page, or IR::WriteTrackUntracked when the binding is marked GPU-written as a whole.
+	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBuffer(uint64_t  vaddr, uint64_t size,
+	                                                        bool      is_written,
+	                                                        bool      is_texel_buffer  = false,
+	                                                        BufferId  id               = {},
+	                                                        uint32_t* write_track_base = nullptr);
 	[[nodiscard]] StreamBuffer&                GetUtilityBuffer(MemoryUsage usage) noexcept {
 		switch (usage) {
 			case MemoryUsage::Upload: return m_staging_buffer;
@@ -73,6 +76,7 @@ public:
 	[[nodiscard]] const Buffer* GetGdsBuffer() const noexcept { return &m_gds_buffer; }
 	[[nodiscard]] Buffer* GetBdaPageTableBuffer() noexcept { return &m_bda_pagetable_buffer; }
 	[[nodiscard]] Buffer* GetFaultBuffer() noexcept { return m_fault_manager.GetFaultBuffer(); }
+	[[nodiscard]] Buffer* GetWriteTrackerBuffer() noexcept { return &m_write_tracker; }
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferForImage(uint64_t vaddr, uint64_t size);
 	void FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds);
 	void CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
@@ -148,13 +152,39 @@ private:
 	                                                    const uint8_t* gpu);
 	std::vector<std::pair<uint64_t, uint64_t>> m_tick_written_ranges;
 	std::unordered_map<uint64_t, uint64_t>     m_page_last_mark;
-	// KYTY_LEARN_WRITES (implies verification): per 4 KiB page of writable bindings, how many
-	// verifications in a row found it unchanged (PageWritten once the GPU changed it). Pages
-	// unchanged LearnedCleanCount times are no longer marked GPU-written at bind; they are still
-	// verified, and a change found later publishes the GPU's bytes and marks them written.
-	static constexpr uint8_t                   PageWritten       = 0xff;
-	static constexpr uint8_t                   LearnedCleanCount = 3;
-	std::unordered_map<uint64_t, uint8_t>      m_page_learn;
+	// GPU write tracking (KYTY_WRITE_TRACK). Shaders set one bit per 4 KiB guest page they store
+	// to. Submissions alternate between the two halves of the bitmap; a submission's half is
+	// copied back and cleared at the end of the next one, so a draw recorded one submission after
+	// its bindings were prepared is still counted. A page of writable
+	// bindings that the GPU left unwritten enough submissions in a row (more after each wrong
+	// guess) is no longer marked GPU-written at bind. When the GPU writes such a page after all,
+	// it is marked GPU-written as soon as the submission completes, so CPU accesses read back.
+	struct TrackedRange {
+		uint64_t first_page = 0;
+		uint32_t pages      = 0;
+		uint32_t base       = 0;
+	};
+	struct PageHistory {
+		uint8_t clean  = 0; // Submissions in a row without GPU writes.
+		uint8_t misses = 0; // Times the GPU wrote the page after it was predicted clean.
+	};
+	[[nodiscard]] uint32_t AllocateWriteTrack(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] bool     PredictClean(uint64_t page) const;
+	void                   RecordWriteTracking();
+	void                   ProcessWriteTracking(const std::vector<TrackedRange>& ranges,
+	                                            const std::vector<uint64_t>& predicted,
+	                                            const uint32_t* bits);
+	Buffer                                              m_write_tracker;
+	bool                                                m_write_tracker_cleared = false;
+	uint32_t                                            m_track_cursor          = 0;
+	uint32_t                                            m_track_half            = 0;
+	std::map<std::pair<uint64_t, uint64_t>, uint32_t>   m_track_bases;
+	std::vector<TrackedRange>                           m_track_ranges;
+	std::vector<uint64_t>                               m_track_predicted;
+	uint32_t                                            m_previous_track_cursor = 0;
+	std::vector<TrackedRange>                           m_previous_track_ranges;
+	std::vector<uint64_t>                               m_previous_track_predicted;
+	std::unordered_map<uint64_t, PageHistory>           m_page_history;
 	uint64_t                               m_address_write_epoch = 1;
 	std::unordered_map<uint64_t, uint64_t> m_command_page_epochs;
 	std::mutex                   m_cpu_store_mutex;

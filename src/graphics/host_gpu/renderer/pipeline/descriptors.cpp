@@ -68,6 +68,7 @@ vk::DescriptorType NativeDescriptorType(BindingKind kind) {
 		case BindingKind::Gds:
 		case BindingKind::BdaPagetable:
 		case BindingKind::FaultBuffer:
+		case BindingKind::WriteTracker:
 		case BindingKind::FlattenedSrt:
 		case BindingKind::ShaderData:
 		case BindingKind::SharedMemory: return vk::DescriptorType::eStorageBuffer;
@@ -111,8 +112,12 @@ static bool IsMultisampledTexture(Prospero::ImageType type) {
 
 static vk::DescriptorBufferInfo
 NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource& source,
-                    const ShaderRecompiler::IR::BufferResource& resource, uint32_t& buffer_offset) {
+                    const ShaderRecompiler::IR::BufferResource& resource, uint32_t& buffer_offset,
+                    uint32_t* write_track_info) {
 	buffer_offset = 0;
+	if (write_track_info != nullptr) {
+		*write_track_info = ShaderRecompiler::IR::WriteTrackUntracked;
+	}
 
 	const auto& [address, size, id] = source;
 	if (address == 0 || size == 0) {
@@ -123,9 +128,11 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	if (size > graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange) {
 		EXIT("storage buffer range is unsupported\n");
 	}
+	uint32_t track_base   = ShaderRecompiler::IR::WriteTrackUntracked;
 	auto [buffer, offset] = context.GetBufferCache().ObtainBuffer(
 	    address, size, resource.written,
-	    resource.formatted || (resource.read && Config::SyncRawImageBuffersEnabled()), id);
+	    resource.formatted || (resource.read && Config::SyncRawImageBuffersEnabled()), id,
+	    resource.written && write_track_info != nullptr ? &track_base : nullptr);
 	const auto aligned_offset = Common::AlignDown(offset, alignment);
 	const auto adjustment     = offset - aligned_offset;
 	const auto max_range      = graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange;
@@ -133,6 +140,13 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 		EXIT("storage buffer offset adjustment is unsupported\n");
 	}
 	buffer_offset = static_cast<uint32_t>(adjustment);
+	if (track_base != ShaderRecompiler::IR::WriteTrackUntracked) {
+		// The shader counts pages from the view start; the cache's bits start at address's page.
+		const auto view_start = address - adjustment;
+		*write_track_info = ((track_base - static_cast<uint32_t>((address >> 12u) - (view_start >> 12u)))
+		                     << 12u) |
+		                    static_cast<uint32_t>(view_start & 0xfffu);
+	}
 	const vk::DescriptorBufferInfo result {buffer->Handle(), aligned_offset, size + adjustment};
 	if (resource.written) {
 		context.GetTextureCache().InvalidateMemoryFromGPU(address, size);
@@ -818,13 +832,20 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		const auto shift = (index % 4u) * 8u;
 		prepared.shader_data[dword] |= offset << shift;
 	};
+	const bool tracks_writes = layout.write_track_dword != ShaderRecompiler::IR::PushData::NoStart;
 	for (const auto& resource: program.info.buffers) {
 		const auto index = resource.descriptor_index;
 		if (index == UINT32_MAX) continue;
-		uint32_t buffer_offset = 0;
-		prepared.buffers[index] = NativeStorageBuffer(m_context, prepared.buffer_sources[index],
-		                                              resource, buffer_offset);
+		uint32_t   buffer_offset = 0;
+		uint32_t   track_info    = ShaderRecompiler::IR::WriteTrackUntracked;
+		const bool tracked       = tracks_writes && ((layout.tracked_writes >> index) & 1u) != 0;
+		prepared.buffers[index]  = NativeStorageBuffer(m_context, prepared.buffer_sources[index],
+		                                               resource, buffer_offset,
+		                                               tracked ? &track_info : nullptr);
 		pack_memory_offset(index, buffer_offset);
+		if (tracks_writes) {
+			prepared.shader_data[layout.write_track_dword + index] = track_info;
+		}
 	}
 	if (layout.descriptor_counts[static_cast<size_t>(BindingKind::FlattenedSrt)] != 0) {
 		prepared.flattened_srt = NativeUpload(m_context, snapshot.flattened_srt);
@@ -996,6 +1017,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	m_descriptor_writes.reserve(write_count);
 	size_t image_cursor = 0;
 	std::array<vk::DescriptorBufferInfo, 2> address_buffers;
+	vk::DescriptorBufferInfo                write_tracker_view;
 
 	for (auto* prepared: prepared_bindings) {
 		const auto& program       = *prepared->runtime->program;
@@ -1091,6 +1113,12 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 						auto& view = address_buffers[kind == BindingKind::FaultBuffer];
 						view = {bda_buffer->Handle(), 0, bda_buffer->Size()};
 						write.pBufferInfo = &view;
+						break;
+					}
+					case BindingKind::WriteTracker: {
+						const auto* tracker = m_context.GetBufferCache().GetWriteTrackerBuffer();
+						write_tracker_view  = {tracker->Handle(), 0, tracker->Size()};
+						write.pBufferInfo   = &write_tracker_view;
 						break;
 					}
 					case BindingKind::FlattenedSrt:

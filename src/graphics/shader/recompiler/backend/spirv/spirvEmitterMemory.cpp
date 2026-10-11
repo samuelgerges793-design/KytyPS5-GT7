@@ -482,7 +482,8 @@ void StoreSubwordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR:
 
 void StoreSubword(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo mem, uint32_t bits) {
 	EmitIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
-		const auto resource = PrepareMemoryResourceAccess(ctx.state, mem);
+		auto resource  = PrepareMemoryResourceAccess(ctx.state, mem);
+		resource.write = true;
 		StoreSubwordPrepared(ctx, inst, mem, resource, bits, ctx.Arg(inst, inst.NumArgs() - 2));
 	});
 }
@@ -558,7 +559,8 @@ void StoreWord(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo mem) 
 				    state.program.descriptor_sources[buffer.source].indirect_descriptor) return;
 			}
 			mem.resource = resource;
-			const auto access = PrepareMemoryResourceAccess(state, mem);
+			auto access  = PrepareMemoryResourceAccess(state, mem);
+			access.write = true;
 			StoreWordPrepared(ctx, inst, mem, access, data);
 		};
 		if (mem.kind != IR::ResourceKind::Buffer ||
@@ -600,7 +602,8 @@ uint32_t EmitAtomicAccess(ValueEmitContext& ctx, const IR::Inst& inst,
                           const IR::MemoryInfo& mem, Fn&& operation) {
 	return EmitValueOrZeroIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
 		const auto index = DwordIndex(ctx, inst, mem);
-		const auto resource = PrepareMemoryResourceAccess(ctx.state, mem);
+		auto resource  = PrepareMemoryResourceAccess(ctx.state, mem);
+		resource.write = true;
 		return EmitValueOrZeroIfCondition(
 		    ctx.state, EmitMemoryElementInBounds(ctx.state, resource, index), [&]() {
 			    return operation(EmitMemoryElementPointer(ctx.state, resource, index));
@@ -825,7 +828,8 @@ void StoreFormattedPrepared(ValueEmitContext& ctx, const IR::Inst& inst,
 
 void FormattedStore(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem) {
 	EmitIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
-		const auto resource = PrepareMemoryResourceAccess(ctx.state, mem);
+		auto resource  = PrepareMemoryResourceAccess(ctx.state, mem);
+		resource.write = true;
 		const auto data     = ctx.Arg(inst, inst.NumArgs() - 2);
 		const auto info     = Format::GetFormatInfo(BufferFormat(ctx, mem));
 		if (info.type == Format::ComponentType::Unknown) {
@@ -1059,7 +1063,8 @@ void StoreWideBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t compo
 	auto& state = ctx.state;
 	EmitIfCondition(state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
 		const auto mem       = ctx.Memory(inst);
-		const auto resource  = PrepareMemoryResourceAccess(state, mem);
+		auto       resource  = PrepareMemoryResourceAccess(state, mem);
+		resource.write       = true;
 		const auto composite = ctx.Arg(inst, inst.NumArgs() - 2);
 		const auto info = Format::GetFormatInfo(
 		    mem.formatted ? BufferFormat(ctx, mem) : Prospero::BufferFormat::kInvalid);
@@ -1209,6 +1214,9 @@ uint32_t EmitBufferAtomic64(ValueEmitContext& ctx, const IR::Inst& inst) {
 		    return EmitValueOrDefaultIfCondition(
 		        state, EmitMemoryElementInBounds(state, resource, index), TypeU64(state),
 		        ConstantU64(state, 0), [&]() {
+			        EmitWriteTrackMark(state, resource.descriptor,
+			                           Binary(state, spv::OpShiftLeftLogical, TypeU32(state), index,
+			                                  ConstantU32(state, 3u)));
 			        const auto pointer = EmitStorageBufferElementPointer(
 			            state, resource, index, TypeStorageBufferElementPointer(state, 64));
 			        const auto old = EmitAtomicOperation(ctx, inst, pointer, spv::ScopeDevice);
@@ -1295,7 +1303,8 @@ uint32_t EmitAppendConsume(ValueEmitContext& ctx, const IR::Inst& inst) {
 	}
 	const auto index =
 	    Binary(state, spv::OpShiftRightLogical, TypeU32(state), address, ConstantU32(state, 2));
-	const auto access = PrepareMemoryResourceAccess(state, mem);
+	auto access  = PrepareMemoryResourceAccess(state, mem);
+	access.write = true;
 	const auto exec   = ctx.Arg(inst, 1);
 	const auto ballot = ctx.Ballot(inst.Arg(1));
 	const auto low    = state.builder.AllocateId();

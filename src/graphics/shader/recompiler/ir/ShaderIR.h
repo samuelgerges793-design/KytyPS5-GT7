@@ -2,6 +2,7 @@
 #define EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_RECOMPILER_SHADERIR_H_
 
 #include "common/common.h"
+#include <cstdlib>
 #include "common/stringUtils.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/gpu_format.h"
@@ -307,11 +308,12 @@ enum class DescriptorBindingKind : uint32_t {
 	FlattenedSrt,
 	ShaderData,
 	SharedMemory,
+	WriteTracker,
 	Count,
 };
 
 static_assert(static_cast<uint32_t>(DescriptorBindingKind::Samplers) == 49u);
-static_assert(static_cast<uint32_t>(DescriptorBindingKind::Count) == 56u);
+static_assert(static_cast<uint32_t>(DescriptorBindingKind::Count) == 57u);
 
 struct PushData {
 	static constexpr uint32_t DwordCount = 32;
@@ -427,16 +429,32 @@ DescriptorBindingForImage(const ImageResource& image) {
 	return static_cast<DescriptorBindingKind>(base + dimension);
 }
 
+// GPU write tracking (KYTY_WRITE_TRACK): every store to a written buffer descriptor sets the bit
+// of its 4 KiB guest page in a bitmap, so the host learns which pages of a writable binding the
+// GPU really wrote. Each tracked descriptor gets one shader-data dword: (first bit << 12) | the
+// low 12 bits of the guest address where the descriptor view starts; WriteTrackUntracked when the
+// host did not allocate bits for it.
+inline constexpr uint32_t WriteTrackerBits    = 1u << 20u;
+inline constexpr uint32_t WriteTrackUntracked = UINT32_MAX;
+[[nodiscard]] inline bool WriteTrackingEnabled() {
+	static const bool enabled = std::getenv("KYTY_WRITE_TRACK") != nullptr;
+	return enabled;
+}
+
 struct Bindings {
 	std::array<uint32_t, static_cast<size_t>(DescriptorBindingKind::Count)> descriptor_counts {};
 	uint64_t descriptor_mask = 0;
 	uint32_t push_data_start_dword = PushData::NoStart;
 	uint32_t dispatch_thread_dword = PushData::NoStart;
 	uint32_t memory_offset_dword = 0;
+	uint32_t write_track_dword = PushData::NoStart;
+	// Buffer descriptors (by descriptor index) whose every store marks the write tracker.
+	uint64_t tracked_writes = 0;
 
 	[[nodiscard]] uint32_t ShaderDataDwords() const {
-		return memory_offset_dword +
-		       (descriptor_counts[static_cast<size_t>(DescriptorBindingKind::Buffers)] + 3u) / 4u;
+		const auto buffers = descriptor_counts[static_cast<size_t>(DescriptorBindingKind::Buffers)];
+		return memory_offset_dword + (buffers + 3u) / 4u +
+		       (write_track_dword != PushData::NoStart ? buffers : 0u);
 	}
 	[[nodiscard]] bool UsesPushData() const {
 		return push_data_start_dword != PushData::NoStart;

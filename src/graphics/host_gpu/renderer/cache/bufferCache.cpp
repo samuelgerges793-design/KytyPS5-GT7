@@ -1,3 +1,4 @@
+#include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 
 #include "common/alignment.h"
@@ -239,6 +240,8 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
       m_gds_buffer(graphics, scheduler, MemoryUsage::Stream, 0, AllFlags, GdsBufferSize),
       m_bda_pagetable_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags,
                              BDA_PAGETABLE_SIZE),
+      m_write_tracker(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags,
+                      ShaderRecompiler::IR::WriteTrackerBits / 8u),
       m_memory_tracker(page_manager),
       m_staging_buffer(graphics, scheduler, MemoryUsage::Upload, 512 * MiB),
       m_stream_buffer(graphics, scheduler, MemoryUsage::Stream, 64 * MiB),
@@ -250,6 +253,7 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	m_gds_buffer.Flush(0, m_gds_buffer.Size());
 	SetVulkanObjectNameF(m_graphics.device, m_bda_pagetable_buffer.Handle(),
 	                     "BDA Page Table Buffer");
+	SetVulkanObjectNameF(m_graphics.device, m_write_tracker.Handle(), "Write Tracker");
 	const auto null_id =
 	    m_slot_buffers.insert(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, 16);
 	EXIT_IF(null_id != NULL_BUFFER_ID);
@@ -532,7 +536,162 @@ uint64_t BufferCache::SyncGpuWrittenRange(uint64_t vaddr, uint64_t size) {
 	return differing;
 }
 
+uint32_t BufferCache::AllocateWriteTrack(uint64_t vaddr, uint64_t size) {
+	using ShaderRecompiler::IR::WriteTrackerBits;
+	using ShaderRecompiler::IR::WriteTrackUntracked;
+	const auto [found, inserted] = m_track_bases.try_emplace({vaddr, size}, WriteTrackUntracked);
+	if (!inserted) {
+		return found->second;
+	}
+	const auto first_page = vaddr >> 12u;
+	const auto pages      = ((vaddr + size - 1u) >> 12u) - first_page + 1u;
+	// One spare bit before each range: the shader counts pages from where the descriptor view
+	// starts, up to 255 bytes earlier and possibly on the previous page.
+	constexpr uint32_t half_bits = WriteTrackerBits / 2u;
+	if (pages + 1u > half_bits - m_track_cursor) {
+		return WriteTrackUntracked;
+	}
+	if (!m_write_tracker_cleared) {
+		auto& command = m_scheduler.Current();
+		command.EndRendering();
+		const auto native = command.Handle();
+		native.fillBuffer(m_write_tracker.Handle(), 0, m_write_tracker.Size(), 0);
+		vk::MemoryBarrier barrier {};
+		barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+		barrier.dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite;
+		native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+		                       vk::PipelineStageFlagBits::eAllCommands, {}, 1, &barrier, 0, nullptr,
+		                       0, nullptr);
+		m_write_tracker_cleared = true;
+	}
+	const auto base = m_track_half * half_bits + m_track_cursor + 1u;
+	m_track_cursor += static_cast<uint32_t>(pages) + 1u;
+	found->second = base;
+	m_track_ranges.push_back({first_page, static_cast<uint32_t>(pages), base});
+	return base;
+}
+
+static uint32_t RequiredCleanSubmissions(uint8_t misses) {
+	constexpr std::array<uint32_t, 4> required {4u, 16u, 64u, 250u};
+	return required[std::min<size_t>(misses, required.size() - 1u)];
+}
+
+bool BufferCache::PredictClean(uint64_t page) const {
+	const auto found = m_page_history.find(page);
+	return found != m_page_history.end() &&
+	       found->second.clean >= RequiredCleanSubmissions(found->second.misses);
+}
+
+void BufferCache::RecordWriteTracking() {
+	// The previous submission's half is complete once this submission has run.
+	auto ranges    = std::move(m_previous_track_ranges);
+	auto predicted = std::move(m_previous_track_predicted);
+	const auto used = m_previous_track_cursor;
+	m_previous_track_ranges    = std::move(m_track_ranges);
+	m_previous_track_predicted = std::move(m_track_predicted);
+	m_previous_track_cursor    = m_track_cursor;
+	m_track_ranges.clear();
+	m_track_predicted.clear();
+	m_track_bases.clear();
+	m_track_cursor = 0;
+	m_track_half ^= 1u;
+	if (ranges.empty()) {
+		return;
+	}
+	// The half to read is the one the next submission allocates from again.
+	const uint64_t start = uint64_t {m_track_half} * (ShaderRecompiler::IR::WriteTrackerBits / 8u / 2u);
+	const uint64_t bytes = uint64_t {(used + 32u) / 32u} * 4u;
+	auto staging = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
+	                                        vk::BufferUsageFlagBits::eTransferDst, bytes);
+	auto& command = m_scheduler.Current();
+	command.EndRendering();
+	const auto        native = command.Handle();
+	vk::MemoryBarrier before {};
+	before.srcAccessMask = vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eMemoryWrite;
+	before.dstAccessMask = vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eTransfer,
+	                       {}, 1, &before, 0, nullptr, 0, nullptr);
+	const vk::BufferCopy copy {start, 0, bytes};
+	native.copyBuffer(m_write_tracker.Handle(), staging->Handle(), 1, &copy);
+	native.fillBuffer(m_write_tracker.Handle(), start, bytes, 0);
+	vk::MemoryBarrier to_host {};
+	to_host.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	to_host.dstAccessMask = vk::AccessFlagBits::eHostRead;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost, {},
+	                       1, &to_host, 0, nullptr, 0, nullptr);
+	vk::MemoryBarrier to_shaders {};
+	to_shaders.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	to_shaders.dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eAllCommands,
+	                       {}, 1, &to_shaders, 0, nullptr, 0, nullptr);
+	const auto first_bit = static_cast<uint32_t>(start * 8u);
+	for (auto& range: ranges) {
+		range.base -= first_bit;
+	}
+	m_scheduler.DeferOperation([this, bytes, ranges = std::move(ranges),
+	                            predicted = std::move(predicted),
+	                            owner = std::move(staging)]() mutable {
+		owner->Invalidate(0, bytes);
+		ProcessWriteTracking(ranges, predicted,
+		                     reinterpret_cast<const uint32_t*>(owner->Mapped().data()));
+		owner.reset();
+	});
+}
+
+void BufferCache::ProcessWriteTracking(const std::vector<TrackedRange>& ranges,
+                                       const std::vector<uint64_t>& predicted, const uint32_t* bits) {
+	// Overlapping bindings: a page counts as written when any of its bits is set.
+	std::unordered_map<uint64_t, bool> written;
+	for (const auto& range: ranges) {
+		for (uint32_t i = 0; i < range.pages; i++) {
+			const auto bit = range.base + i;
+			written[range.first_page + i] |= ((bits[bit >> 5u] >> (bit & 31u)) & 1u) != 0;
+		}
+	}
+	uint64_t mispredicted = 0;
+	uint64_t conflicts    = 0;
+	for (const auto page: predicted) {
+		const auto found = written.find(page);
+		if (found == written.end() || !found->second) {
+			continue;
+		}
+		found->second = false; // Handled once.
+		auto& history = m_page_history[page];
+		if (history.misses < UINT8_MAX) history.misses++;
+		history.clean = 0;
+		const auto address = page << 12u;
+		if (m_gpu_modified_ranges.Intersects(address, 0x1000)) {
+			continue; // Marked since by other work.
+		}
+		if (!m_memory_tracker.IsRegionCpuModified(address, 0x1000)) {
+			// The guest copy is the last upload: the GPU's bytes become the page's contents.
+			m_gpu_modified_ranges.Add(address, 0x1000);
+			m_memory_tracker.MarkRegionAsGpuModified(address, 0x1000);
+			mispredicted++;
+		} else {
+			// The CPU changed the page too: its bytes win and the next upload replaces the GPU's.
+			conflicts++;
+			static std::atomic<uint32_t> logged {0};
+			if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+				Log::WriteToConsoleAndLog(fmt::format(
+				    "write tracker: GPU and CPU both wrote predicted-clean page 0x{:x}\n", address));
+			}
+		}
+	}
+	for (const auto& [page, was_written]: written) {
+		auto& history = m_page_history[page];
+		if (was_written) {
+			history.clean = 0;
+		} else if (history.clean < UINT8_MAX) {
+			history.clean++;
+		}
+	}
+	if (mispredicted != 0) PerfAdd(PerfCounter::TrackMispredict, mispredicted);
+	if (conflicts != 0) PerfAdd(PerfCounter::TrackConflict, conflicts);
+}
+
 void BufferCache::RecordWriteVerification() {
+	RecordWriteTracking();
 	if (m_tick_written_ranges.empty()) {
 		return;
 	}
@@ -629,24 +788,8 @@ void BufferCache::VerifyWrites(uint64_t tick, const std::vector<std::pair<uint64
 		const auto offset  = pages[i].second;
 		const auto size    = pages[i + 1].first;
 		for (uint64_t page = address; page < address + size; page += 0x1000) {
-			static const bool learn = std::getenv("KYTY_LEARN_WRITES") != nullptr;
-			const auto*       gpu_page = gpu + offset + (page - address);
-			const bool        marked   = m_gpu_modified_ranges.Intersects(page, 0x1000);
-			if (learn && Libs::LibKernel::Memory::TryReadBacking(page, guest.data(), guest.size())) {
-				const bool same  = std::memcmp(gpu_page, guest.data(), guest.size()) == 0;
-				auto&      state = m_page_learn[page >> 12u];
-				if (!same) {
-					if (!marked && state >= LearnedCleanCount && state != PageWritten &&
-					    !m_memory_tracker.IsRegionCpuModified(page, 0x1000)) {
-						// A learned-clean page the GPU wrote after all: make the bytes visible.
-						Libs::LibKernel::Memory::WriteBacking(page, gpu_page, guest.size());
-						PerfAdd(PerfCounter::LearnedLateWrites, 0);
-					}
-					state = PageWritten;
-				} else if (state != PageWritten && state < LearnedCleanCount) {
-					state++;
-				}
-			}
+			const auto* gpu_page = gpu + offset + (page - address);
+			const bool  marked   = m_gpu_modified_ranges.Intersects(page, 0x1000);
 			const auto mark = m_page_last_mark.find(page >> 12u);
 			if (mark == m_page_last_mark.end() || mark->second != tick) {
 				continue; // Marked again by later work, or already handled.
@@ -808,7 +951,7 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t size,
                                                        bool is_written, bool is_texel_buffer,
-                                                       BufferId id) {
+                                                       BufferId id, uint32_t* write_track_base) {
 	auto& command = m_scheduler.Current();
 	if (command.IsInvalid() || !GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: buffer request requires a recording command buffer\n");
@@ -832,18 +975,22 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	}
 	auto& buffer = m_slot_buffers[id];
 	TouchBuffer(buffer);
-	static const bool learn  = std::getenv("KYTY_LEARN_WRITES") != nullptr;
-	static const bool verify = learn || std::getenv("KYTY_WRITE_VERIFY") != nullptr;
-	if (is_written && learn) {
-		// Mark only pages not yet learned clean; the rest are uploaded like reads.
+	static const bool verify  = std::getenv("KYTY_WRITE_VERIFY") != nullptr;
+	static const bool predict = std::getenv("KYTY_WRITE_TRACK_NO_PREDICT") == nullptr;
+	uint32_t          track   = ShaderRecompiler::IR::WriteTrackUntracked;
+	if (is_written && write_track_base != nullptr) {
+		track             = AllocateWriteTrack(vaddr, size);
+		*write_track_base = track;
+	}
+	if (track != ShaderRecompiler::IR::WriteTrackUntracked && predict) {
+		// Pages predicted clean are synchronized like reads; the rest are marked GPU-written.
 		uint64_t run_begin = vaddr;
 		bool     run_mark  = true;
 		bool     first     = true;
 		const auto end     = vaddr + size;
 		for (uint64_t page = vaddr & ~uint64_t {0xfff}; page < end; page += 0x1000) {
-			const auto found = m_page_learn.find(page >> 12u);
-			const bool mark  = found == m_page_learn.end() || found->second < LearnedCleanCount ||
-			                  found->second == PageWritten;
+			const bool mark  = !PredictClean(page >> 12u);
+			if (!mark) m_track_predicted.push_back(page >> 12u);
 			const auto begin = std::max(page, vaddr);
 			if (first) {
 				run_mark = mark;
@@ -851,14 +998,14 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 			} else if (mark != run_mark) {
 				(void)SynchronizeBuffer(buffer, run_begin, begin - run_begin, run_mark, is_texel_buffer);
 				if (run_mark) m_gpu_modified_ranges.Add(run_begin, begin - run_begin);
-				else PerfAdd(PerfCounter::LearnedSkipBytes, begin - run_begin);
+				else PerfAdd(PerfCounter::TrackSkipBytes, begin - run_begin);
 				run_begin = begin;
 				run_mark  = mark;
 			}
 		}
 		(void)SynchronizeBuffer(buffer, run_begin, end - run_begin, run_mark, is_texel_buffer);
 		if (run_mark) m_gpu_modified_ranges.Add(run_begin, end - run_begin);
-		else PerfAdd(PerfCounter::LearnedSkipBytes, end - run_begin);
+		else PerfAdd(PerfCounter::TrackSkipBytes, end - run_begin);
 	} else {
 		(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
 		if (is_written) m_gpu_modified_ranges.Add(vaddr, size);
