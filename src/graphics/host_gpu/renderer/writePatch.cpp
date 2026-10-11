@@ -22,6 +22,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <fmt/format.h>
 #include <mutex>
 #include <unordered_map>
 
@@ -207,6 +208,28 @@ bool DecodePlainStore(const CONTEXT& context, PlainStore& store) {
 	return true;
 }
 
+// Logs each store site that keeps the readback path (once per instruction address), to see
+// what the patching misses.
+void NoteFallback(const CONTEXT& context, const char* reason) {
+	static std::mutex                   mutex;
+	static std::unordered_map<uint64_t, uint32_t> seen;
+	{
+		std::scoped_lock lock(mutex);
+		if (seen.size() >= 200 || !seen.try_emplace(context.Rip, 0).second) return;
+	}
+	ZydisDecoder            decoder {};
+	ZydisDecodedInstruction instruction {};
+	ZydisDecodedOperand     operands[ZYDIS_MAX_OPERAND_COUNT] {};
+	const char*             mnemonic = "?";
+	if (ZYAN_SUCCESS(ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64)) &&
+	    ZYAN_SUCCESS(ZydisDecoderDecodeFull(&decoder, reinterpret_cast<const void*>(context.Rip),
+	                                        ZYDIS_MAX_INSTRUCTION_LENGTH, &instruction, operands))) {
+		mnemonic = ZydisMnemonicGetString(instruction.mnemonic);
+	}
+	Log::WriteToConsoleAndLog(fmt::format("write patch fallback: rip=0x{:x} {} ({})\n", context.Rip,
+	                                      mnemonic != nullptr ? mnemonic : "?", reason));
+}
+
 // Bursts of stores into one page are cheaper as one readback, which hands the page to the CPU.
 bool BurstLimited(uint64_t page) {
 	struct Burst {
@@ -241,10 +264,18 @@ bool RenderContext::TryBeginWritePatch(void* native_context, uint64_t fault_vadd
 	}
 	auto&      context = *static_cast<CONTEXT*>(native_context);
 	PlainStore store;
-	if (!DecodePlainStore(context, store) || fault_vaddr < store.address ||
-	    fault_vaddr >= store.address + store.size ||
+	if (!DecodePlainStore(context, store)) {
+		NoteFallback(context, "not a plain store");
+		return false;
+	}
+	if (fault_vaddr < store.address || fault_vaddr >= store.address + store.size ||
 	    (store.address & ~(PatchPageSize - 1u)) != page ||
-	    ((store.address + store.size - 1u) & ~(PatchPageSize - 1u)) != page || BurstLimited(page)) {
+	    ((store.address + store.size - 1u) & ~(PatchPageSize - 1u)) != page) {
+		NoteFallback(context, "crosses a page");
+		return false;
+	}
+	if (BurstLimited(page)) {
+		PerfAdd(PerfCounter::WritePatchBegin, 0);
 		return false;
 	}
 	// Images over the stored bytes see the CPU write, as on the readback path.
