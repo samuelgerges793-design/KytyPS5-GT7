@@ -74,6 +74,9 @@ enum class PerfCounter {
 	// Plain CPU stores into GPU-written pages let through without a readback (writePatch.cpp).
 	WritePatch,
 	WritePatchBegin,
+	// Bytes of storage buffers bound writable (the report shows MB/s); every byte is marked
+	// GPU-written until the CPU reads it back.
+	WritableBindBytes,
 	Count
 };
 void PerfAdd(PerfCounter counter, uint64_t nanoseconds);
@@ -82,6 +85,8 @@ void PerfReport(double fps);
 void LowerCurrentThreadPriority();
 // Tallies a guest page fault by page; the perf report lists the busiest pages.
 void NoteFaultPage(uint64_t vaddr, bool write, uint64_t ns);
+// Tallies a writable storage buffer binding; the report lists the largest by bytes bound.
+void NoteWritableBinding(uint64_t vaddr, uint64_t size);
 class PerfScope {
 public:
 	explicit PerfScope(PerfCounter counter);

@@ -199,6 +199,12 @@ void NoteLongestWait(uint64_t ns) {
 	}
 }
 
+struct WritableBinding {
+	uint64_t size = 0, count = 0, shader = 0;
+};
+std::mutex                                    g_writable_mutex;
+std::unordered_map<uint64_t, WritableBinding> g_writable_bindings;
+
 struct FaultPage {
 	uint64_t reads = 0, writes = 0, ns = 0;
 };
@@ -248,7 +254,8 @@ void PerfReport(double fps) {
 	                                        "pipe-cache-hit", "pipe-cache-miss",
 	                                        "cpu-read-fault", "cpu-write-fault",
 	                                        "write-readback", "write-readback-skipped",
-	                                        "write-patch", "write-patch-burst"};
+	                                        "write-patch", "write-patch-burst",
+	                                        "writable-bind-MB"};
 	std::string text = fmt::format("perf: {:.1f} fps | longest-gpu-wait {:.0f} ms |", fps,
 	                               static_cast<double>(g_longest_wait_ns.exchange(0)) / 1e6);
 	for (size_t i = 0; i < g_perf.size(); i++) {
@@ -280,7 +287,36 @@ void PerfReport(double fps) {
 			                    pages[i].second.writes, static_cast<double>(pages[i].second.ns) / 1e6);
 		}
 	}
+	{
+		std::scoped_lock lock(g_writable_mutex);
+		std::vector<std::pair<uint64_t, WritableBinding>> bindings(g_writable_bindings.begin(),
+		                                                           g_writable_bindings.end());
+		g_writable_bindings.clear();
+		std::ranges::sort(bindings, [](const auto& a, const auto& b) {
+			return a.second.size * a.second.count > b.second.size * b.second.count;
+		});
+		if (!bindings.empty()) text += fmt::format(" | writable bindings ({}):", bindings.size());
+		for (size_t i = 0; i < bindings.size() && i < 5; i++) {
+			text += fmt::format(" 0x{:x}+{:.1f}MBx{} sh={:016x}", bindings[i].first,
+			                    static_cast<double>(bindings[i].second.size) / 1048576.0,
+			                    bindings[i].second.count, bindings[i].second.shader);
+		}
+	}
 	Log::WriteToConsoleAndLog(text + "\n");
+}
+
+void NoteWritableBinding(uint64_t vaddr, uint64_t size) {
+	PerfAdd(PerfCounter::WritableBindBytes, size);
+	uint64_t shader = 0;
+	{
+		std::scoped_lock lock(g_noted_mutex);
+		if (g_last_noted < g_recording.size()) shader = g_recording[g_last_noted].hash;
+	}
+	std::scoped_lock lock(g_writable_mutex);
+	auto&            binding = g_writable_bindings[vaddr];
+	binding.size             = std::max(binding.size, size);
+	binding.count++;
+	binding.shader = shader;
 }
 
 void NoteFaultPage(uint64_t vaddr, bool write, uint64_t ns) {
