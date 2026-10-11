@@ -18,13 +18,16 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cinttypes>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <span>
 #include <tuple>
+#include <vector>
 #include <vulkan/vulkan_format_traits.hpp>
 
 namespace Libs::Graphics {
@@ -1730,6 +1733,9 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	if (!LibKernel::Memory::TryReadBacking(range.address, mapped, range.size)) {
 		return false;
 	}
+	// The guest bytes now: when the download lands, pages the CPU changed meanwhile (memory the
+	// game reused, for example for command buffers) keep the CPU's bytes instead of old pixels.
+	auto before = std::make_shared<std::vector<uint8_t>>(mapped, mapped + range.size);
 	download.Flush(offset, range.size);
 
 	DownloadImage(image, download, offset, range.size, image.info.resources.levels);
@@ -1746,9 +1752,29 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	m_scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 	                                               vk::PipelineStageFlagBits::eHost, {}, 0, nullptr,
 	                                               1, &barrier, 0, nullptr);
-	m_scheduler.DeferPriorityOperation([&download, range, mapped, offset] {
+	m_scheduler.DeferPriorityOperation([&download, range, mapped, offset, before] {
 		download.Invalidate(offset, range.size);
-		LibKernel::Memory::WriteBacking(range.address, mapped, range.size);
+		std::array<uint8_t, 4096> current {};
+		uint64_t                  kept_pages = 0;
+		for (uint64_t page_offset = 0; page_offset < range.size;) {
+			const auto address = range.address + page_offset;
+			const auto bytes   = std::min<uint64_t>(4096u - (address & 4095u), range.size - page_offset);
+			if (LibKernel::Memory::TryReadBacking(address, current.data(), bytes) &&
+			    std::memcmp(current.data(), before->data() + page_offset, bytes) != 0) {
+				kept_pages++;
+			} else {
+				LibKernel::Memory::WriteBacking(address, mapped + page_offset, bytes);
+			}
+			page_offset += bytes;
+		}
+		if (kept_pages != 0) {
+			static std::atomic<uint32_t> logged {0};
+			if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+				Log::WriteToConsoleAndLog(fmt::format(
+				    "image download 0x{:x} (+{}): kept {} page(s) the CPU changed meanwhile\n",
+				    range.address, range.size, kept_pages));
+			}
+		}
 	});
 	return true;
 }
