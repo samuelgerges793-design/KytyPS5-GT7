@@ -1963,6 +1963,16 @@ KYTY_CP_OP_PARSER(CpOpIndirectBuffer) {
 	return 3;
 }
 
+// Indirect register tables GT7 submits sometimes hold zeros or stale entries (read before
+// the data is there); writes to registers that do not exist are skipped, as hardware does.
+static void ReportSkippedIndirectRegister(const char* kind, uint32_t offset, uint32_t value) {
+	static std::atomic<uint32_t> logged {0};
+	if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+		Log::WriteToConsoleAndLog(fmt::format("PM4: skipped indirect {} register 0x{:x} = 0x{:08x}\n",
+		                                      kind, offset, value));
+	}
+}
+
 KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 	KYTY_PROFILER_FUNCTION();
 
@@ -2026,7 +2036,8 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 				}
 				continue;
 			}
-			EXIT("unknown cx reg at %05" PRIx32 ": 0x%" PRIx32 "\n", num_dw - dw, cmd_offset);
+			ReportSkippedIndirectRegister("CX", cmd_offset, value);
+			continue;
 		}
 
 		pfunc(cp, cmd_offset, value);
@@ -2075,9 +2086,8 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 		}
 
 		if (cmd_offset >= Pm4::SH_NUM) {
-			EXIT("unsupported indirect SH register offset 0x%08" PRIx32 " (raw 0x%08" PRIx32
-			     "), value = 0x%08" PRIx32 "\n",
-			     cmd_offset, raw_cmd_offset, value);
+			ReportSkippedIndirectRegister("SH", raw_cmd_offset, value);
+			continue;
 		}
 
 		auto pfunc = g_hw_sh_indirect_func[cmd_offset];
@@ -2091,7 +2101,8 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 				LOGF("\t sh_indirect[%" PRIu32 "] offset=0x%08" PRIx32 ", value=0x%08" PRIx32 "\n",
 				     j, dump_regs[j * 2], dump_regs[j * 2 + 1]);
 			}
-			EXIT("unknown sh reg at %05" PRIx32 ": 0x%" PRIx32 "\n", num_dw - dw, cmd_offset);
+			ReportSkippedIndirectRegister("SH", cmd_offset, value);
+			continue;
 		}
 
 		pfunc(cp, cmd_offset, value);
@@ -2135,9 +2146,8 @@ KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
 			continue;
 		}
 		if (cmd_offset >= Pm4::UC_NUM) {
-			EXIT("unsupported indirect UC register offset 0x%08" PRIx32 " (raw 0x%08" PRIx32
-			     "), value = 0x%08" PRIx32 "\n",
-			     cmd_offset, raw_cmd_offset, value);
+			ReportSkippedIndirectRegister("UC", raw_cmd_offset, value);
+			continue;
 		}
 
 		auto pfunc = g_hw_uc_indirect_func[cmd_offset & (Pm4::UC_NUM - 1)];
@@ -2148,7 +2158,8 @@ KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
 				LOGF("\t uc_indirect[%" PRIu32 "] offset=0x%08" PRIx32 ", value=0x%08" PRIx32 "\n",
 				     j, dump_regs[j * 2], dump_regs[j * 2 + 1]);
 			}
-			EXIT("unknown uc reg at %05" PRIx32 ": 0x%" PRIx32 "\n", num_dw - dw, cmd_offset);
+			ReportSkippedIndirectRegister("UC", cmd_offset, value);
+			continue;
 		}
 		pfunc(cp, cmd_offset, value);
 	}
