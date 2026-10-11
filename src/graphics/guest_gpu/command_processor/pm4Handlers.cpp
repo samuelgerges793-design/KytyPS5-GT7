@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <fmt/format.h>
 #include <bit>
 #include <cstdio>
 #include <cstring>
@@ -2213,11 +2214,19 @@ KYTY_CP_OP_PARSER(CpOpNop) {
 KYTY_CP_OP_PARSER(CpOpNumInstances) {
 	KYTY_PROFILER_FUNCTION();
 
-	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0002f00);
+	if (cmd_id != 0xc0002f00) {
+		// GT7 sent other headers here; log the first few and use the count from the first dword.
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "PM4: NUM_INSTANCES header 0x{:08x} (expected 0xc0002f00), dwords {:08x} {:08x}\n",
+			    cmd_id, buffer[0], num_dw - dw > 1 ? buffer[1] : 0u));
+		}
+	}
 
 	cp.SetNumInstances(buffer[0]);
 
-	return 1;
+	return KYTY_PM4_LEN(cmd_id) - 1;
 }
 
 KYTY_CP_OP_PARSER(CpOpPopMarker) {
