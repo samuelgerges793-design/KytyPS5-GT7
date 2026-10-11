@@ -189,6 +189,16 @@ struct WaitSite {
 std::mutex                       g_wait_sites_mutex;
 std::unordered_map<uintptr_t, WaitSite> g_wait_sites;
 
+// The longest single GPU wait since the last report: near 2 s before a timeout means frames
+// that are too slow, not a hang.
+std::atomic<uint64_t> g_longest_wait_ns {0};
+
+void NoteLongestWait(uint64_t ns) {
+	auto current = g_longest_wait_ns.load(std::memory_order_relaxed);
+	while (ns > current && !g_longest_wait_ns.compare_exchange_weak(current, ns, std::memory_order_relaxed)) {
+	}
+}
+
 struct FaultPage {
 	uint64_t reads = 0, writes = 0, ns = 0;
 };
@@ -239,7 +249,8 @@ void PerfReport(double fps) {
 	                                        "cpu-read-fault", "cpu-write-fault",
 	                                        "write-readback", "write-readback-skipped",
 	                                        "write-patch", "write-patch-burst"};
-	std::string text = fmt::format("perf: {:.1f} fps |", fps);
+	std::string text = fmt::format("perf: {:.1f} fps | longest-gpu-wait {:.0f} ms |", fps,
+	                               static_cast<double>(g_longest_wait_ns.exchange(0)) / 1e6);
 	for (size_t i = 0; i < g_perf.size(); i++) {
 		const auto ns    = g_perf[i].ns.exchange(0, std::memory_order_relaxed);
 		const auto count = g_perf[i].count.exchange(0, std::memory_order_relaxed);
@@ -418,6 +429,7 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	const auto result     = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
 	PerfAdd(PerfCounter::GpuWait, PerfNow() - wait_start);
 	NoteWaitSite(PerfNow() - wait_start);
+	NoteLongestWait(PerfNow() - wait_start);
 	if (result != vk::Result::eSuccess) {
 		DebugReportNotedShaders("waitSemaphores failed", KnownGpuTick());
 		DebugReportCheckpoints(m_graphics.queue);
