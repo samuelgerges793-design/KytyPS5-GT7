@@ -126,6 +126,14 @@ struct PlainStore {
 // The upper 128 bits of YMM registers live in the context's extended (XSAVE) state.
 bool YmmUpper(CONTEXT& context, uint32_t index, uint8_t* out) {
 	DWORD64 features = 0;
+	// A context that carries extended state but not the AVX component holds YMM upper halves
+	// in their initial state (zero), as after VZEROUPPER or zeroing with VEX.128 moves.
+	if ((context.ContextFlags & CONTEXT_XSTATE) == CONTEXT_XSTATE &&
+	    GetXStateFeaturesMask(&context, &features) && (features & XSTATE_MASK_AVX) == 0 &&
+	    (GetEnabledXStateFeatures() & XSTATE_MASK_AVX) != 0) {
+		std::memset(out, 0, sizeof(M128A));
+		return true;
+	}
 	if (!GetXStateFeaturesMask(&context, &features) || (features & XSTATE_MASK_AVX) == 0) {
 		static std::atomic_bool logged {false};
 		if (!logged.exchange(true)) {
