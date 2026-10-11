@@ -1980,6 +1980,8 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 	if (indirect_buffer == nullptr) {
 		EXIT("indirect CX registers have null address, num_regs = %" PRIu32 "\n", indirect_num_dw);
 	}
+	// The table can be GPU-written through raw addresses, like command buffers.
+	cp.SyncCommandMemory({indirect_buffer, indirect_num_dw * 2u});
 	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
 		// Keep the encoded offset for packet control values, and use the normalized offset
 		// only for register dispatch.
@@ -2050,6 +2052,8 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 	if (indirect_buffer == nullptr) {
 		EXIT("indirect SH registers have null address, num_regs = %" PRIu32 "\n", indirect_num_dw);
 	}
+	// The table can be GPU-written through raw addresses, like command buffers.
+	cp.SyncCommandMemory({indirect_buffer, indirect_num_dw * 2u});
 	const auto indirect_address = reinterpret_cast<uint64_t>(indirect_buffer);
 
 	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
@@ -2113,6 +2117,8 @@ KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
 	if (indirect_buffer == nullptr) {
 		EXIT("indirect UC registers have null address, num_regs = %" PRIu32 "\n", indirect_num_dw);
 	}
+	// The table can be GPU-written through raw addresses, like command buffers.
+	cp.SyncCommandMemory({indirect_buffer, indirect_num_dw * 2u});
 	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
 		auto raw_cmd_offset = indirect_buffer[0];
 		auto cmd_offset     = NormalizeRegisterOffset(raw_cmd_offset);

@@ -147,6 +147,10 @@ public:
 	void                   SetSubmitId(uint64_t submit_id) { m_submit_id = submit_id; }
 	[[nodiscard]] bool     IsAsyncComputeQueue() const { return m_interrupt_event_id >= 0x20; }
 
+public:
+	// Before the command processor reads GPU-reachable memory as commands or register tables.
+	void SyncCommandMemory(std::span<const uint32_t> commands);
+
 private:
 	template <typename T>
 	void WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_write_dest, uint32_t eop_event_type,
@@ -156,7 +160,6 @@ private:
 	void ProcessPm4(Pm4Execution& execution);
 	void SuspendPm4();
 	CommandScheduler&   GetScheduler() const { return m_renderer.GetCommandScheduler(); }
-	void                SyncCommandMemory(std::span<const uint32_t> commands);
 	CommandBuffer&      CurrentBuffer() { return GetScheduler().Current(); }
 
 	RenderContext&   m_renderer;
