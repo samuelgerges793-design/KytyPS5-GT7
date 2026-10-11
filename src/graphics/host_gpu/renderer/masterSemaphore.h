@@ -73,6 +73,7 @@ enum class PerfCounter {
 	WriteReadbackSkipped,
 	// Plain CPU stores into GPU-written pages let through without a readback (writePatch.cpp).
 	WritePatch,
+	WritePatchBegin,
 	Count
 };
 void PerfAdd(PerfCounter counter, uint64_t nanoseconds);

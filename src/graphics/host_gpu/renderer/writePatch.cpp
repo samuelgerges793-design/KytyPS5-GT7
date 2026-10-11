@@ -192,6 +192,7 @@ bool RenderContext::TryBeginWritePatch(void* native_context, uint64_t fault_vadd
 	t_pending.size    = size;
 	m_page_manager.SetTemporaryWrite(page, true);
 	context.EFlags |= TrapFlag;
+	PerfAdd(PerfCounter::WritePatchBegin, 0);
 	return true;
 }
 
@@ -204,29 +205,35 @@ bool RenderContext::FinishWritePatch(void* native_context) noexcept {
 	t_pending.active = false;
 	m_page_manager.SetTemporaryWrite(t_pending.page, false);
 
-	// Upload the instruction's store, plus any bytes another thread changed while the page was
-	// open (those stores did not fault). Runs of changes close together upload as one.
+	// The instruction's store, plus any bytes another thread changed while the page was open
+	// (those stores did not fault). Runs of changes close together go as one.
 	std::array<uint8_t, PatchPageSize> after {};
-	std::vector<std::pair<uint64_t, uint64_t>> ranges;
-	ranges.emplace_back(t_pending.address, t_pending.size);
-	if (Libs::LibKernel::Memory::TryReadBacking(t_pending.page, after.data(), PatchPageSize)) {
-		uint64_t run_begin = 0;
-		uint64_t run_end   = 0;
-		for (uint64_t i = 0; i < PatchPageSize; i++) {
-			if (after[i] == t_pending.before[i]) continue;
-			if (run_end != 0 && i <= run_end + 32u) {
-				run_end = i + 1u;
-				continue;
-			}
-			if (run_end != 0) ranges.emplace_back(t_pending.page + run_begin, run_end - run_begin);
-			run_begin = i;
-			run_end   = i + 1u;
-		}
-		if (run_end != 0) ranges.emplace_back(t_pending.page + run_begin, run_end - run_begin);
+	if (!Libs::LibKernel::Memory::TryReadBacking(t_pending.page, after.data(), PatchPageSize)) {
+		std::memcpy(after.data(), t_pending.before.data(), PatchPageSize);
 	}
-	m_gpu->SendCommand([this, ranges = std::move(ranges)] {
-		for (const auto& [address, size]: ranges) {
-			m_buffer_cache.ApplyCpuWrite(address, size);
+	std::vector<std::pair<uint64_t, uint64_t>> ranges;
+	ranges.emplace_back(t_pending.address - t_pending.page, t_pending.size);
+	uint64_t run_begin = 0;
+	uint64_t run_end   = 0;
+	for (uint64_t i = 0; i < PatchPageSize; i++) {
+		if (after[i] == t_pending.before[i]) continue;
+		if (run_end != 0 && i <= run_end + 32u) {
+			run_end = i + 1u;
+			continue;
+		}
+		if (run_end != 0) ranges.emplace_back(run_begin, run_end - run_begin);
+		run_begin = i;
+		run_end   = i + 1u;
+	}
+	if (run_end != 0) ranges.emplace_back(run_begin, run_end - run_begin);
+	// Synchronous on the GPU thread (no GPU wait): a readback of this page that is already
+	// queued finishes first and may publish the GPU's older bytes over the store, so the
+	// stored bytes are written to guest memory again as well as uploaded.
+	const auto page = t_pending.page;
+	m_gpu->SendCommandSync([this, page, &after, &ranges] {
+		for (const auto& [offset, size]: ranges) {
+			Libs::LibKernel::Memory::WriteBacking(page + offset, after.data() + offset, size);
+			m_buffer_cache.ApplyCpuWrite(page + offset, size);
 		}
 	});
 	PerfAdd(PerfCounter::WritePatch, 0);
