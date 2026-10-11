@@ -15,6 +15,8 @@
 
 namespace Libs::Graphics {
 
+class BufferCache;
+
 class CommandScheduler {
 public:
 	CommandScheduler(RenderContext& context, GraphicContext& graphics);
@@ -86,6 +88,15 @@ private:
 	void PriorityOperationsThread(std::stop_token stop);
 	void QueueOperation(Common::UniqueFunction<void>&& operation, bool priority);
 	void RunOperation(Common::UniqueFunction<void>&& operation);
+
+public:
+	// Called at the end of each command buffer, before it is submitted (BufferCache records
+	// the copies that verify its writable bindings).
+	void SetPreSubmitHook(BufferCache* cache) { m_pre_submit = cache; }
+
+private:
+	BufferCache* m_pre_submit     = nullptr;
+	bool         m_in_pre_submit  = false;
 
 	MasterSemaphore              m_master;
 	RenderContext&               m_context;

@@ -245,6 +245,7 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
       m_download_buffer(graphics, scheduler, MemoryUsage::Download, 64 * MiB),
       m_device_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 128 * MiB),
       m_texture_cache(texture_cache) {
+	m_scheduler.SetPreSubmitHook(this);
 	std::memset(m_gds_buffer.Mapped().data(), 0, static_cast<size_t>(m_gds_buffer.Size()));
 	m_gds_buffer.Flush(0, m_gds_buffer.Size());
 	SetVulkanObjectNameF(m_graphics.device, m_bda_pagetable_buffer.Handle(),
@@ -279,6 +280,7 @@ BufferCache::~BufferCache() {
 		}
 	}
 	m_buffers.clear();
+	m_scheduler.SetPreSubmitHook(nullptr);
 }
 
 void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
@@ -530,6 +532,125 @@ uint64_t BufferCache::SyncGpuWrittenRange(uint64_t vaddr, uint64_t size) {
 	return differing;
 }
 
+void BufferCache::RecordWriteVerification() {
+	if (m_tick_written_ranges.empty()) {
+		return;
+	}
+	auto ranges = std::move(m_tick_written_ranges);
+	m_tick_written_ranges.clear();
+	// Whole 4 KiB pages (the tracker's granularity), merged.
+	for (auto& [address, size]: ranges) {
+		const auto end = Common::AlignUp(address + size, 0x1000);
+		address        = Common::AlignDown(address, 0x1000);
+		size           = end - address;
+	}
+	std::ranges::sort(ranges);
+	std::vector<std::pair<uint64_t, uint64_t>> merged;
+	for (const auto& [address, size]: ranges) {
+		if (!merged.empty() && address <= merged.back().first + merged.back().second) {
+			auto& last  = merged.back();
+			last.second = std::max(last.first + last.second, address + size) - last.first;
+		} else {
+			merged.emplace_back(address, size);
+		}
+	}
+	// Split by owning buffer; skip what no buffer covers any more.
+	struct Chunk {
+		BufferId id;
+		uint64_t address;
+		uint64_t size;
+	};
+	std::vector<Chunk> chunks;
+	uint64_t           total = 0;
+	for (const auto& [address, size]: merged) {
+		for (uint64_t cursor = address; cursor < address + size;) {
+			const auto* owner = m_page_table.Find(cursor >> PageTable::kPageBits);
+			if (owner == nullptr || !*owner) {
+				cursor = Common::AlignDown(cursor, CACHING_PAGESIZE) + CACHING_PAGESIZE;
+				continue;
+			}
+			const auto& buffer = m_slot_buffers[*owner];
+			const auto  end    = std::min(address + size, buffer.CpuAddress() + buffer.Size());
+			if (end <= cursor) {
+				cursor = Common::AlignDown(cursor, CACHING_PAGESIZE) + CACHING_PAGESIZE;
+				continue;
+			}
+			chunks.push_back({*owner, cursor, end - cursor});
+			total += end - cursor;
+			cursor = end;
+		}
+	}
+	// Very large frames stay conservative rather than copying hundreds of megabytes.
+	if (chunks.empty() || total > (uint64_t {256} << 20u)) {
+		return;
+	}
+	auto staging = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
+	                                        vk::BufferUsageFlagBits::eTransferDst, total);
+	auto& command = m_scheduler.Current();
+	command.EndRendering();
+	const auto        native = command.Handle();
+	vk::MemoryBarrier before {};
+	before.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
+	before.dstAccessMask = vk::AccessFlagBits::eTransferRead;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eTransfer,
+	                       {}, 1, &before, 0, nullptr, 0, nullptr);
+	std::vector<std::pair<uint64_t, uint64_t>> pages;
+	uint64_t                                   offset = 0;
+	for (const auto& chunk: chunks) {
+		const auto&          buffer = m_slot_buffers[chunk.id];
+		const vk::BufferCopy copy {buffer.Offset(chunk.address), offset, chunk.size};
+		native.copyBuffer(buffer.Handle(), staging->Handle(), 1, &copy);
+		pages.emplace_back(chunk.address, offset);
+		pages.emplace_back(chunk.size, 0);
+		offset += chunk.size;
+	}
+	vk::MemoryBarrier after {};
+	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	after.dstAccessMask = vk::AccessFlagBits::eHostRead;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost, {}, 1,
+	                       &after, 0, nullptr, 0, nullptr);
+	PerfAdd(PerfCounter::WriteVerifyBytes, total);
+	const auto tick = m_scheduler.CurrentTick();
+	m_scheduler.DeferOperation([this, tick, total, pages = std::move(pages),
+	                            owner = std::move(staging)]() mutable {
+		owner->Invalidate(0, total);
+		VerifyWrites(tick, pages, owner->Mapped().data());
+		owner.reset();
+	});
+}
+
+void BufferCache::VerifyWrites(uint64_t tick, const std::vector<std::pair<uint64_t, uint64_t>>& pages,
+                               const uint8_t* gpu) {
+	std::array<uint8_t, 0x1000> guest {};
+	uint64_t                    released = 0;
+	// Pairs: (address, staging offset), (size, 0).
+	for (size_t i = 0; i + 1 < pages.size(); i += 2) {
+		const auto address = pages[i].first;
+		const auto offset  = pages[i].second;
+		const auto size    = pages[i + 1].first;
+		for (uint64_t page = address; page < address + size; page += 0x1000) {
+			const auto mark = m_page_last_mark.find(page >> 12u);
+			if (mark == m_page_last_mark.end() || mark->second != tick) {
+				continue; // Marked again by later work, or already handled.
+			}
+			m_page_last_mark.erase(mark);
+			if (!m_gpu_modified_ranges.Intersects(page, 0x1000) ||
+			    !Libs::LibKernel::Memory::TryReadBacking(page, guest.data(), guest.size())) {
+				continue;
+			}
+			if (std::memcmp(gpu + offset + (page - address), guest.data(), guest.size()) != 0) {
+				continue; // Written by the GPU: stays GPU-owned.
+			}
+			m_gpu_modified_ranges.Subtract(page, 0x1000);
+			m_memory_tracker.UnmarkRegionAsGpuModified(page, 0x1000);
+			released++;
+		}
+	}
+	if (released != 0) {
+		PerfAdd(PerfCounter::WriteVerifyReleased, released);
+	}
+}
+
 bool BufferCache::StoreCpuBytes(uint64_t vaddr, const uint8_t* data, uint32_t size) {
 	if (size == 0 || size > 32 || !GuestRange {vaddr, size}.Valid()) {
 		return false;
@@ -697,6 +818,14 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
 	if (is_written) {
 		m_gpu_modified_ranges.Add(vaddr, size);
+		static const bool verify = std::getenv("KYTY_NO_WRITE_VERIFY") == nullptr;
+		if (verify) {
+			const auto tick = m_scheduler.CurrentTick();
+			for (uint64_t page = vaddr >> 12u; page <= (vaddr + size - 1u) >> 12u; page++) {
+				m_page_last_mark[page] = tick;
+			}
+			m_tick_written_ranges.emplace_back(vaddr, size);
+		}
 	}
 	return {&buffer, buffer.Offset(vaddr)};
 }

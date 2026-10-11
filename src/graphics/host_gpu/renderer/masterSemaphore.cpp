@@ -256,7 +256,8 @@ void PerfReport(double fps) {
 	                                        "write-readback", "write-readback-skipped",
 	                                        "write-patch", "write-patch-burst",
 	                                        "writable-bind-MB", "cp-sync",
-	                                        "cp-stale-bytes"};
+	                                        "cp-stale-bytes", "verify-copy-MB",
+	                                        "verify-released"};
 	std::string text = fmt::format("perf: {:.1f} fps | longest-gpu-wait {:.0f} ms |", fps,
 	                               static_cast<double>(g_longest_wait_ns.exchange(0)) / 1e6);
 	for (size_t i = 0; i < g_perf.size(); i++) {

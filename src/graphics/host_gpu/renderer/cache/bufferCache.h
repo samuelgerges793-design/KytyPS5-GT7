@@ -99,6 +99,11 @@ public:
 	// GPU thread: work recorded with a shader that writes through raw addresses. Command memory
 	// synced since the last such work is skipped.
 	void               NoteAddressWrites() { m_address_write_epoch++; }
+	// Writable bindings mark their whole range GPU-written. At the end of each command buffer,
+	// the pages marked in it are copied back; when that work completes, pages whose GPU bytes
+	// equal guest memory (the shaders did not change them) are released to the CPU, unless a
+	// later command buffer marked them again. KYTY_NO_WRITE_VERIFY turns it off.
+	void               RecordWriteVerification();
 
 private:
 	friend struct BufferCacheTestAccess;
@@ -137,6 +142,11 @@ private:
 		uint32_t                size    = 0;
 		std::array<uint8_t, 32> bytes {};
 	};
+	void                                   VerifyWrites(uint64_t tick,
+	                                                    const std::vector<std::pair<uint64_t, uint64_t>>& pages,
+	                                                    const uint8_t* gpu);
+	std::vector<std::pair<uint64_t, uint64_t>> m_tick_written_ranges;
+	std::unordered_map<uint64_t, uint64_t>     m_page_last_mark;
 	uint64_t                               m_address_write_epoch = 1;
 	std::unordered_map<uint64_t, uint64_t> m_command_page_epochs;
 	std::mutex                   m_cpu_store_mutex;
