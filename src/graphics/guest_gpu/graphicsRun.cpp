@@ -713,6 +713,25 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			continue;
 		}
 
+		// A command buffer that is zero from its start: report what memory it is in and compare
+		// it with the GPU's copy once (GPU-written commands the guest copy has not seen yet).
+		if (packet_header == 0u && cursor.offset_dw == 0u && total_dw >= 4u &&
+		    std::all_of(packet, packet + total_dw, [](uint32_t dw) { return dw == 0u; })) {
+			static std::atomic<uint32_t> empty_log_count {0};
+			const auto address = reinterpret_cast<uint64_t>(packet);
+			auto&      cache   = m_renderer.GetBufferCache();
+			const auto pages   = cache.DescribePages(address, uint64_t {total_dw} * 4u);
+			const auto synced  = cache.SyncGpuWrittenRange(address, uint64_t {total_dw} * 4u, true);
+			if (empty_log_count.fetch_add(1) < 16) {
+				Log::WriteToConsoleAndLog(fmt::format(
+				    "PM4: command buffer at 0x{:x} ({} dwords) is all zero; GPU copy differs in {} "
+				    "bytes;{}\n",
+				    address, total_dw, synced, pages));
+			}
+			if (synced != 0 && packet[0] != 0u) {
+				continue; // Re-read with the GPU's bytes.
+			}
+		}
 		// GT7 submits command buffers whose tail is zero-filled; treat zero dwords as padding.
 		if (packet_header == 0u) {
 			static std::atomic<uint32_t> zero_log_count {0};

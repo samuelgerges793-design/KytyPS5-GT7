@@ -291,8 +291,178 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid memory-invalidation range\n");
 	}
+	if (ShaderRecompiler::IR::WriteTrackingEnabled()) {
+		std::scoped_lock lock(m_snapshot_mutex);
+		if (!m_snapshot_candidates.empty()) {
+			for (uint64_t page = vaddr >> 12u; page <= (vaddr + size - 1u) >> 12u; page++) {
+				if (!m_snapshot_candidates.contains(page) || m_snapshots.contains(page) ||
+				    m_memory_tracker.IsRegionCpuModified(page << 12u, 0x1000)) {
+					continue;
+				}
+				auto bytes = std::make_unique<std::array<uint8_t, 0x1000>>();
+				if (Libs::LibKernel::Memory::TryReadBacking(page << 12u, bytes->data(), bytes->size())) {
+					m_snapshots.emplace(page, std::move(bytes));
+				}
+			}
+		}
+	}
 	m_memory_tracker.InvalidateRegion(vaddr, size,
 	                                  [this, vaddr, size] { ReadMemory(vaddr, size, true); });
+}
+
+void BufferCache::NoteGpuOwnedAccess(uint64_t vaddr) {
+	if (!ShaderRecompiler::IR::WriteTrackingEnabled()) {
+		return;
+	}
+	const auto page = vaddr >> 12u;
+	auto       counter = PerfCounter::GpuOwnedUntracked;
+	{
+		std::scoped_lock lock(m_snapshot_mutex);
+		if (m_release_candidates.size() < 65536) m_release_candidates.insert(page);
+		if (m_track_last_written.contains(page)) {
+			counter = PerfCounter::GpuOwnedWritten;
+		} else if (m_track_last_tracked.contains(page)) {
+			counter = PerfCounter::GpuOwnedClean;
+		}
+	}
+	PerfAdd(counter, 0);
+}
+
+void BufferCache::SetPredictedInFlight(uint64_t page, bool in_flight) {
+	std::scoped_lock lock(m_snapshot_mutex);
+	if (in_flight) {
+		m_snapshot_candidates.insert(page);
+	} else {
+		m_snapshot_candidates.erase(page);
+	}
+}
+
+bool BufferCache::TryReleaseUnwrittenPage(uint64_t page) {
+	// A page marked GPU-written only by tracked bindings the GPU never wrote holds the same bytes
+	// on both sides (CPU stores to it were applied to both), once every submission that marked
+	// it has been checked.
+	static const bool release = std::getenv("KYTY_WRITE_TRACK_NO_RELEASE") == nullptr;
+	const auto history = m_page_history.find(page);
+	if (!release || history == m_page_history.end() || history->second.ever_written) {
+		return false;
+	}
+	const auto marked = m_page_mark_generation.find(page);
+	if (marked == m_page_mark_generation.end() || marked->second > m_track_checked_generation) {
+		return false;
+	}
+	const auto address = page << 12u;
+	if (!m_gpu_modified_ranges.Intersects(address, 0x1000)) {
+		return false;
+	}
+	m_gpu_modified_ranges.Subtract(address, 0x1000);
+	m_memory_tracker.UnmarkRegionAsGpuModified(address, 0x1000);
+	return true;
+}
+
+bool BufferCache::CanReleaseAfterDownload(uint64_t page) const {
+	// Opt-in: a run with it ended in a garbage command packet (Oct 11, cause not confirmed).
+	static const bool release = std::getenv("KYTY_WRITE_TRACK_DOWNLOAD_RELEASE") != nullptr;
+	const auto history = m_page_history.find(page);
+	if (!release || history == m_page_history.end() || history->second.downloads >= 4u ||
+	    m_predicted_in_flight.contains(page)) {
+		return false;
+	}
+	const auto marked = m_page_mark_generation.find(page);
+	return marked != m_page_mark_generation.end() && marked->second <= m_track_checked_generation &&
+	       m_gpu_modified_ranges.Intersects(page << 12u, 0x1000);
+}
+
+void BufferCache::ReleaseAfterDownload(std::vector<uint64_t>& pages) {
+	// GPU-owned pages the CPU keeps touching, which no unchecked submission marked: download them
+	// once (a wait) and hand them back to the CPU. Contiguous pages of one buffer go together.
+	const auto now = std::chrono::steady_clock::now();
+	if (now - m_last_release_download < std::chrono::milliseconds(50) ||
+	    m_scheduler.Current().IsInvalid()) {
+		return;
+	}
+	m_last_release_download = now;
+	std::ranges::sort(pages);
+	uint64_t released = 0;
+	uint32_t runs     = 0;
+	for (size_t i = 0; i < pages.size() && runs < 64u;) {
+		const auto  begin = pages[i] << 12u;
+		const auto* owner = m_page_table.Find(begin >> PageTable::kPageBits);
+		if (owner == nullptr || !*owner || !m_slot_buffers[*owner].IsInBounds(begin, 0x1000)) {
+			i++;
+			continue;
+		}
+		auto&  buffer = m_slot_buffers[*owner];
+		size_t j      = i + 1u;
+		while (j < pages.size() && pages[j] == pages[j - 1u] + 1u &&
+		       buffer.IsInBounds(pages[j] << 12u, 0x1000)) {
+			j++;
+		}
+		const auto size = uint64_t {j - i} << 12u;
+		(void)DownloadBufferMemory<false>(buffer, begin, size);
+		m_memory_tracker.UnmarkRegionAsGpuModified(begin, size);
+		for (size_t k = i; k < j; k++) {
+			auto& history        = m_page_history[pages[k]];
+			history.ever_written = false;
+			history.downloads++;
+		}
+		released += j - i;
+		runs++;
+		i = j;
+	}
+	if (released != 0) PerfAdd(PerfCounter::TrackDownloadReleased, released);
+}
+
+void BufferCache::ProcessPendingMerges() {
+	if (!ShaderRecompiler::IR::WriteTrackingEnabled()) {
+		return;
+	}
+	std::vector<uint64_t> pages;
+	std::vector<uint64_t> candidates;
+	{
+		std::scoped_lock lock(m_snapshot_mutex);
+		candidates.assign(m_release_candidates.begin(), m_release_candidates.end());
+		m_release_candidates.clear();
+		if (!m_pending_merges.empty() && !m_scheduler.Current().IsInvalid()) {
+			pages.swap(m_pending_merges);
+		}
+	}
+	if (!candidates.empty()) {
+		uint64_t              released = 0;
+		std::vector<uint64_t> downloads;
+		for (const auto page: candidates) {
+			const auto history = m_page_history.find(page);
+			PerfAdd(history == m_page_history.end()  ? PerfCounter::CandidateNoHistory
+			        : history->second.command         ? (history->second.ever_written
+			                                                 ? PerfCounter::CandidateCommandWritten
+			                                                 : PerfCounter::CandidateCommandClean)
+			        : history->second.ever_written    ? PerfCounter::CandidateWritten
+			                                          : PerfCounter::CandidateClean,
+			        0);
+			if (TryReleaseUnwrittenPage(page)) {
+				released++;
+			} else if (CanReleaseAfterDownload(page)) {
+				downloads.push_back(page);
+			}
+		}
+		if (released != 0) PerfAdd(PerfCounter::TrackReleased, released);
+		if (!downloads.empty()) ReleaseAfterDownload(downloads);
+	}
+	for (const auto page: pages) {
+		const auto address = page << 12u;
+		if (m_gpu_modified_ranges.Intersects(address, 0x1000)) {
+			continue; // Marked since by other work.
+		}
+		const auto* owner = m_page_table.Find(address >> PageTable::kPageBits);
+		if (owner == nullptr || !*owner || !m_slot_buffers[*owner].IsInBounds(address, 0x1000)) {
+			continue;
+		}
+		// Upload the CPU's changes (only those, when saved bytes exist), then mark the page
+		// GPU-written: CPU accesses read back the merged bytes.
+		(void)SynchronizeBuffer(m_slot_buffers[*owner], address, 0x1000, true, false);
+		m_gpu_modified_ranges.Add(address, 0x1000);
+		std::scoped_lock lock(m_snapshot_mutex);
+		m_snapshots.erase(page);
+	}
 }
 
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
@@ -432,6 +602,14 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 		const auto old_id = (it++)->second;
 		JoinOverlap(id, old_id, !overlap.has_stream_leap);
 	}
+	{
+		// A new buffer's contents are not what any saved page bytes describe.
+		std::scoped_lock lock(m_snapshot_mutex);
+		std::erase_if(m_snapshots, [&](const auto& entry) {
+			const auto address = entry.first << 12u;
+			return address >= overlap.begin && address < overlap.end;
+		});
+	}
 	Register(id);
 	return id;
 }
@@ -441,13 +619,57 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size = 0;
 	vk::Buffer                  source;
+	std::unique_lock snapshot_lock(m_snapshot_mutex, std::defer_lock);
+	if (ShaderRecompiler::IR::WriteTrackingEnabled()) snapshot_lock.lock();
+	const bool has_snapshots = snapshot_lock.owns_lock() && !m_snapshots.empty();
+	if (snapshot_lock.owns_lock() && !has_snapshots) snapshot_lock.unlock();
 	m_memory_tracker.ForEachUploadRange(
 	    vaddr, size, is_written,
 	    [&](uint64_t address, uint64_t bytes) noexcept {
-		    copies.emplace_back(total_size, buffer.Offset(address), bytes);
-		    total_size += bytes;
+		    const auto add = [&](uint64_t begin, uint64_t count) {
+			    copies.emplace_back(total_size, buffer.Offset(begin), count);
+			    total_size += count;
+		    };
+		    if (!has_snapshots) {
+			    add(address, bytes);
+			    return;
+		    }
+		    std::array<uint8_t, 0x1000> guest {};
+		    for (uint64_t cursor = address; cursor < address + bytes;) {
+			    const auto page_end = (cursor & ~uint64_t {0xfff}) + 0x1000;
+			    const auto end      = std::min(page_end, address + bytes);
+			    const auto saved    = m_snapshots.find(cursor >> 12u);
+			    if (saved == m_snapshots.end() ||
+			        !Libs::LibKernel::Memory::TryReadBacking(cursor & ~uint64_t {0xfff}, guest.data(),
+			                                                 guest.size())) {
+				    add(cursor, end - cursor);
+				    cursor = end;
+				    continue;
+			    }
+			    const auto& before = *saved->second;
+			    for (uint64_t i = cursor & 0xfffu; i < ((end - 1u) & 0xfffu) + 1u;) {
+				    if (guest[i] == before[i]) {
+					    i++;
+					    continue;
+				    }
+				    auto run_end = i + 1u;
+				    // Runs separated by short equal gaps upload together.
+				    for (uint64_t gap = 0; run_end < ((end - 1u) & 0xfffu) + 1u && gap < 16u; run_end++) {
+					    gap = guest[run_end] == before[run_end] ? gap + 1u : 0u;
+				    }
+				    while (guest[run_end - 1u] == before[run_end - 1u]) run_end--;
+				    add((cursor & ~uint64_t {0xfff}) + i, run_end - i);
+				    PerfAdd(PerfCounter::TrackMergedBytes, run_end - i);
+				    i = run_end;
+			    }
+			    m_snapshots.erase(saved);
+			    cursor = end;
+		    }
 	    },
-	    [&]() noexcept { source = UploadCopies(buffer, copies, total_size); });
+	    [&]() noexcept {
+		    if (snapshot_lock.owns_lock()) snapshot_lock.unlock();
+		    source = UploadCopies(buffer, copies, total_size);
+	    });
 	if (source) {
 		RecordBufferUpload(buffer, source, copies);
 	}
@@ -457,18 +679,49 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	return false;
 }
 
-uint64_t BufferCache::SyncGpuWrittenRange(uint64_t vaddr, uint64_t size) {
+std::string BufferCache::DescribePages(uint64_t vaddr, uint64_t size) {
+	std::string text;
+	for (uint64_t page = vaddr >> 12u; page <= (vaddr + size - 1u) >> 12u; page++) {
+		const auto address = page << 12u;
+		const auto history = m_page_history.find(page);
+		bool saved = false;
+		{
+			std::scoped_lock lock(m_snapshot_mutex);
+			saved = m_snapshots.contains(page);
+		}
+		text += fmt::format(" [0x{:x} saved={} reg={} gpu={} cpu={} inflight={}", address, saved ? 1 : 0,
+		                    IsRegionRegistered(address, 0x1000) ? 1 : 0,
+		                    m_gpu_modified_ranges.Intersects(address, 0x1000) ? 1 : 0,
+		                    m_memory_tracker.IsRegionCpuModified(address, 0x1000) ? 1 : 0,
+		                    m_predicted_in_flight.contains(page) ? 1 : 0);
+		if (history != m_page_history.end()) {
+			text += fmt::format(" clean={} misses={} cmd={}", history->second.clean,
+			                    history->second.misses, history->second.command ? 1 : 0);
+		}
+		text += "]";
+	}
+	return text;
+}
+
+uint64_t BufferCache::SyncGpuWrittenRange(uint64_t vaddr, uint64_t size, bool force) {
 	static const bool enabled = std::getenv("KYTY_NO_CP_SYNC") == nullptr;
 	if (!enabled || size == 0 || !GuestRange {vaddr, size}.Valid() ||
 	    !IsRegionRegistered(vaddr, size) || m_scheduler.Current().IsInvalid()) {
 		return 0;
 	}
-	// Pages synced after the last raw-address write work cannot hold newer GPU bytes.
-	bool stale = false;
+	// Pages synced after the last raw-address write work cannot hold newer GPU bytes, unless a
+	// write-tracking prediction left them unmarked and the GPU may have written them since.
+	bool stale     = false;
+	bool predicted = false;
 	for (uint64_t page = vaddr >> 12u; page <= (vaddr + size - 1u) >> 12u; page++) {
 		const auto found = m_command_page_epochs.find(page);
 		stale |= found == m_command_page_epochs.end() || found->second != m_address_write_epoch;
+		if (ShaderRecompiler::IR::WriteTrackingEnabled()) {
+			predicted |= m_predicted_in_flight.contains(page);
+			m_page_history[page].command = true;
+		}
 	}
+	stale |= predicted || force;
 	if (!stale) {
 		return 0;
 	}
@@ -528,8 +781,8 @@ uint64_t BufferCache::SyncGpuWrittenRange(uint64_t vaddr, uint64_t size) {
 		static std::atomic<uint32_t> logged {0};
 		if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
 			Log::WriteToConsoleAndLog(fmt::format(
-			    "CP sync: commands at 0x{:x} ({} bytes) differ from the GPU copy in {} bytes\n",
-			    vaddr, size, differing));
+			    "CP sync: commands at 0x{:x} ({} bytes) differ from the GPU copy in {} bytes{}\n",
+			    vaddr, size, differing, predicted ? " (predicted-clean page)" : ""));
 		}
 		PerfAdd(PerfCounter::CommandMemoryStale, differing);
 	}
@@ -578,7 +831,7 @@ static uint32_t RequiredCleanSubmissions(uint8_t misses) {
 
 bool BufferCache::PredictClean(uint64_t page) const {
 	const auto found = m_page_history.find(page);
-	return found != m_page_history.end() &&
+	return found != m_page_history.end() && !found->second.command &&
 	       found->second.clean >= RequiredCleanSubmissions(found->second.misses);
 }
 
@@ -595,6 +848,8 @@ void BufferCache::RecordWriteTracking() {
 	m_track_bases.clear();
 	m_track_cursor = 0;
 	m_track_half ^= 1u;
+	const auto generation = m_track_generation - 1u; // The previous submission's.
+	m_track_generation++;
 	if (ranges.empty()) {
 		return;
 	}
@@ -628,24 +883,39 @@ void BufferCache::RecordWriteTracking() {
 	for (auto& range: ranges) {
 		range.base -= first_bit;
 	}
-	m_scheduler.DeferOperation([this, bytes, ranges = std::move(ranges),
+	m_scheduler.DeferOperation([this, bytes, generation, ranges = std::move(ranges),
 	                            predicted = std::move(predicted),
 	                            owner = std::move(staging)]() mutable {
 		owner->Invalidate(0, bytes);
 		ProcessWriteTracking(ranges, predicted,
-		                     reinterpret_cast<const uint32_t*>(owner->Mapped().data()));
+		                     reinterpret_cast<const uint32_t*>(owner->Mapped().data()), generation);
 		owner.reset();
 	});
 }
 
 void BufferCache::ProcessWriteTracking(const std::vector<TrackedRange>& ranges,
-                                       const std::vector<uint64_t>& predicted, const uint32_t* bits) {
+                                       const std::vector<uint64_t>& predicted, const uint32_t* bits,
+                                       uint64_t generation) {
 	// Overlapping bindings: a page counts as written when any of its bits is set.
 	std::unordered_map<uint64_t, bool> written;
 	for (const auto& range: ranges) {
 		for (uint32_t i = 0; i < range.pages; i++) {
 			const auto bit = range.base + i;
 			written[range.first_page + i] |= ((bits[bit >> 5u] >> (bit & 31u)) & 1u) != 0;
+		}
+	}
+	for (const auto page: predicted) {
+		const auto in_flight = m_predicted_in_flight.find(page);
+		if (in_flight != m_predicted_in_flight.end() && --in_flight->second == 0) {
+			m_predicted_in_flight.erase(in_flight);
+			SetPredictedInFlight(page, false);
+			// Saved bytes describe the GPU copy only while the page's prediction is checked;
+			// a page the GPU wrote keeps them for its merge.
+			const auto found = written.find(page);
+			if (found == written.end() || !found->second) {
+				std::scoped_lock lock(m_snapshot_mutex);
+				m_snapshots.erase(page);
+			}
 		}
 	}
 	uint64_t mispredicted = 0;
@@ -668,24 +938,55 @@ void BufferCache::ProcessWriteTracking(const std::vector<TrackedRange>& ranges,
 			m_gpu_modified_ranges.Add(address, 0x1000);
 			m_memory_tracker.MarkRegionAsGpuModified(address, 0x1000);
 			mispredicted++;
-		} else {
-			// The CPU changed the page too: its bytes win and the next upload replaces the GPU's.
+			continue;
+		}
+		std::scoped_lock lock(m_snapshot_mutex);
+		if (!m_snapshots.contains(page)) {
+			// Changed by the CPU without saved bytes: its whole page will win over the GPU's.
 			conflicts++;
 			static std::atomic<uint32_t> logged {0};
 			if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
 				Log::WriteToConsoleAndLog(fmt::format(
-				    "write tracker: GPU and CPU both wrote predicted-clean page 0x{:x}\n", address));
+				    "write tracker: GPU and CPU both wrote predicted-clean page 0x{:x} (no saved bytes)\n",
+				    address));
 			}
 		}
+		m_pending_merges.push_back(page);
+		mispredicted++;
 	}
+	{
+		std::unordered_set<uint64_t> last_written;
+		std::unordered_set<uint64_t> last_tracked;
+		last_tracked.reserve(written.size());
+		for (const auto& [page, was_written]: written) {
+			last_tracked.insert(page);
+			if (was_written) last_written.insert(page);
+		}
+		for (const auto page: predicted) {
+			if (m_gpu_modified_ranges.Intersects(page << 12u, 0x1000)) last_written.insert(page);
+		}
+		std::scoped_lock lock(m_snapshot_mutex);
+		m_track_last_written.swap(last_written);
+		m_track_last_tracked.swap(last_tracked);
+	}
+	static const bool release = std::getenv("KYTY_WRITE_TRACK_NO_RELEASE") == nullptr;
+	uint64_t          released = 0;
 	for (const auto& [page, was_written]: written) {
 		auto& history = m_page_history[page];
 		if (was_written) {
-			history.clean = 0;
-		} else if (history.clean < UINT8_MAX) {
+			history.clean        = 0;
+			history.ever_written = true;
+			continue;
+		}
+		if (history.clean < UINT8_MAX) {
 			history.clean++;
 		}
 	}
+	m_track_checked_generation = std::max(m_track_checked_generation, generation);
+	for (const auto& [page, was_written]: written) {
+		if (release && !was_written && TryReleaseUnwrittenPage(page)) released++;
+	}
+	if (released != 0) PerfAdd(PerfCounter::TrackReleased, released);
 	if (mispredicted != 0) PerfAdd(PerfCounter::TrackMispredict, mispredicted);
 	if (conflicts != 0) PerfAdd(PerfCounter::TrackConflict, conflicts);
 }
@@ -827,6 +1128,7 @@ bool BufferCache::StoreCpuBytes(uint64_t vaddr, const uint8_t* data, uint32_t si
 }
 
 void BufferCache::FlushCpuWrites() {
+	ProcessPendingMerges();
 	std::vector<std::pair<uint64_t, uint64_t>> ranges;
 	{
 		std::scoped_lock lock(m_cpu_store_mutex);
@@ -990,7 +1292,11 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		const auto end     = vaddr + size;
 		for (uint64_t page = vaddr & ~uint64_t {0xfff}; page < end; page += 0x1000) {
 			const bool mark  = !PredictClean(page >> 12u);
-			if (!mark) m_track_predicted.push_back(page >> 12u);
+			if (mark) m_page_mark_generation[page >> 12u] = m_track_generation;
+			if (!mark) {
+				m_track_predicted.push_back(page >> 12u);
+				if (m_predicted_in_flight[page >> 12u]++ == 0) SetPredictedInFlight(page >> 12u, true);
+			}
 			const auto begin = std::max(page, vaddr);
 			if (first) {
 				run_mark = mark;
@@ -1006,9 +1312,24 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		(void)SynchronizeBuffer(buffer, run_begin, end - run_begin, run_mark, is_texel_buffer);
 		if (run_mark) m_gpu_modified_ranges.Add(run_begin, end - run_begin);
 		else PerfAdd(PerfCounter::TrackSkipBytes, end - run_begin);
+		PerfAdd(PerfCounter::MarkTrackedBytes, size);
 	} else {
 		(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
-		if (is_written) m_gpu_modified_ranges.Add(vaddr, size);
+		if (is_written) {
+			m_gpu_modified_ranges.Add(vaddr, size);
+			for (uint64_t page = vaddr >> 12u;
+			     ShaderRecompiler::IR::WriteTrackingEnabled() && page <= (vaddr + size - 1u) >> 12u; page++) {
+				if (track != ShaderRecompiler::IR::WriteTrackUntracked) {
+					m_page_mark_generation[page] = m_track_generation;
+				} else {
+					m_page_history[page].ever_written = true;
+				}
+			}
+			PerfAdd(write_track_base == nullptr ? PerfCounter::MarkOtherBytes
+			        : track != ShaderRecompiler::IR::WriteTrackUntracked ? PerfCounter::MarkTrackedBytes
+			                                                             : PerfCounter::MarkOverflowBytes,
+			        size);
+		}
 	}
 	if (is_written) {
 		if (verify) {

@@ -129,6 +129,9 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 		EXIT("storage buffer range is unsupported\n");
 	}
 	uint32_t track_base   = ShaderRecompiler::IR::WriteTrackUntracked;
+	if (resource.written && write_track_info == nullptr) {
+		PerfAdd(PerfCounter::MarkUntrackedBindingBytes, size);
+	}
 	auto [buffer, offset] = context.GetBufferCache().ObtainBuffer(
 	    address, size, resource.written,
 	    resource.formatted || (resource.read && Config::SyncRawImageBuffersEnabled()), id,

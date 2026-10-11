@@ -297,6 +297,7 @@ bool RenderContext::TryBeginWritePatch(void* native_context, uint64_t fault_vadd
 	if (!m_buffer_cache.IsRegionGpuModified(page, PatchPageSize)) {
 		return false;
 	}
+	m_buffer_cache.NoteGpuOwnedAccess(fault_vaddr);
 	auto&      context = *static_cast<CONTEXT*>(native_context);
 	PlainStore store;
 	if (!DecodePlainStore(context, store)) {

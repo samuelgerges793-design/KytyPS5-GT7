@@ -11,6 +11,10 @@
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
+#include <chrono>
+#include <string>
+#include <memory>
+#include <unordered_set>
 #include <array>
 #include <map>
 #include <mutex>
@@ -77,6 +81,9 @@ public:
 	[[nodiscard]] Buffer* GetBdaPageTableBuffer() noexcept { return &m_bda_pagetable_buffer; }
 	[[nodiscard]] Buffer* GetFaultBuffer() noexcept { return m_fault_manager.GetFaultBuffer(); }
 	[[nodiscard]] Buffer* GetWriteTrackerBuffer() noexcept { return &m_write_tracker; }
+	// Diagnostics: counts a CPU access to a GPU-owned page by what the last checked submission
+	// saw: written by the GPU, tracked but clean, or not tracked.
+	void NoteGpuOwnedAccess(uint64_t vaddr);
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferForImage(uint64_t vaddr, uint64_t size);
 	void FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds);
 	void CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
@@ -99,7 +106,9 @@ public:
 	// GPU buffer covers it, waits for the GPU and copies the GPU's bytes into guest memory
 	// (except on pages the CPU changed since), so commands the GPU wrote through raw addresses
 	// are seen. Returns the number of bytes that differed.
-	uint64_t           SyncGpuWrittenRange(uint64_t vaddr, uint64_t size);
+	uint64_t           SyncGpuWrittenRange(uint64_t vaddr, uint64_t size, bool force = false);
+	// Diagnostics: buffer-cache and write-tracking state of the pages of a range.
+	[[nodiscard]] std::string DescribePages(uint64_t vaddr, uint64_t size);
 	// GPU thread: work recorded with a shader that writes through raw addresses. Command memory
 	// synced since the last such work is skipped.
 	void               NoteAddressWrites() { m_address_write_epoch++; }
@@ -167,13 +176,29 @@ private:
 	struct PageHistory {
 		uint8_t clean  = 0; // Submissions in a row without GPU writes.
 		uint8_t misses = 0; // Times the GPU wrote the page after it was predicted clean.
+		bool    command = false; // The command processor read commands from it: never predicted.
+		// The GPU may have written it (a set bit, or marked by untracked work): its GPU copy can
+		// differ from the guest's, so releasing it needs a download.
+		bool    ever_written = false;
+		uint8_t downloads    = 0; // Times released after a download.
 	};
 	[[nodiscard]] uint32_t AllocateWriteTrack(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool     PredictClean(uint64_t page) const;
 	void                   RecordWriteTracking();
 	void                   ProcessWriteTracking(const std::vector<TrackedRange>& ranges,
 	                                            const std::vector<uint64_t>& predicted,
-	                                            const uint32_t* bits);
+	                                            const uint32_t* bits, uint64_t generation);
+	// Submissions are numbered by tracking generation; the last generation that marked each
+	// page decides whether a checked generation can release it.
+	uint64_t                                            m_track_generation = 1;
+	uint64_t                                            m_track_checked_generation = 0;
+	// GPU-owned pages the CPU touched (from fault threads), checked for release on the GPU thread.
+	std::unordered_set<uint64_t>                        m_release_candidates;
+	[[nodiscard]] bool TryReleaseUnwrittenPage(uint64_t page);
+	[[nodiscard]] bool CanReleaseAfterDownload(uint64_t page) const;
+	void               ReleaseAfterDownload(std::vector<uint64_t>& pages);
+	std::chrono::steady_clock::time_point              m_last_release_download {};
+	std::unordered_map<uint64_t, uint64_t>              m_page_mark_generation;
 	Buffer                                              m_write_tracker;
 	bool                                                m_write_tracker_cleared = false;
 	uint32_t                                            m_track_cursor          = 0;
@@ -185,6 +210,21 @@ private:
 	std::vector<TrackedRange>                           m_previous_track_ranges;
 	std::vector<uint64_t>                               m_previous_track_predicted;
 	std::unordered_map<uint64_t, PageHistory>           m_page_history;
+	// Pages left unmarked by a prediction whose submission has not been checked yet (count of
+	// predictions in flight).
+	std::unordered_map<uint64_t, uint32_t>              m_predicted_in_flight;
+	// Merging CPU and GPU writes to a predicted page: the CPU's first write fault on an in-flight
+	// page saves its bytes (equal to the GPU buffer before GPU writes). Uploads of the page then
+	// send only the bytes the CPU changed, so GPU-written bytes in the buffer survive; a page the
+	// GPU wrote after all gets the CPU's changes uploaded and is then marked GPU-written.
+	void                                                SetPredictedInFlight(uint64_t page, bool in_flight);
+	void                                                ProcessPendingMerges();
+	std::mutex                                          m_snapshot_mutex;
+	std::unordered_set<uint64_t>                        m_snapshot_candidates;
+	std::unordered_map<uint64_t, std::unique_ptr<std::array<uint8_t, 0x1000>>> m_snapshots;
+	std::vector<uint64_t>                               m_pending_merges;
+	std::unordered_set<uint64_t>                        m_track_last_written;
+	std::unordered_set<uint64_t>                        m_track_last_tracked;
 	uint64_t                               m_address_write_epoch = 1;
 	std::unordered_map<uint64_t, uint64_t> m_command_page_epochs;
 	std::mutex                   m_cpu_store_mutex;

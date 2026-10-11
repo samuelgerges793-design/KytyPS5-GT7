@@ -88,6 +88,27 @@ enum class PerfCounter {
 	TrackSkipBytes,
 	TrackMispredict,
 	TrackConflict,
+	TrackMergedBytes,
+	// CPU stores and read faults on GPU-owned pages, by what the last checked submission saw.
+	GpuOwnedWritten,
+	GpuOwnedClean,
+	GpuOwnedUntracked,
+	// Bytes marked GPU-written per second, by source: tracked bindings (before prediction),
+	// tracker overflow, written bindings of untracked programs, and other (DMA copies/fills
+	// plus untracked bindings).
+	MarkTrackedBytes,
+	MarkOverflowBytes,
+	MarkUntrackedBindingBytes,
+	MarkOtherBytes,
+	// GPU-owned pages released because the GPU never wrote them (pages per second).
+	TrackReleased,
+	TrackDownloadReleased,
+	// CPU-touched GPU-owned pages (unique per flush), by tracking history.
+	CandidateNoHistory,
+	CandidateCommandClean,
+	CandidateCommandWritten,
+	CandidateClean,
+	CandidateWritten,
 	Count
 };
 void PerfAdd(PerfCounter counter, uint64_t nanoseconds);
