@@ -383,6 +383,12 @@ void EmitBlock(ValueEmitContext& ctx, const IR::Block* block, EmitInstruction&& 
 		}
 		ctx.state.lane_half = 0;
 	}
+	if (const auto reset = ctx.state.loop_watchdog_resets.find(block);
+	    reset != ctx.state.loop_watchdog_resets.end()) {
+		for (const auto counter: reset->second) {
+			ctx.state.builder.AddFunction(spv::OpStore, counter, ConstantU32(ctx.state, 0));
+		}
+	}
 }
 
 void PatchStructuredPhis(ValueEmitContext& ctx, StructuredFunctionState& structured) {
@@ -820,6 +826,7 @@ void EmitProgram(EmitterState& state) {
 	state.loop_watchdogs.clear();
 	state.loop_watchdog_breaks.clear();
 	state.loop_watchdog_waterfalls.clear();
+	state.loop_watchdog_resets.clear();
 	g_last_waterfall_guards = 0;
 	static const bool watchdog = std::getenv("KYTY_NO_LOOP_WATCHDOG") == nullptr;
 	if (watchdog && !state.program.dispatcher_fallback) {
@@ -900,6 +907,26 @@ void EmitProgram(EmitterState& state) {
 			}
 			return waterfall;
 		};
+		// The merge block of the innermost loop around a block (counters restart there).
+		const auto innermost_merge = [&](const IR::Block* block) -> const IR::Block* {
+			const auto index     = block_index.at(block);
+			size_t     best_size = SIZE_MAX;
+			const IR::Block* best = nullptr;
+			for (const auto& [header, merge]: loop_merges) {
+				const auto first = block_index.find(header);
+				const auto last  = block_index.find(merge);
+				if (first == block_index.end() || last == block_index.end() || index < first->second ||
+				    index >= last->second || last->second - first->second >= best_size) {
+					continue;
+				}
+				best_size = last->second - first->second;
+				best      = merge;
+			}
+			return best;
+		};
+		// KYTY_LOOP_COUNTER_NO_RESET: old behaviour, one count per invocation for all entries of a
+		// loop (a loop inside another loop hit its cap early and silently skipped work).
+		static const bool reset_counters = std::getenv("KYTY_LOOP_COUNTER_NO_RESET") == nullptr;
 		for (const auto* block: program.blocks) {
 			const auto& term = block->terminator;
 			bool guarded = exits_loop(block);
@@ -917,6 +944,11 @@ void EmitProgram(EmitterState& state) {
 				                          TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
 				                          counter, spv::StorageClassFunction);
 				state.loop_watchdogs.emplace(block, counter);
+				if (reset_counters) {
+					if (const auto* merge = innermost_merge(block); merge != nullptr) {
+						state.loop_watchdog_resets[merge].push_back(counter);
+					}
+				}
 				if (!waterfall_ranges.empty() && in_waterfall(block)) {
 					state.loop_watchdog_waterfalls.insert(block);
 					g_last_waterfall_guards++;

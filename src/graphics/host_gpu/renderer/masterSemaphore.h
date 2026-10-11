@@ -155,6 +155,11 @@ void DisablePowerThrottling();
 // Diagnostics (KYTY_WATCH_RANGE=hexaddr,hexsize): GPU writes into that range are logged.
 bool WatchedRange(uint64_t vaddr, uint64_t size);
 void NoteWatchedWrite(const std::string& what);
+// Diagnostics (KYTY_HW_WATCH=addr[,addr...], up to 4): CPU debug registers on every thread catch
+// each write to those 8-byte guest locations; direct-backing writes are logged too.
+void HwWatchStart();
+bool HwWatchOverlaps(uint64_t vaddr, uint64_t size) noexcept;
+void HwWatchNoteBackingWrite(uint64_t vaddr, const void* data, uint64_t size) noexcept;
 // The GPU queue whose submission the GPU thread is processing (watch logs name it).
 void SetCurrentGpuQueue(int queue);
 void PerfReport(double fps);

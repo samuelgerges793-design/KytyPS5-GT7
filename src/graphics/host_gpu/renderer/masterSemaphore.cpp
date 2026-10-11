@@ -3,6 +3,8 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/guest_gpu/graphicsRun.h"
+#include "kernel/memory.h"
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -10,6 +12,7 @@
 #include <fstream>
 #include <filesystem>
 #include <windows.h>
+#include <tlhelp32.h>
 #endif
 
 #include <algorithm>
@@ -24,6 +27,8 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+#include <thread>
+#include <cstring>
 
 namespace Libs::Graphics {
 
@@ -317,6 +322,143 @@ void NoteWaitSite(uint64_t ns) {
 #endif
 }
 
+
+namespace {
+struct HwWatchHit {
+	std::atomic<uint32_t> ready {0};
+	uint32_t              thread = 0;
+	uint64_t              rip    = 0;
+	uint64_t              dr6    = 0;
+	uint64_t              values[4] {};
+	uint64_t              time   = 0;
+};
+std::vector<uint64_t>          g_hw_watch;
+std::array<HwWatchHit, 1024>   g_hw_hits;
+std::atomic<uint64_t>          g_hw_hit_count {0};
+uint64_t                       g_hw_hits_printed = 0;
+
+uint64_t ReadGuest64(uint64_t address) {
+	uint64_t value = 0;
+	(void)Libs::LibKernel::Memory::TryReadBacking(address, &value, sizeof(value));
+	return value;
+}
+
+LONG CALLBACK HwWatchHandler(EXCEPTION_POINTERS* info) {
+	if (info->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP || (info->ContextRecord->Dr6 & 0xfu) == 0) {
+		return EXCEPTION_CONTINUE_SEARCH;
+	}
+	const auto index = g_hw_hit_count.fetch_add(1, std::memory_order_acq_rel);
+	auto&      hit   = g_hw_hits[index % g_hw_hits.size()];
+	hit.ready.store(0, std::memory_order_relaxed);
+	hit.thread = GetCurrentThreadId();
+	hit.rip    = info->ContextRecord->Rip;
+	hit.dr6    = info->ContextRecord->Dr6;
+	for (size_t i = 0; i < g_hw_watch.size() && i < 4; i++) {
+		hit.values[i] = *reinterpret_cast<volatile uint64_t*>(g_hw_watch[i]);
+	}
+	hit.time = PerfNow();
+	hit.ready.store(1, std::memory_order_release);
+	info->ContextRecord->Dr6 = 0;
+	return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+void HwWatchApplyAll() {
+	DWORD64 dr7 = 0;
+	for (size_t i = 0; i < g_hw_watch.size() && i < 4; i++) {
+		dr7 |= 1ull << (i * 2);              // local enable
+		dr7 |= 0x9ull << (16 + i * 4);       // write only, 8 bytes
+	}
+	const auto self = GetCurrentThreadId();
+	const auto pid  = GetCurrentProcessId();
+	HANDLE     snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+	if (snap == INVALID_HANDLE_VALUE) return;
+	THREADENTRY32 entry {};
+	entry.dwSize = sizeof(entry);
+	for (BOOL ok = Thread32First(snap, &entry); ok; ok = Thread32Next(snap, &entry)) {
+		if (entry.th32OwnerProcessID != pid || entry.th32ThreadID == self) continue;
+		HANDLE thread = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME, FALSE,
+		                           entry.th32ThreadID);
+		if (thread == nullptr) continue;
+		if (SuspendThread(thread) != static_cast<DWORD>(-1)) {
+			CONTEXT context {};
+			context.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+			if (GetThreadContext(thread, &context) && context.Dr7 != dr7) {
+				context.Dr0 = g_hw_watch.size() > 0 ? g_hw_watch[0] : 0;
+				context.Dr1 = g_hw_watch.size() > 1 ? g_hw_watch[1] : 0;
+				context.Dr2 = g_hw_watch.size() > 2 ? g_hw_watch[2] : 0;
+				context.Dr3 = g_hw_watch.size() > 3 ? g_hw_watch[3] : 0;
+				context.Dr7 = dr7;
+				SetThreadContext(thread, &context);
+			}
+			ResumeThread(thread);
+		}
+		CloseHandle(thread);
+	}
+	CloseHandle(snap);
+}
+
+void HwWatchPrint() {
+	const auto count = g_hw_hit_count.load(std::memory_order_acquire);
+	if (count > g_hw_hits_printed + g_hw_hits.size()) {
+		Log::WriteToConsoleAndLog(fmt::format("hwwatch: {} hits lost\n", count - g_hw_hits_printed - g_hw_hits.size()));
+		g_hw_hits_printed = count - g_hw_hits.size();
+	}
+	const auto base = reinterpret_cast<uint64_t>(GetModuleHandleW(nullptr));
+	for (; g_hw_hits_printed < count; g_hw_hits_printed++) {
+		auto& hit = g_hw_hits[g_hw_hits_printed % g_hw_hits.size()];
+		if (hit.ready.load(std::memory_order_acquire) == 0) break;
+		std::string line = fmt::format("hwwatch: #{} t={:.3f} thread {} rip 0x{:x}{} dr6 0x{:x}", g_hw_hits_printed,
+		                               static_cast<double>(hit.time) / 1e9, hit.thread, hit.rip,
+		                               hit.rip >= base && hit.rip < base + 0x10000000 ? fmt::format(" (emu+0x{:x})", hit.rip - base) : "",
+		                               hit.dr6 & 0xfu);
+		for (size_t i = 0; i < g_hw_watch.size() && i < 4; i++) line += fmt::format(" [{:x}]={:016x}", g_hw_watch[i], hit.values[i]);
+		Log::WriteToConsoleAndLog(line + "\n");
+	}
+}
+} // namespace
+
+bool HwWatchOverlaps(uint64_t vaddr, uint64_t size) noexcept {
+	for (const auto address: g_hw_watch) {
+		if (address < vaddr + size && vaddr < address + 8) return true;
+	}
+	return false;
+}
+
+void HwWatchNoteBackingWrite(uint64_t vaddr, const void* data, uint64_t size) noexcept {
+	for (const auto address: g_hw_watch) {
+		if (address < vaddr + size && vaddr < address + 8) {
+			uint64_t value = 0;
+			const auto offset = address >= vaddr ? address - vaddr : 0;
+			std::memcpy(&value, static_cast<const uint8_t*>(data) + offset, std::min<uint64_t>(8, size - offset));
+			Log::WriteToConsoleAndLog(fmt::format("hwwatch: backing write [{:x}] <- {:016x} (range 0x{:x}+0x{:x}, was {:016x}) t={:.3f} gpu-thread={}\n",
+			                                      address, value, vaddr, size, ReadGuest64(address),
+			                                      static_cast<double>(PerfNow()) / 1e9, GuestGpu::IsGpuThread()));
+		}
+	}
+}
+
+void HwWatchStart() {
+	const char* env = std::getenv("KYTY_HW_WATCH");
+	if (env == nullptr || !g_hw_watch.empty()) return;
+	std::string text(env);
+	size_t      start = 0;
+	while (start < text.size() && g_hw_watch.size() < 4) {
+		const auto end = std::min(text.find(',', start), text.size());
+		if (end > start) g_hw_watch.push_back(std::stoull(text.substr(start, end - start), nullptr, 16) & ~uint64_t {7});
+		start = end + 1;
+	}
+	if (g_hw_watch.empty()) return;
+	AddVectoredExceptionHandler(1, HwWatchHandler);
+	std::thread([] {
+		for (;;) {
+			HwWatchApplyAll();
+			HwWatchPrint();
+			std::this_thread::sleep_for(std::chrono::milliseconds(100));
+		}
+	}).detach();
+	Log::WriteToConsoleAndLog(fmt::format("hwwatch: watching {} addresses\n", g_hw_watch.size()));
+}
+
 void PerfAdd(PerfCounter counter, uint64_t nanoseconds) {
 	auto& totals = g_perf[static_cast<size_t>(counter)];
 	totals.ns.fetch_add(nanoseconds, std::memory_order_relaxed);
@@ -560,12 +702,29 @@ void MasterSemaphore::Wait(uint64_t tick) {
 		return;
 	}
 
+	const auto wait_start = PerfNow();
+	// Short GPU waits are most of the waits: polling the counter wakes up sooner than a kernel
+	// wait (KYTY_GPU_SPIN_US, microseconds to poll before blocking; 0 = block at once).
+	static LiveSetting spin_us("KYTY_GPU_SPIN_US", 0);
+	if (const auto spin = spin_us.Get(); spin != 0) {
+		const auto deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(spin);
+		do {
+			YieldProcessor();
+			Refresh();
+			if (IsFree(tick)) {
+				PerfAdd(PerfCounter::GpuWait, PerfNow() - wait_start);
+				NoteWaitSite(PerfNow() - wait_start);
+				NoteLongestWait(PerfNow() - wait_start);
+				return;
+			}
+		} while (std::chrono::steady_clock::now() < deadline);
+	}
+
 	vk::SemaphoreWaitInfo wait_info {};
 	wait_info.semaphoreCount = 1;
 	wait_info.pSemaphores    = &m_semaphore;
 	wait_info.pValues        = &tick;
 
-	const auto wait_start = PerfNow();
 	const auto result     = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
 	PerfAdd(PerfCounter::GpuWait, PerfNow() - wait_start);
 	NoteWaitSite(PerfNow() - wait_start);

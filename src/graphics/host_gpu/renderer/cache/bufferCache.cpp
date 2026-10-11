@@ -521,10 +521,10 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
 
 		// The CPU sweeps through these buffers: one wait downloads the GPU-written pages around
-		// the access too (KYTY_READBACK_WINDOW_KB, e.g. 256; default 0 = just the access), so the
+		// the access too (KYTY_READBACK_WINDOW_KB, default 64; 0 = just the access), so the
 		// next accesses do not each need one. Pages it hands back stay clean for CPU-write
-		// tracking. Opt-in: GT7 races froze more often with it (timing, see GT7-PROGRESS Day 6).
-		static LiveSetting window_kb("KYTY_READBACK_WINDOW_KB", 0);
+		// tracking. GT7 races: +40% fps (the freezes it seemed to cause were the CP sync bug).
+		static LiveSetting window_kb("KYTY_READBACK_WINDOW_KB", 64);
 		const uint64_t     window = window_kb.Get() == 0 ? 0 : std::bit_floor(window_kb.Get()) * 1024ull;
 		uint64_t begin = vaddr;
 		uint64_t end   = vaddr + size;
@@ -822,6 +822,22 @@ uint64_t BufferCache::SyncGpuWrittenRange(uint64_t vaddr, uint64_t size, bool fo
 		differing += count;
 		// The CPU's own newer bytes win on pages it changed after the GPU buffer was filled.
 		if (!m_memory_tracker.IsRegionCpuModified(page, 0x1000)) {
+			// A GPU copy that is all zero where the guest holds commands is a stale copy, not GPU
+			// output: writing it back emptied GT7's compute command buffers and froze race loads
+			// (KYTY_CP_SYNC_ZERO_GUARD=0 turns the guard off).
+			static LiveSetting zero_guard("KYTY_CP_SYNC_ZERO_GUARD", 1);
+			if (zero_guard.Get() != 0 && std::all_of(a, a + (end - begin), [](uint8_t v) { return v == 0; })) {
+				static std::atomic<uint32_t> guard_logged {0};
+				if (guard_logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+					uint32_t first = 0;
+					std::memcpy(&first, b, std::min<uint64_t>(4, end - begin));
+					Log::WriteToConsoleAndLog(fmt::format(
+					    "CP sync: kept guest commands at 0x{:x}+0x{:x} (first 0x{:08x}) over an all-zero GPU copy;{}\n",
+					    begin, end - begin, first, DescribePages(begin, end - begin)));
+				}
+				PerfAdd(PerfCounter::ZeroBufferGaveUp, 0);
+				continue;
+			}
 			Libs::LibKernel::Memory::WriteBacking(begin, a, end - begin);
 		}
 	}

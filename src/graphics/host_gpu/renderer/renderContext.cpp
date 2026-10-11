@@ -22,6 +22,7 @@ RenderContext::RenderContext(GraphicContext& graphics)
       m_texture_cache(graphics, m_command_scheduler, m_page_manager, m_buffer_cache) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	DisablePowerThrottling();
+	HwWatchStart();
 }
 
 RenderContext::~RenderContext() {

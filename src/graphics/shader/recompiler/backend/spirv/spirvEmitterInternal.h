@@ -152,6 +152,9 @@ struct EmitterState {
 	// Guarded blocks of waterfall loops (one pass per distinct lane value, so at most a wave's
 	// lanes): these get a cap just above the wave size instead of the stage's general cap.
 	std::unordered_set<const IR::Block*> loop_watchdog_waterfalls;
+	// Counters to clear when the loop they guard is left (keyed by the loop's merge block), so a
+	// loop entered again (inside an outer loop) gets its full cap again.
+	std::unordered_map<const IR::Block*, std::vector<uint32_t>> loop_watchdog_resets;
 	uint32_t                   subgroup_local_invocation_id_variable = 0;
 	uint32_t                   per_vertex_variable                   = 0;
 	uint32_t                   point_size_variable                   = 0;
