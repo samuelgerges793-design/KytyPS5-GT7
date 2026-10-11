@@ -643,6 +643,7 @@ Pm4ProcessResult CommandProcessor::Process(Pm4Execution&             execution,
 	EXIT_IF(g_current_execution != nullptr);
 	EXIT_IF(commands.size() > UINT32_MAX);
 	if (execution.m_buffer_stack.empty() && !commands.empty()) {
+		SyncCommandMemory(commands);
 		execution.m_buffer_stack.push_back({commands});
 	}
 	execution.m_suspended     = false;
@@ -666,6 +667,13 @@ Pm4ProcessResult CommandProcessor::Process(Pm4Execution&             execution,
 	ProcessPm4(execution);
 	return execution.m_buffer_stack.empty() ? Pm4ProcessResult::Complete
 	                                        : Pm4ProcessResult::Blocked;
+}
+
+// Commands in memory a GPU buffer covers may have been written by the GPU through raw
+// addresses, which are not copied back on their own (see BufferCache::SyncGpuWrittenRange).
+void CommandProcessor::SyncCommandMemory(std::span<const uint32_t> commands) {
+	m_renderer.GetBufferCache().SyncGpuWrittenRange(reinterpret_cast<uint64_t>(commands.data()),
+	                                               commands.size_bytes());
 }
 
 void CommandProcessor::ProcessIndirectBuffer(std::span<const uint32_t> commands, bool chain) {
@@ -787,6 +795,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		cursor.offset_dw += packet_dw;
 		execution.m_made_progress = true;
 		if (!execution.m_next_buffer.empty()) {
+			SyncCommandMemory(execution.m_next_buffer);
 			// Chains and taken branches reuse the fetcher; only calls retain a return cursor.
 			if (execution.m_chain) {
 				cursor = {execution.m_next_buffer};

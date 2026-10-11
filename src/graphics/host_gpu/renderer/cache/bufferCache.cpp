@@ -451,6 +451,70 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	return false;
 }
 
+uint64_t BufferCache::SyncGpuWrittenRange(uint64_t vaddr, uint64_t size) {
+	static const bool enabled = std::getenv("KYTY_NO_CP_SYNC") == nullptr;
+	if (!enabled || size == 0 || !GuestRange {vaddr, size}.Valid() ||
+	    !IsRegionRegistered(vaddr, size) || m_scheduler.Current().IsInvalid()) {
+		return 0;
+	}
+	PerfScope perf(PerfCounter::CommandMemorySync);
+	FlushCpuWrites();
+	auto&      buffer = m_slot_buffers[FindBuffer(vaddr, size)];
+	auto       staging = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
+	                                              vk::BufferUsageFlagBits::eTransferDst, size);
+	auto&      command = m_scheduler.Current();
+	command.EndRendering();
+	const auto native = command.Handle();
+	vk::MemoryBarrier before {};
+	before.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
+	before.dstAccessMask = vk::AccessFlagBits::eTransferRead;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eTransfer,
+	                       {}, 1, &before, 0, nullptr, 0, nullptr);
+	const vk::BufferCopy copy {buffer.Offset(vaddr), 0, size};
+	native.copyBuffer(buffer.Handle(), staging->Handle(), 1, &copy);
+	vk::MemoryBarrier after {};
+	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	after.dstAccessMask = vk::AccessFlagBits::eHostRead;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost, {}, 1,
+	                       &after, 0, nullptr, 0, nullptr);
+	const auto tick = m_scheduler.CurrentTick();
+	m_scheduler.Wait(tick);
+	m_scheduler.WaitPriorityOperations(tick);
+	staging->Invalidate(0, size);
+
+	const auto*          gpu = staging->Mapped().data();
+	std::vector<uint8_t> guest(size);
+	if (!Libs::LibKernel::Memory::TryReadBacking(vaddr, guest.data(), size)) {
+		return 0;
+	}
+	uint64_t differing = 0;
+	for (uint64_t page = vaddr & ~uint64_t {0xfff}; page < vaddr + size; page += 0x1000) {
+		const auto begin = std::max(page, vaddr);
+		const auto end   = std::min(page + 0x1000, vaddr + size);
+		const auto* a    = gpu + (begin - vaddr);
+		const auto* b    = guest.data() + (begin - vaddr);
+		if (std::memcmp(a, b, end - begin) == 0) continue;
+		uint64_t count = 0;
+		for (uint64_t i = 0; i < end - begin; i++) count += a[i] != b[i];
+		differing += count;
+		// The CPU's own newer bytes win on pages it changed after the GPU buffer was filled.
+		if (!m_memory_tracker.IsRegionCpuModified(page, 0x1000)) {
+			Libs::LibKernel::Memory::WriteBacking(begin, a, end - begin);
+		}
+	}
+	m_scheduler.DeferOperation([owner = std::move(staging)]() mutable { owner.reset(); });
+	if (differing != 0) {
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "CP sync: commands at 0x{:x} ({} bytes) differ from the GPU copy in {} bytes\n",
+			    vaddr, size, differing));
+		}
+		PerfAdd(PerfCounter::CommandMemoryStale, differing);
+	}
+	return differing;
+}
+
 bool BufferCache::StoreCpuBytes(uint64_t vaddr, const uint8_t* data, uint32_t size) {
 	if (size == 0 || size > 32 || !GuestRange {vaddr, size}.Valid()) {
 		return false;

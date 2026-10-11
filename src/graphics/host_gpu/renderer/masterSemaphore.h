@@ -77,6 +77,9 @@ enum class PerfCounter {
 	// Bytes of storage buffers bound writable (the report shows MB/s); every byte is marked
 	// GPU-written until the CPU reads it back.
 	WritableBindBytes,
+	// Command buffers read from GPU-covered memory: the wait and copy, and stale bytes found.
+	CommandMemorySync,
+	CommandMemoryStale,
 	Count
 };
 void PerfAdd(PerfCounter counter, uint64_t nanoseconds);

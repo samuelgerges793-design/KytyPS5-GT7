@@ -90,6 +90,11 @@ public:
 	// writes them again, so a store is never lost to older GPU data.
 	[[nodiscard]] bool StoreCpuBytes(uint64_t vaddr, const uint8_t* data, uint32_t size);
 	void               FlushCpuWrites();
+	// GPU thread: before the command processor reads [vaddr, vaddr + size) as commands. When a
+	// GPU buffer covers it, waits for the GPU and copies the GPU's bytes into guest memory
+	// (except on pages the CPU changed since), so commands the GPU wrote through raw addresses
+	// are seen. Returns the number of bytes that differed.
+	uint64_t           SyncGpuWrittenRange(uint64_t vaddr, uint64_t size);
 
 private:
 	friend struct BufferCacheTestAccess;

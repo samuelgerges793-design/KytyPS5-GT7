@@ -156,6 +156,7 @@ private:
 	void ProcessPm4(Pm4Execution& execution);
 	void SuspendPm4();
 	CommandScheduler&   GetScheduler() const { return m_renderer.GetCommandScheduler(); }
+	void                SyncCommandMemory(std::span<const uint32_t> commands);
 	CommandBuffer&      CurrentBuffer() { return GetScheduler().Current(); }
 
 	RenderContext&   m_renderer;
