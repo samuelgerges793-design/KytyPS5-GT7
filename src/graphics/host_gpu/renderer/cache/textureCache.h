@@ -12,7 +12,9 @@
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 
+#include <atomic>
 #include <map>
+#include <memory>
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
@@ -172,6 +174,13 @@ private:
 	BufferCache&                                      m_buffer_cache;
 	Common::SlotVector<Image>                         m_slot_images;
 	ImagePageTable                                    m_image_page_table;
+	// Lock-free filter for CPU write faults: registered images per hashed 1 MiB page. Zero
+	// means no registered image touches any page in that bucket, so the fault can skip m_lock
+	// (which the GPU thread holds while preparing draws).
+	static constexpr uint64_t                         ImageFilterBuckets = uint64_t {1} << 16u;
+	std::unique_ptr<std::atomic<uint32_t>[]>          m_image_filter =
+	    std::make_unique<std::atomic<uint32_t>[]>(ImageFilterBuckets);
+	[[nodiscard]] bool                                MayHoldImage(uint64_t address, uint64_t size) const;
 	std::unordered_map<vk::Format, ImageId>           m_null_images;
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;

@@ -127,6 +127,12 @@ struct PlainStore {
 bool YmmUpper(CONTEXT& context, uint32_t index, uint8_t* out) {
 	DWORD64 features = 0;
 	if (!GetXStateFeaturesMask(&context, &features) || (features & XSTATE_MASK_AVX) == 0) {
+		static std::atomic_bool logged {false};
+		if (!logged.exchange(true)) {
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "write patch: no AVX state in the exception context (flags 0x{:x}, features 0x{:x})\n",
+			    static_cast<uint32_t>(context.ContextFlags), static_cast<uint64_t>(features)));
+		}
 		return false;
 	}
 	DWORD length = 0;

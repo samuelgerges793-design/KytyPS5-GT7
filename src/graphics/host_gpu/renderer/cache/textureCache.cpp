@@ -216,6 +216,7 @@ void TextureCache::RegisterImage(ImageId id) {
 	}
 	ForEachPage(image.info.data.address, image.info.data.size, [this, id](uint64_t page) {
 		m_image_page_table[page].push_back(id);
+		m_image_filter[page & (ImageFilterBuckets - 1u)].fetch_add(1, std::memory_order_release);
 	});
 	image.registered = true;
 	image.lru_id     = m_lru_cache.Insert(id, m_gc_tick);
@@ -237,6 +238,7 @@ void TextureCache::UnregisterImage(ImageId id) {
 		if (owners == nullptr || !owners->Erase(id)) {
 			EXIT("TextureCache: image missing from page owner index\n");
 		}
+		m_image_filter[page & (ImageFilterBuckets - 1u)].fetch_sub(1, std::memory_order_release);
 	});
 	m_lru_cache.Free(image.lru_id);
 	const auto accounted = image.AccountedSize();
@@ -1581,8 +1583,24 @@ void TextureCache::InvalidateMemory(uint64_t address, uint64_t size) {
 	if (!GuestRange {address, size}.Valid()) {
 		EXIT("TextureCache: invalid memory-invalidation range\n");
 	}
+	if (!MayHoldImage(address, size)) {
+		return;
+	}
 	std::scoped_lock lock {m_lock};
 	InvalidateCpuAliases(address, size);
+}
+
+bool TextureCache::MayHoldImage(uint64_t address, uint64_t size) const {
+	ImagePageTable::PageRange pages {};
+	if (size == 0 || !ImagePageTable::TryGetPageRange(address, size, pages)) {
+		return true;
+	}
+	bool found = false;
+	ForEachPage(address, size, [this, &found](uint64_t page) {
+		found = m_image_filter[page & (ImageFilterBuckets - 1u)].load(std::memory_order_acquire) != 0;
+		return found;
+	});
+	return found;
 }
 
 void TextureCache::DownloadDepth(Image& image, Buffer& destination, uint64_t destination_offset) {
