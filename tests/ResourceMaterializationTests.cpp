@@ -654,6 +654,64 @@ void TestFailedMaterializationRejectsStage() {
         "missing runtime user data did not reject the cached stage");
 }
 
+void TestSharedControlPredicates() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  using Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind;
+  constexpr uint32_t depth = 8;
+  for (const auto operation : {ValueOpcode::LogicalAnd, ValueOpcode::LogicalOr}) {
+    Program program;
+    program.user_data_count = 1;
+    program.srt_plan_complete = program.resource_tracking_complete = true;
+    auto &block = AddValueBlock(program);
+    const auto emit = [&](ValueOpcode opcode, std::initializer_list<Value> args) {
+      return Value(&block.AppendNewInst(opcode, args));
+    };
+    const auto user = emit(ValueOpcode::GetUserData, {Value(ScalarReg(0))});
+    const auto uniform = emit(ValueOpcode::INotEqual32, {user, Value(0u)});
+    const auto lane = emit(ValueOpcode::GetBuiltin,
+        {Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)), Value(0u)});
+    auto varying = emit(ValueOpcode::INotEqual32, {lane, Value(0u)});
+    // Both failed and partially uniform subgraphs share their operands exponentially.
+    for (uint32_t i = 0; i < depth; ++i)
+      varying = emit(ValueOpcode::LogicalOr, {varying, varying});
+    auto condition = emit(operation, {varying, uniform});
+    for (uint32_t i = 0; i < depth; ++i)
+      condition = emit(ValueOpcode::LogicalOr, {condition, condition});
+    condition = emit(ValueOpcode::LogicalNot, {condition});
+    condition = emit(ValueOpcode::ConditionRef, {condition});
+    for (uint32_t i = 0; i < 3; ++i) AddValueBlock(program);
+    for (uint32_t i = 0; i < 2; ++i) {
+      program.blocks[i]->condition = condition;
+      program.blocks[i]->terminator.kind = TerminatorKind::ConditionalBranch;
+      program.blocks[i]->terminator.true_block = program.blocks[i == 0 ? 1 : 3];
+      program.blocks[i]->terminator.false_block = program.blocks[2];
+    }
+    auto plan = ExtractResourcePlan(program);
+    Check(plan.value_storage.size() == depth + 5 &&
+              plan.control_flow.size() == 4 &&
+              plan.control_flow[0].condition == plan.control_flow[1].condition &&
+              !plan.capture_specialization_reads,
+          "shared predicates expanded into trees or retained varying dependencies");
+    for (const uint32_t flag : {0u, 1u}) {
+      const std::array<uint32_t, 1> user_data{flag};
+      SrtWalker walker(plan, {.user_data = user_data});
+      uint32_t result = 99;
+      const bool conjunction = operation == ValueOpcode::LogicalAnd;
+      const bool known = conjunction ? flag == 0 : flag != 0;
+      Check(walker.Evaluate(plan.control_flow[0].condition, result) == known &&
+                (!known || result == uint32_t{conjunction}),
+            "shared predicate changed its uniform factor or cached runtime values");
+      std::vector<uint32_t> flat;
+      Check(walker.RefreshFlatBuffer(flat) &&
+                plan.visited_blocks == (known
+                    ? (conjunction ? std::vector<uint8_t>{1, 1, 0, 1}
+                                   : std::vector<uint8_t>{1, 0, 1, 0})
+                    : std::vector<uint8_t>{1, 1, 1, 1}),
+            "shared predicate skipped an unknown branch or followed a rejected branch");
+    }
+  }
+}
+
 void TestFiniteImageRefreshReusesScalarReads() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   Program program;
@@ -808,6 +866,7 @@ int main() {
     for (const bool loop : {false, true})
       TestWrittenDescriptorPredicateReads(memory_condition, loop);
   TestFailedMaterializationRejectsStage();
+  TestSharedControlPredicates();
   TestFiniteImageRefreshReusesScalarReads();
   TestMixedSamplerVariantsShareRuntimeDescriptor();
   std::puts("ResourceMaterializationTests: all cases passed");

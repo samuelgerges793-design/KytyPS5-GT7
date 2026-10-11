@@ -180,6 +180,12 @@
               <property name="text"><string>Accurate texture synchronization</string></property>
              </widget>
             </item>
+            <item row="8" column="1">
+             <widget class="QCheckBox" name="checkBox_hdr">
+              <property name="toolTip"><string>Enable HDR10 output for supported games. Requires HDR enabled on the host display.</string></property>
+              <property name="text"><string>Enable HDR display support</string></property>
+             </widget>
+            </item>
            </layout>
           </widget>
          </item>
