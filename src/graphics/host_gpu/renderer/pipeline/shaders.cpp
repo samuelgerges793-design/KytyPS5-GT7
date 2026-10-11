@@ -49,7 +49,7 @@ public:
 
 	const void* Chain() const { return &m_info; }
 
-	void Report(const char* kind, uint64_t fingerprint) const {
+	void Report(const char* kind, uint64_t fingerprint, const std::string& detail = {}) const {
 		const auto ns = static_cast<uint64_t>(
 		    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
 		                                                         m_start)
@@ -67,13 +67,14 @@ public:
 			                                      fingerprint, static_cast<double>(ns) / 1e6,
 			                                      valid ? "" : " (driver gave no feedback)"));
 		}
-		WriteFingerprint(kind, fingerprint, hit, ns);
+		WriteFingerprint(kind, fingerprint, hit, ns, detail);
 	}
 
 private:
 	// One line per created pipeline in _gt7_pipelines_<time>.txt: comparing two runs shows whether
 	// a pipeline that missed was already created before (the cache lost it) or is new content.
-	static void WriteFingerprint(const char* kind, uint64_t fingerprint, bool hit, uint64_t ns) {
+	static void WriteFingerprint(const char* kind, uint64_t fingerprint, bool hit, uint64_t ns,
+	                             const std::string& detail) {
 		static std::mutex mutex;
 		static FILE*      file = [] {
 			const auto now = std::time(nullptr);
@@ -85,8 +86,9 @@ private:
 		}();
 		if (file == nullptr) return;
 		std::scoped_lock lock(mutex);
-		std::fprintf(file, "%s %016llx %s %.1f\n", hit ? "hit " : "miss", static_cast<unsigned long long>(fingerprint),
-		             kind, static_cast<double>(ns) / 1e6);
+		std::fprintf(file, "%s %016llx %s %.1f %s\n", hit ? "hit " : "miss",
+		             static_cast<unsigned long long>(fingerprint), kind, static_cast<double>(ns) / 1e6,
+		             detail.c_str());
 		std::fflush(file);
 	}
 
@@ -642,8 +644,16 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	pipeline_info.pNext = feedback.Chain();
 	result = graphics.device.createGraphicsPipelines(driver_cache, 1, &pipeline_info, nullptr,
 	                                                 &pipeline.pipeline);
-	feedback.Report("graphics", GraphicsPipelineFingerprint(rendering, vertex_input, programs,
-	                                                       static_params, ps_active));
+	{
+		// Detail for comparing runs: stage SPIR-V hashes and a hash of the remaining state.
+		std::string detail;
+		for (const auto& program: programs.vertex) detail += fmt::format("vs={:016x} ", program.spirv_hash);
+		detail += fmt::format("ps={:016x} state={:016x}", ps_active ? programs.pixel.spirv_hash : 0,
+		                      GraphicsPipelineFingerprint(rendering, vertex_input, {}, static_params, false));
+		feedback.Report("graphics", GraphicsPipelineFingerprint(rendering, vertex_input, programs,
+		                                                       static_params, ps_active),
+		                detail);
+	}
 	if (graphics_debug_dump_enabled()) {
 		LOGF("PipelineTrace: vkCreateGraphicsPipelines done result=%s pipeline=%p\n",
 		     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));

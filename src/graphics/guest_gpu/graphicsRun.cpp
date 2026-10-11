@@ -320,8 +320,28 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 	}
 
 	(void)poll;
+	// Diagnostics: a wait unsatisfied for over 2 s is logged once per address.
+	static std::unordered_map<uint64_t, std::chrono::steady_clock::time_point> waiting;
+	static std::mutex                                                         waiting_mutex;
+	const auto key = reinterpret_cast<uint64_t>(addr);
 	if (!TestWaitRegMemValue(*addr, ref, mask, func)) {
+		const auto now = std::chrono::steady_clock::now();
+		{
+			std::scoped_lock lock(waiting_mutex);
+			auto [entry, fresh] = waiting.try_emplace(key, now);
+			if (!fresh && entry->second != std::chrono::steady_clock::time_point::max() &&
+			    now - entry->second > std::chrono::seconds(2)) {
+				entry->second = std::chrono::steady_clock::time_point::max();
+				Log::WriteToConsoleAndLog(fmt::format(
+				    "PM4: wait on 0x{:x} unsatisfied for 2 s: value 0x{:x} mask 0x{:x} func {} ref 0x{:x}\n",
+				    key, static_cast<uint64_t>(*addr), static_cast<uint64_t>(mask), func,
+				    static_cast<uint64_t>(ref)));
+			}
+		}
 		SuspendPm4();
+	} else {
+		std::scoped_lock lock(waiting_mutex);
+		waiting.erase(key);
 	}
 }
 
@@ -427,10 +447,55 @@ void CommandProcessor::DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cach
 	                        dst_gds, src_gds);
 }
 
+// Diagnostics: completed submissions per queue.
+static std::array<std::atomic<uint64_t>, 64> g_queue_completed {};
+static std::atomic<uint64_t>                 g_selections {0};
+static std::atomic<uint64_t>                 g_graphics_selections {0};
+static std::atomic<int>                      g_running_queue {-1};
+static std::atomic<int64_t>                  g_running_since {0};
+
 void GuestGpu::Enqueue(Submission submission) {
 	EXIT_IF(submission.queue_id >= QueueCount);
 	Common::LockGuard lock(m_queue_mutex);
 	EXIT_IF(!m_accepting);
+	// The game recycles its command buffers on its own schedule; a game running too far ahead
+	// rewrites buffers still queued here. Graphics submitters wait while KYTY_MAX_QUEUED_SUBMITS
+	// (default 0 = no limit) are queued, at most 250 ms in case the GPU thread waits for
+	// something the game does next. GT7's graphics queue never got deep, so this is opt-in.
+	static const uint32_t limit = [] {
+		const char* value = std::getenv("KYTY_MAX_QUEUED_SUBMITS");
+		return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 0u;
+	}();
+	if (limit != 0 && submission.queue_id == 0 && !IsGpuThread()) {
+		const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
+		while (m_queues[0].size() >= limit && m_accepting) {
+			const auto now = std::chrono::steady_clock::now();
+			if (now >= deadline) {
+				PerfAdd(PerfCounter::SubmitQueueTimeout, 0);
+				break;
+			}
+			PerfScope wait(PerfCounter::SubmitQueueWait);
+			m_space_available.WaitFor(&m_queue_mutex,
+			                          static_cast<uint32_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+			                                                    deadline - now).count()) + 1u);
+		}
+	}
+	static std::atomic<size_t> deepest {0};
+	const auto                 depth = m_queues[submission.queue_id].size() + 1u;
+	if (depth > deepest.load(std::memory_order_relaxed) && depth >= 8u) {
+		deepest.store(depth, std::memory_order_relaxed);
+		const auto& front  = m_queues[submission.queue_id].front();
+		const auto* packet = front.command_execution.CurrentPacket();
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "GPU queue {}: {} submissions waiting (front type {} started {} blocked {} packet 0x{:x} op 0x{:02x}; "
+		    "processing {} current queue {}; completed so far {}; selections {} (graphics {}); running "
+		    "queue {} for {} ms)\n",
+		    submission.queue_id, depth, static_cast<int>(front.type), front.started, front.blocked,
+		    reinterpret_cast<uint64_t>(packet), packet != nullptr ? (packet[0] >> 8u) & 0xffu : 0u, m_processing,
+		    m_next_queue, g_queue_completed[submission.queue_id % 64u].load(), g_selections.load(),
+		    g_graphics_selections.load(), g_running_queue.load(),
+		    (std::chrono::steady_clock::now().time_since_epoch().count() - g_running_since.load()) / 1000000));
+	}
 	m_queues[submission.queue_id].push_back(std::move(submission));
 	m_submission_count++;
 	m_work_available.Signal();
@@ -474,13 +539,19 @@ void GuestGpu::ThreadRun(void* data) {
 				EXIT_IF(gpu->m_pending_commands.fetch_sub(1, std::memory_order_acq_rel) == 0);
 				gpu->m_processing = true;
 			} else {
+				// KYTY_GPU_COMPUTE_FIRST: serve compute queues before graphics (experiment; the
+				// default is a plain round robin over all queues).
+				static const bool fair = std::getenv("KYTY_GPU_COMPUTE_FIRST") == nullptr;
 				int selected_queue = -1;
 				for (uint32_t offset = 0; offset < QueueCount; offset++) {
 					const auto id = (gpu->m_next_queue + offset) % QueueCount;
-					if (!gpu->m_queues[id].empty() && !gpu->m_queues[id].front().blocked) {
+					if ((fair || id != 0) && !gpu->m_queues[id].empty() && !gpu->m_queues[id].front().blocked) {
 						selected_queue = static_cast<int>(id);
 						break;
 					}
+				}
+				if (selected_queue < 0 && !gpu->m_queues[0].empty() && !gpu->m_queues[0].front().blocked) {
+					selected_queue = 0;
 				}
 				if (selected_queue < 0) {
 					gpu->m_processing = false;
@@ -500,7 +571,13 @@ void GuestGpu::ThreadRun(void* data) {
 				submission  = std::move(queue.front());
 				queue.pop_front();
 				gpu->m_submission_count--;
+				gpu->m_space_available.SignalAll();
 				gpu->m_next_queue = (static_cast<uint32_t>(selected_queue) + 1) % QueueCount;
+				g_selections.fetch_add(1, std::memory_order_relaxed);
+				if (selected_queue == 0) g_graphics_selections.fetch_add(1, std::memory_order_relaxed);
+				g_running_queue.store(selected_queue, std::memory_order_relaxed);
+				g_running_since.store(std::chrono::steady_clock::now().time_since_epoch().count(),
+				                      std::memory_order_relaxed);
 				gpu->m_processing = true;
 				has_submission    = true;
 			}
@@ -527,6 +604,27 @@ void GuestGpu::ThreadRun(void* data) {
 		EXIT_IF(!has_submission);
 		const bool complete = gpu->Process(submission);
 
+		if (!complete) {
+			// Diagnostics: a queue blocked on the same packet for over 2 s is logged once.
+			static std::array<std::pair<const uint32_t*, std::chrono::steady_clock::time_point>, QueueCount> stuck {};
+			const auto* packet = submission.command_execution.CurrentPacket();
+			auto&       entry  = stuck[submission.queue_id];
+			const auto  now    = std::chrono::steady_clock::now();
+			if (entry.first != packet) {
+				entry = {packet, now};
+			} else if (packet != nullptr && entry.second != std::chrono::steady_clock::time_point::max() &&
+			           now - entry.second > std::chrono::seconds(2)) {
+				entry.second = std::chrono::steady_clock::time_point::max();
+				std::string words;
+				for (uint32_t i = 0; i < 8; i++) words += fmt::format(" {:08x}", packet[i]);
+				Log::WriteToConsoleAndLog(fmt::format("GPU queue {} blocked for 2 s at 0x{:x} (op 0x{:02x}):{}\n",
+				                                      submission.queue_id, reinterpret_cast<uint64_t>(packet),
+				                                      (packet[0] >> 8u) & 0xffu, words));
+			}
+		}
+		if (complete) {
+			g_queue_completed[submission.queue_id % 64u].fetch_add(1, std::memory_order_relaxed);
+		}
 		Common::LockGuard lock(gpu->m_queue_mutex);
 		if (!complete) {
 			submission.blocked = true;
@@ -725,12 +823,31 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			if (empty_log_count.fetch_add(1) < 16) {
 				Log::WriteToConsoleAndLog(fmt::format(
 				    "PM4: command buffer at 0x{:x} ({} dwords) is all zero; GPU copy differs in {} "
-				    "bytes;{}\n",
-				    address, total_dw, synced, pages));
+				    "bytes;{}; {}\n",
+				    address, total_dw, synced, pages,
+				    cache.DescribeRecentStores(address & ~uint64_t {0xfff}, 0x1000)));
 			}
 			if (synced != 0 && packet[0] != 0u) {
 				continue; // Re-read with the GPU's bytes.
 			}
+			// GT7 builds some command buffers with compute work on another queue; one read as
+			// zeros was not written yet. Yield to the other queues, as a wait packet does, and
+			// read it again; give up (padding) after KYTY_ZERO_IB_WAIT_MS (default 0 = off).
+			static const uint32_t wait_ms = [] {
+				const char* value = std::getenv("KYTY_ZERO_IB_WAIT_MS");
+				return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 0u;
+			}();
+			const auto now     = std::chrono::steady_clock::now();
+			auto [entry, fresh] = m_zero_buffer_waits.try_emplace(address, now);
+			if (wait_ms != 0 && now - entry->second < std::chrono::milliseconds(wait_ms)) {
+				if (fresh) PerfAdd(PerfCounter::ZeroBufferWait, 0);
+				execution.m_suspended = true;
+				return;
+			}
+			m_zero_buffer_waits.erase(entry);
+			PerfAdd(PerfCounter::ZeroBufferGaveUp, 0);
+		} else if (cursor.offset_dw == 0u && !m_zero_buffer_waits.empty()) {
+			m_zero_buffer_waits.erase(reinterpret_cast<uint64_t>(packet));
 		}
 		// GT7 submits command buffers whose tail is zero-filled; treat zero dwords as padding.
 		if (packet_header == 0u) {

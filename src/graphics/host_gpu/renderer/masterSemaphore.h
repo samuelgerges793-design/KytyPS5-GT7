@@ -4,6 +4,7 @@
 #include "common/common.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
+#include <string>
 #include <atomic>
 
 namespace Libs::Graphics {
@@ -117,9 +118,25 @@ enum class PerfCounter {
 	PatchRefusedOtherInsn,
 	PatchRefusedOther,
 	ReadbackExplicit,
+	// YMM stores whose context lacked AVX state (upper halves assumed zero).
+	YmmAssumedZero,
+	// KYTY_WRITE_PATCH_VERIFY: single-stepped stores whose real bytes matched / differed.
+	PatchVerifyMatch,
+	PatchVerifyMismatch,
+	// Readbacks: guest bytes covered per second (window around each access).
+	ReadbackWindowBytes,
+	// Game submissions waiting for room in the GPU queue, and waits that timed out.
+	SubmitQueueWait,
+	SubmitQueueTimeout,
+	// All-zero command buffers waited for (yielding to other queues), and given up on.
+	ZeroBufferWait,
+	ZeroBufferGaveUp,
 	Count
 };
 void PerfAdd(PerfCounter counter, uint64_t nanoseconds);
+// Diagnostics (KYTY_WATCH_RANGE=hexaddr,hexsize): GPU writes into that range are logged.
+bool WatchedRange(uint64_t vaddr, uint64_t size);
+void NoteWatchedWrite(const std::string& what);
 void PerfReport(double fps);
 // Background compile threads yield to the game and GPU threads.
 void LowerCurrentThreadPriority();

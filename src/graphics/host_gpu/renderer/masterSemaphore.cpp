@@ -161,6 +161,26 @@ std::vector<uint64_t> ParseHashList(const char* name) {
 
 } // namespace
 
+bool WatchedRange(uint64_t vaddr, uint64_t size) {
+	static const std::pair<uint64_t, uint64_t> range = [] {
+		std::pair<uint64_t, uint64_t> result {0, 0};
+		if (const char* env = std::getenv("KYTY_WATCH_RANGE"); env != nullptr) {
+			char* end     = nullptr;
+			result.first  = std::strtoull(env, &end, 16);
+			result.second = (end != nullptr && *end == ',') ? std::strtoull(end + 1, nullptr, 16) : 0x1000;
+		}
+		return result;
+	}();
+	return range.second != 0 && vaddr < range.first + range.second && range.first < vaddr + size;
+}
+
+void NoteWatchedWrite(const std::string& what) {
+	static std::atomic<uint32_t> logged {0};
+	if (logged.fetch_add(1, std::memory_order_relaxed) < 400) {
+		Log::WriteToConsoleAndLog("watch: " + what + "\n");
+	}
+}
+
 bool DumpShaderInputs(uint64_t hash) {
 	static const std::vector<uint64_t> hashes = ParseHashList("KYTY_DUMP_SHADERS");
 	return !hashes.empty() && std::ranges::find(hashes, hash) != hashes.end();
@@ -267,7 +287,10 @@ void PerfReport(double fps) {
 	                                        "cand-nohistory", "cand-cmd-clean", "cand-cmd-written",
 	                                        "cand-clean", "cand-written", "refused-gpu-thread",
 	                                        "refused-extract", "refused-rmw", "refused-other-insn",
-	                                        "refused-other", "readback-explicit"};
+	                                        "refused-other", "readback-explicit", "ymm-assumed-zero",
+	                                        "verify-match", "verify-MISMATCH",
+	                                        "readback-window-MB", "submit-queue-wait",
+	                                        "submit-queue-timeout", "zero-ib-wait", "zero-ib-gave-up"};
 	std::string text = fmt::format("perf: {:.1f} fps | longest-gpu-wait {:.0f} ms |", fps,
 	                               static_cast<double>(g_longest_wait_ns.exchange(0)) / 1e6);
 	for (size_t i = 0; i < g_perf.size(); i++) {

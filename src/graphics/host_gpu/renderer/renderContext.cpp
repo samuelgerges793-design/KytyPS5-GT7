@@ -166,10 +166,22 @@ void RenderContext::PrepareBda() {
 		Log::WriteToConsoleAndLog("GPU: using buffer device address (BDA) shader memory access.\n");
 		m_bda_logged = true;
 	}
-	std::shared_lock lock(m_mapped_ranges_mutex);
-	m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
-		m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
-	});
+	static const bool full_sync = std::getenv("KYTY_FULL_BDA_SYNC") != nullptr;
+	if (full_sync) {
+		std::shared_lock lock(m_mapped_ranges_mutex);
+		m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
+			m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
+		});
+	} else {
+		// Only the mapped parts: buffers may still cover memory the game has unmapped.
+		const auto regions = m_buffer_cache.TakeCpuDirtyRegions();
+		std::shared_lock lock(m_mapped_ranges_mutex);
+		for (const auto region: regions) {
+			m_mapped_ranges.ForEachInRange(region, TRACKER_REGION_SIZE, [this](uint64_t start, uint64_t end) {
+				m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
+			});
+		}
+	}
 	m_fault_process_pending = true;
 }
 

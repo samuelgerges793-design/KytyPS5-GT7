@@ -421,6 +421,30 @@ void WriteSpirvManifest(const ShaderRecompiler::CompileOptions&             opti
 	             static_cast<unsigned long long>(SpecializationHash(specialization)),
 	             static_cast<unsigned long long>(spirv_hash), spirv.size());
 	std::fflush(file);
+	// KYTY_DUMP_SPIRV=hash,...: the SPIR-V of those shaders, one file per specialization and
+	// run, to compare runs.
+	static const std::vector<uint64_t> dump = [] {
+		std::vector<uint64_t> list;
+		if (const char* env = std::getenv("KYTY_DUMP_SPIRV"); env != nullptr) {
+			const std::string text(env);
+			for (size_t start = 0; start < text.size();) {
+				const auto end = std::min(text.find(',', start), text.size());
+				if (end > start) list.push_back(std::stoull(text.substr(start, end - start), nullptr, 16));
+				start = end + 1;
+			}
+		}
+		return list;
+	}();
+	if (std::ranges::find(dump, options.shader_hash) != dump.end()) {
+		static const auto stamp = std::time(nullptr);
+		const auto        name  = fmt::format("_spirv_dumps/{:016x}_{:016x}_{}_{}.spv", options.shader_hash,
+		                                      SpecializationHash(specialization), push_data_start, stamp);
+		std::filesystem::create_directories("_spirv_dumps");
+		if (FILE* out = std::fopen(name.c_str(), "wb"); out != nullptr) {
+			std::fwrite(spirv.data(), sizeof(uint32_t), spirv.size(), out);
+			std::fclose(out);
+		}
+	}
 }
 
 } // namespace

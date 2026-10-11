@@ -48,6 +48,7 @@ public:
 					return true;
 				}
 				manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset, bytes);
+				NoteCpuDirty(manager);
 				return false;
 			}();
 			if (should_flush) {
@@ -149,6 +150,16 @@ private:
 
 	static void    ValidateRange(uint64_t vaddr, uint64_t size);
 	RegionManager* GetOrCreateRegion(uint64_t index);
+	void           NoteCpuDirty(RegionManager* manager);
+
+public:
+	// Base addresses of tracking regions that gained CPU-dirty pages since the last call (new
+	// regions start dirty). Their flags are cleared first, so later changes queue them again.
+	[[nodiscard]] std::vector<uint64_t> TakeCpuDirtyRegions();
+
+private:
+	std::mutex            m_cpu_dirty_mutex;
+	std::vector<uint64_t> m_cpu_dirty_regions;
 
 	std::unique_ptr<std::atomic<RegionManager*>[]> m_regions;
 	std::vector<std::unique_ptr<RegionManager>>    m_region_storage;

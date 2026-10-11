@@ -204,7 +204,12 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	                       vk::PipelineStageFlagBits::eAllCommands |
 	                           vk::PipelineStageFlagBits::eHost,
 	                       {}, 0, nullptr, 1, &after, 0, nullptr);
-	auto publish = [this, mapped, offset, total_size, buffer_address,
+	uint64_t first_store = 0;
+	{
+		std::scoped_lock lock(m_cpu_store_mutex);
+		first_store = m_recent_store_count;
+	}
+	auto publish = [this, mapped, offset, total_size, buffer_address, first_store,
 	                copies = std::move(copies), owner = std::move(temporary)] {
 		(owner ? *owner : m_download_buffer).Invalidate(offset, total_size);
 		std::scoped_lock lock(m_cpu_store_mutex);
@@ -214,6 +219,26 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		}
 		// Queued CPU stores are newer than this download: write them again on top.
 		for (const auto& store: m_cpu_stores) {
+			for (const auto& copy: copies) {
+				const auto begin = buffer_address + copy.srcOffset;
+				if (store.address < begin + copy.size && begin < store.address + store.size) {
+					Libs::LibKernel::Memory::WriteBacking(store.address, store.bytes.data(), store.size);
+					break;
+				}
+			}
+		}
+		// So are stores emulated after the copy was recorded that a flush already took from
+		// the queue (the GPU copy predates their upload): write them again, oldest first.
+		if (m_recent_store_count - first_store > m_recent_stores.size()) {
+			static std::atomic<uint32_t> logged {0};
+			if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+				Log::WriteToConsoleAndLog("buffer download: store history overflowed while in flight\n");
+			}
+		}
+		const auto oldest = std::max(first_store, m_recent_store_count -
+		                                              std::min<uint64_t>(m_recent_store_count, m_recent_stores.size()));
+		for (uint64_t sequence = oldest; sequence < m_recent_store_count; sequence++) {
+			const auto& store = m_recent_stores[sequence % m_recent_stores.size()];
 			for (const auto& copy: copies) {
 				const auto begin = buffer_address + copy.srcOffset;
 				if (store.address < begin + copy.size && begin < store.address + store.size) {
@@ -494,8 +519,25 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		if (is_write) write_readback.emplace(PerfCounter::WriteReadback);
 		auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
 
-		if (DownloadBufferMemory<false>(buffer, vaddr, size)) {
-			m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
+		// The CPU sweeps through these buffers: one wait downloads the GPU-written pages around
+		// the access too (KYTY_READBACK_WINDOW_KB, e.g. 256; default 0 = just the access), so the
+		// next accesses do not each need one. Pages it hands back stay clean for CPU-write
+		// tracking. Opt-in: GT7 races froze more often with it (timing, see GT7-PROGRESS Day 6).
+		static const uint64_t window = [] {
+			const char* value = std::getenv("KYTY_READBACK_WINDOW_KB");
+			return (value != nullptr ? std::strtoull(value, nullptr, 10) : 0ull) * 1024ull;
+		}();
+		uint64_t begin = vaddr;
+		uint64_t end   = vaddr + size;
+		if (window != 0) {
+			begin = std::max(buffer.CpuAddress(), vaddr & ~(window - 1u));
+			end   = std::min(buffer.CpuAddress() + buffer.Size(), (vaddr + size + window - 1u) & ~(window - 1u));
+			begin = std::min(begin, vaddr);
+			end   = std::max(end, vaddr + size);
+		}
+		if (DownloadBufferMemory<false>(buffer, begin, end - begin)) {
+			m_memory_tracker.UnmarkRegionAsGpuModified(begin, end - begin);
+			PerfAdd(PerfCounter::ReadbackWindowBytes, end - begin);
 		}
 		if (is_write) {
 			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
@@ -733,6 +775,11 @@ uint64_t BufferCache::SyncGpuWrittenRange(uint64_t vaddr, uint64_t size, bool fo
 	}
 	PerfScope perf(PerfCounter::CommandMemorySync);
 	FlushCpuWrites();
+	uint64_t first_store = 0;
+	{
+		std::scoped_lock lock(m_cpu_store_mutex);
+		first_store = m_recent_store_count;
+	}
 	auto&      buffer = m_slot_buffers[FindBuffer(vaddr, size)];
 	auto       staging = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
 	                                              vk::BufferUsageFlagBits::eTransferDst, size);
@@ -781,6 +828,14 @@ uint64_t BufferCache::SyncGpuWrittenRange(uint64_t vaddr, uint64_t size, bool fo
 	}
 	if (differing != 0) {
 		for (const auto& store: m_cpu_stores) {
+			if (store.address < vaddr + size && vaddr < store.address + store.size) {
+				Libs::LibKernel::Memory::WriteBacking(store.address, store.bytes.data(), store.size);
+			}
+		}
+		const auto oldest = std::max(first_store, m_recent_store_count -
+		                                              std::min<uint64_t>(m_recent_store_count, m_recent_stores.size()));
+		for (uint64_t sequence = oldest; sequence < m_recent_store_count; sequence++) {
+			const auto& store = m_recent_stores[sequence % m_recent_stores.size()];
 			if (store.address < vaddr + size && vaddr < store.address + store.size) {
 				Libs::LibKernel::Memory::WriteBacking(store.address, store.bytes.data(), store.size);
 			}
@@ -1134,7 +1189,35 @@ bool BufferCache::StoreCpuBytes(uint64_t vaddr, const uint8_t* data, uint32_t si
 	store.address = vaddr;
 	store.size    = size;
 	std::memcpy(store.bytes.data(), data, size);
+	auto& recent    = m_recent_stores[m_recent_store_count % m_recent_stores.size()];
+	recent.address  = vaddr;
+	recent.size     = size;
+	recent.sequence = m_recent_store_count++;
+	std::memcpy(recent.bytes.data(), data, size);
 	return true;
+}
+
+std::string BufferCache::DescribeRecentStores(uint64_t vaddr, uint64_t size) {
+	std::scoped_lock lock(m_cpu_store_mutex);
+	uint32_t    hits = 0;
+	uint32_t    kept = 0;
+	std::string examples;
+	const auto  available = std::min<uint64_t>(m_recent_store_count, m_recent_stores.size());
+	for (uint64_t i = 0; i < available; i++) {
+		const auto& recent = m_recent_stores[(m_recent_store_count - 1u - i) % m_recent_stores.size()];
+		if (recent.address >= vaddr + size || vaddr >= recent.address + recent.size) continue;
+		std::array<uint8_t, 32> now {};
+		const bool same = Libs::LibKernel::Memory::TryReadBacking(recent.address, now.data(), recent.size) &&
+		                  std::memcmp(now.data(), recent.bytes.data(), recent.size) == 0;
+		hits++;
+		kept += same ? 1u : 0u;
+		if (hits <= 6) {
+			examples += fmt::format(" #{}@0x{:x}+{}{}", m_recent_store_count - 1u - recent.sequence,
+			                        recent.address, recent.size, same ? "" : "(lost)");
+		}
+	}
+	return fmt::format("{} of the last {} emulated stores hit it, {} still in memory;{}", hits, available,
+	                   kept, examples);
 }
 
 void BufferCache::FlushCpuWrites() {
@@ -1379,6 +1462,10 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 }
 
 void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds) {
+	if (!is_gds && WatchedRange(vaddr, size)) {
+		NoteWatchedWrite(fmt::format("fill 0x{:x}+0x{:x} = 0x{:x} ({})", vaddr, size, value,
+		                             IsRegionGpuModified(vaddr, size) ? "GPU" : "CPU memset at record time"));
+	}
 	if ((vaddr & 3u) != 0 || size == 0 || (size & 3u) != 0 || size > UINT64_MAX - vaddr) {
 		EXIT("BufferCache: fill range must be dword aligned\n");
 	}
@@ -1407,6 +1494,10 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 
 void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
                              bool src_gds) {
+	if (!dst_gds && WatchedRange(dst_vaddr, size)) {
+		NoteWatchedWrite(fmt::format("copy 0x{:x} -> 0x{:x} +0x{:x}{}", src_vaddr, dst_vaddr, size,
+		                             src_gds ? " (from GDS)" : ""));
+	}
 	const bool dst_memory = !dst_gds;
 	const bool src_memory = !src_gds;
 	if ((dst_memory && dst_vaddr == 0) || (src_memory && src_vaddr == 0) || size == 0 ||

@@ -24,6 +24,7 @@
 #include <cstring>
 #include <fmt/format.h>
 #include <mutex>
+#include <string>
 #include <unordered_map>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -47,6 +48,42 @@ namespace Libs::Graphics {
 namespace {
 
 constexpr uint64_t PatchPageSize = 4096;
+
+// KYTY_WRITE_PATCH_VERIFY: instead of performing a store, open its page, single-step the real
+// instruction and compare what it wrote with what the emulation would have written.
+struct VerifyPatch {
+	bool                    active  = false;
+	uint64_t                page    = 0;
+	uint64_t                address = 0;
+	uint32_t                size    = 0;
+	uint64_t                rip     = 0;
+	std::array<uint8_t, 32> predicted {};
+};
+thread_local VerifyPatch t_verify;
+constexpr uint32_t       TrapFlag = 0x100;
+
+bool WritePatchVerify() {
+	static const bool enabled = std::getenv("KYTY_WRITE_PATCH_VERIFY") != nullptr;
+	return enabled;
+}
+
+std::string FormatInstructionAt(uint64_t rip) {
+	ZydisDecoder            decoder {};
+	ZydisFormatter          formatter {};
+	ZydisDecodedInstruction instruction {};
+	ZydisDecodedOperand     operands[ZYDIS_MAX_OPERAND_COUNT] {};
+	char                    text[128] = {};
+	if (ZYAN_SUCCESS(ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64)) &&
+	    ZYAN_SUCCESS(ZydisFormatterInit(&formatter, ZYDIS_FORMATTER_STYLE_INTEL)) &&
+	    ZYAN_SUCCESS(ZydisDecoderDecodeFull(&decoder, reinterpret_cast<const void*>(rip),
+	                                        ZYDIS_MAX_INSTRUCTION_LENGTH, &instruction, operands)) &&
+	    ZYAN_SUCCESS(ZydisFormatterFormatInstruction(&formatter, &instruction, operands,
+	                                                 instruction.operand_count_visible, text,
+	                                                 sizeof(text), rip, nullptr))) {
+		return text;
+	}
+	return "?";
+}
 
 bool WritePatchEnabled() {
 	static const bool enabled = std::getenv("KYTY_NO_WRITE_PATCH") == nullptr;
@@ -126,9 +163,17 @@ struct PlainStore {
 // The upper 128 bits of YMM registers live in the context's extended (XSAVE) state.
 bool YmmUpper(CONTEXT& context, uint32_t index, uint8_t* out) {
 	DWORD64 features = 0;
-	// A context that carries extended state but not the AVX component holds YMM upper halves
-	// in their initial state (zero), as after VZEROUPPER or zeroing with VEX.128 moves.
+	// A context that carries extended state but not the AVX component: assumed to hold YMM upper
+	// halves in their initial state (zero). Unverified; KYTY_YMM_ASSUME_ZERO=0 refuses instead.
+	static const bool assume_zero = [] {
+		const char* value = std::getenv("KYTY_YMM_ASSUME_ZERO");
+		return value == nullptr || value[0] != '0';
+	}();
 	if ((context.ContextFlags & CONTEXT_XSTATE) == CONTEXT_XSTATE &&
+	    GetXStateFeaturesMask(&context, &features) && (features & XSTATE_MASK_AVX) == 0) {
+		PerfAdd(PerfCounter::YmmAssumedZero, 0);
+	}
+	if (assume_zero && (context.ContextFlags & CONTEXT_XSTATE) == CONTEXT_XSTATE &&
 	    GetXStateFeaturesMask(&context, &features) && (features & XSTATE_MASK_AVX) == 0 &&
 	    (GetEnabledXStateFeatures() & XSTATE_MASK_AVX) != 0) {
 		std::memset(out, 0, sizeof(M128A));
@@ -320,6 +365,14 @@ bool BurstLimited(uint64_t page) {
 		std::chrono::steady_clock::time_point start;
 		uint32_t                              count = 0;
 	};
+	// KYTY_WRITE_PATCH_BURST: stores per page per 50 ms before handing the page over (0 = never).
+	static const uint32_t limit = [] {
+		const char* value = std::getenv("KYTY_WRITE_PATCH_BURST");
+		return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 64u;
+	}();
+	if (limit == 0) {
+		return false;
+	}
 	static std::mutex                          mutex;
 	static std::unordered_map<uint64_t, Burst> bursts;
 	const auto                                 now = std::chrono::steady_clock::now();
@@ -331,12 +384,7 @@ bool BurstLimited(uint64_t page) {
 	if (burst.count == 0 || now - burst.start > std::chrono::milliseconds(50)) {
 		burst = {now, 0};
 	}
-	// KYTY_WRITE_PATCH_BURST: stores per page per 50 ms before handing the page over (0 = never).
-	static const uint32_t limit = [] {
-		const char* value = std::getenv("KYTY_WRITE_PATCH_BURST");
-		return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 64u;
-	}();
-	return limit != 0 && ++burst.count > limit;
+	return ++burst.count > limit;
 }
 
 } // namespace
@@ -372,6 +420,13 @@ bool RenderContext::TryBeginWritePatch(void* native_context, uint64_t fault_vadd
 		PerfAdd(PerfCounter::PatchRefusedOther, 0);
 		return false;
 	}
+	if (WritePatchVerify() && !t_verify.active && (store.address >> 12u) == ((store.address + store.size - 1u) >> 12u)) {
+		t_verify = {.active = true, .page = page, .address = store.address, .size = store.size,
+		            .rip = context.Rip, .predicted = store.bytes};
+		m_page_manager.SetTemporaryWrite(page, true);
+		context.EFlags |= TrapFlag;
+		return true;
+	}
 	if (BurstLimited(page)) {
 		PerfAdd(PerfCounter::WritePatchBegin, 0);
 		return false;
@@ -387,8 +442,44 @@ bool RenderContext::TryBeginWritePatch(void* native_context, uint64_t fault_vadd
 	return true;
 }
 
-bool RenderContext::FinishWritePatch(void*) noexcept {
-	return false;
+bool RenderContext::FinishWritePatch(void* native_context) noexcept {
+	if (!t_verify.active || native_context == nullptr) {
+		return false;
+	}
+	auto& context = *static_cast<CONTEXT*>(native_context);
+	context.EFlags &= ~TrapFlag;
+	t_verify.active = false;
+	std::array<uint8_t, 32> actual {};
+	std::memcpy(actual.data(), reinterpret_cast<const void*>(t_verify.address), t_verify.size);
+	m_page_manager.SetTemporaryWrite(t_verify.page, false);
+	if (std::memcmp(actual.data(), t_verify.predicted.data(), t_verify.size) != 0) {
+		PerfAdd(PerfCounter::PatchVerifyMismatch, 0);
+		static std::mutex                   mutex;
+		static std::unordered_map<uint64_t, uint32_t> seen;
+		bool                                log = false;
+		{
+			std::scoped_lock lock(mutex);
+			log = seen.size() < 64 && seen.try_emplace(t_verify.rip, 0).second;
+		}
+		if (log) {
+			std::string predicted;
+			std::string written;
+			for (uint32_t i = 0; i < t_verify.size; i++) {
+				predicted += fmt::format("{:02x}", t_verify.predicted[i]);
+				written += fmt::format("{:02x}", actual[i]);
+			}
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "write patch verify MISMATCH at rip=0x{:x} [{}] addr=0x{:x} size={}: emulated {} real {}\n",
+			    t_verify.rip, FormatInstructionAt(t_verify.rip), t_verify.address, t_verify.size,
+			    predicted, written));
+		}
+	} else {
+		PerfAdd(PerfCounter::PatchVerifyMatch, 0);
+	}
+	// The page reopened only for this thread's instruction; give the GPU copy its bytes.
+	m_texture_cache.InvalidateMemory(t_verify.address, t_verify.size);
+	(void)m_buffer_cache.StoreCpuBytes(t_verify.address, actual.data(), t_verify.size);
+	return true;
 }
 
 #else

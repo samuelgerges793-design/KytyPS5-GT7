@@ -79,6 +79,8 @@ private:
 	std::mutex                                     m_shutdown_mutex;
 	Common::CondVar                                m_work_available;
 	Common::CondVar                                m_idle;
+	// Signalled when the GPU thread takes a submission: graphics submitters wait for room.
+	Common::CondVar                                m_space_available;
 	std::array<std::deque<Submission>, QueueCount> m_queues;
 	std::deque<Common::UniqueFunction<void>>       m_commands;
 	std::atomic_uint32_t                           m_pending_commands {0};

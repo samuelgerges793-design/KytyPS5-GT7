@@ -63,6 +63,7 @@ RegionManager* MemoryTracker::GetOrCreateRegion(uint64_t index) {
 	auto* ptr     = manager.get();
 	m_region_storage.push_back(std::move(manager));
 	m_regions[index].store(ptr, std::memory_order_release);
+	NoteCpuDirty(ptr); // New regions start CPU-dirty.
 	return ptr;
 }
 
@@ -84,10 +85,32 @@ bool MemoryTracker::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 
 void MemoryTracker::MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
-	Iterate<true>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+	Iterate<true>(vaddr, size, [this](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 		std::scoped_lock lock(manager->lock);
 		manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset, bytes);
+		NoteCpuDirty(manager);
 	});
+}
+
+void MemoryTracker::NoteCpuDirty(RegionManager* manager) {
+	if (!manager->bda_pending.exchange(true, std::memory_order_acq_rel)) {
+		std::scoped_lock lock(m_cpu_dirty_mutex);
+		m_cpu_dirty_regions.push_back(manager->GetCpuAddr());
+	}
+}
+
+std::vector<uint64_t> MemoryTracker::TakeCpuDirtyRegions() {
+	std::vector<uint64_t> regions;
+	{
+		std::scoped_lock lock(m_cpu_dirty_mutex);
+		regions.swap(m_cpu_dirty_regions);
+	}
+	for (const auto address: regions) {
+		if (auto* manager = m_regions[address / TRACKER_REGION_SIZE].load(std::memory_order_acquire)) {
+			manager->bda_pending.store(false, std::memory_order_release);
+		}
+	}
+	return regions;
 }
 
 void MemoryTracker::MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size) {
@@ -125,8 +148,9 @@ void MemoryTracker::UntrackMemory(uint64_t vaddr, uint64_t size) {
 	    })) {
 		EXIT("cannot untrack GPU-dirty memory\n");
 	}
-	Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+	Iterate<false>(vaddr, size, [this](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 		manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset, bytes);
+		NoteCpuDirty(manager);
 	});
 }
 

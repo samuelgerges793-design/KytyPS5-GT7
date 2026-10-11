@@ -146,6 +146,8 @@ public:
 	}
 
 	TrackingSpinLock lock;
+	// Set when CPU-dirty bits are set; cleared when the region is queued for the next BDA sync.
+	std::atomic<bool> bda_pending {false};
 
 private:
 	template <bool track, bool is_read>

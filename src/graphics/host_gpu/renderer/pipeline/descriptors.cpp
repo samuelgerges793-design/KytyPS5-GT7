@@ -842,6 +842,13 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		uint32_t   buffer_offset = 0;
 		uint32_t   track_info    = ShaderRecompiler::IR::WriteTrackUntracked;
 		const bool tracked       = tracks_writes && ((layout.tracked_writes >> index) & 1u) != 0;
+		if (resource.written && WatchedRange(prepared.buffer_sources[index].address,
+		                                     std::max<uint64_t>(prepared.buffer_sources[index].size, 1))) {
+			NoteWatchedWrite(fmt::format("shader {:016x} stage {} binds 0x{:x}+0x{:x} writable",
+			                             program.shader_hash, static_cast<int>(program.stage),
+			                             prepared.buffer_sources[index].address,
+			                             prepared.buffer_sources[index].size));
+		}
 		prepared.buffers[index]  = NativeStorageBuffer(m_context, prepared.buffer_sources[index],
 		                                               resource, buffer_offset,
 		                                               tracked ? &track_info : nullptr);

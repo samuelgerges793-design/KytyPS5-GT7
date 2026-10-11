@@ -6,6 +6,8 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 
+#include <chrono>
+#include <unordered_map>
 #include <cstdint>
 #include <span>
 #include <vector>
@@ -32,6 +34,12 @@ struct IndirectDrawRegisters {
 class Pm4Execution {
 public:
 	[[nodiscard]] bool MadeProgress() const noexcept { return m_made_progress; }
+	// Diagnostics: the packet where execution stopped (nullptr when done).
+	[[nodiscard]] const uint32_t* CurrentPacket() const noexcept {
+		if (m_buffer_stack.empty()) return nullptr;
+		const auto& cursor = m_buffer_stack.back();
+		return cursor.offset_dw < cursor.commands.size() ? cursor.commands.data() + cursor.offset_dw : nullptr;
+	}
 
 private:
 	friend class CommandProcessor;
@@ -152,6 +160,8 @@ public:
 	void SyncCommandMemory(std::span<const uint32_t> commands);
 
 private:
+	// All-zero command buffers being waited for (address -> first seen), see ProcessPm4.
+	std::unordered_map<uint64_t, std::chrono::steady_clock::time_point> m_zero_buffer_waits;
 	template <typename T>
 	void WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_write_dest, uint32_t eop_event_type,
 	                      uint32_t cache_action, uint32_t event_index, uint32_t event_write_source,

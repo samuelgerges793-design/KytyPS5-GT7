@@ -94,6 +94,11 @@ public:
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	void               ProcessFaultBuffer();
+	// Tracking regions (base addresses, TRACKER_REGION_SIZE each) the CPU touched since the
+	// last call; BDA preparation uploads the CPU's changes in their mapped parts.
+	[[nodiscard]] std::vector<uint64_t> TakeCpuDirtyRegions() {
+		return m_memory_tracker.TakeCpuDirtyRegions();
+	}
 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
 	void               RunGarbageCollector();
 	// Any thread: performs a CPU store into a GPU-written buffer page through the backing view
@@ -109,6 +114,8 @@ public:
 	uint64_t           SyncGpuWrittenRange(uint64_t vaddr, uint64_t size, bool force = false);
 	// Diagnostics: buffer-cache and write-tracking state of the pages of a range.
 	[[nodiscard]] std::string DescribePages(uint64_t vaddr, uint64_t size);
+	// Diagnostics: recent emulated CPU stores into a range, and whether memory still holds them.
+	[[nodiscard]] std::string DescribeRecentStores(uint64_t vaddr, uint64_t size);
 	// GPU thread: work recorded with a shader that writes through raw addresses. Command memory
 	// synced since the last such work is skipped.
 	void               NoteAddressWrites() { m_address_write_epoch++; }
@@ -229,6 +236,14 @@ private:
 	std::unordered_map<uint64_t, uint64_t> m_command_page_epochs;
 	std::mutex                   m_cpu_store_mutex;
 	std::vector<PendingCpuStore> m_cpu_stores;
+	struct RecentStore {
+		uint64_t                address  = 0;
+		uint32_t                size     = 0;
+		uint64_t                sequence = 0;
+		std::array<uint8_t, 32> bytes {};
+	};
+	std::array<RecentStore, 65536> m_recent_stores {};
+	uint64_t                      m_recent_store_count = 0;
 	[[nodiscard]] vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
 	                                      uint64_t total_size);
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
