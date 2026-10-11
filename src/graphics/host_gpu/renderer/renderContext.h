@@ -49,6 +49,9 @@ public:
 	RenderExecutor&     GetRenderExecutor() { return m_render_executor; }
 
 	[[nodiscard]] bool HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept;
+	// writePatch.cpp: a plain store into a GPU-written page without a readback.
+	[[nodiscard]] bool TryBeginWritePatch(void* native_context, uint64_t fault_vaddr) noexcept;
+	[[nodiscard]] bool FinishWritePatch(void* native_context) noexcept;
 	[[nodiscard]] bool InvalidateMemory(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsMapped(uint64_t vaddr, uint64_t size) const noexcept;
 	void               MapMemory(uint64_t vaddr, uint64_t size);

@@ -431,6 +431,35 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	    },
 	    [&]() noexcept { source = UploadCopies(buffer, copies, total_size); });
 	if (source) {
+		RecordBufferUpload(buffer, source, copies);
+	}
+	if (is_texel_buffer && !is_written) {
+		return SynchronizeBufferFromImage(buffer, vaddr, size);
+	}
+	return false;
+}
+
+void BufferCache::ApplyCpuWrite(uint64_t vaddr, uint64_t size) {
+	if (size == 0 || !GuestRange {vaddr, size}.Valid() || !IsRegionRegistered(vaddr, size)) {
+		return;
+	}
+	if (m_scheduler.Current().IsInvalid()) {
+		static std::atomic_bool logged {false};
+		if (!logged.exchange(true)) {
+			Log::WriteToConsoleAndLog("BufferCache: CPU store upload without a command buffer\n");
+		}
+		return;
+	}
+	auto&                         buffer = m_slot_buffers[FindBuffer(vaddr, size)];
+	std::array<vk::BufferCopy, 1> copies {vk::BufferCopy {0, buffer.Offset(vaddr), size}};
+	if (const auto source = UploadCopies(buffer, copies, size)) {
+		RecordBufferUpload(buffer, source, copies);
+	}
+}
+
+void BufferCache::RecordBufferUpload(Buffer& buffer, vk::Buffer source,
+                                     std::span<const vk::BufferCopy> copies) {
+	{
 		auto& command = m_scheduler.Current();
 		command.EndRendering();
 		const auto native = command.Handle();
@@ -456,10 +485,6 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		                       vk::PipelineStageFlagBits::eAllCommands,
 		                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &after, 0, nullptr);
 	}
-	if (is_texel_buffer && !is_written) {
-		return SynchronizeBufferFromImage(buffer, vaddr, size);
-	}
-	return false;
 }
 
 // Uploads read guest memory through its unprotected backing: a page another range keeps

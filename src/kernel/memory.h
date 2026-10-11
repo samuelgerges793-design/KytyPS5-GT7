@@ -125,6 +125,9 @@ void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t s
 void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
 void                   InstallGpuResources(Graphics::RenderContext* renderer) noexcept;
 [[nodiscard]] bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept;
+// A plain store into a GPU-written page goes through without a GPU readback (single-stepped).
+[[nodiscard]] bool TryGpuWritePatch(void* native_context, uint64_t fault_vaddr) noexcept;
+[[nodiscard]] bool FinishGpuWritePatch(void* native_context) noexcept;
 
 int KYTY_SYSV_ABI KernelMapNamedFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags,
                                                const char* name);

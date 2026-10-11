@@ -71,6 +71,8 @@ enum class PerfCounter {
 	// CPU writes to GPU-written buffer pages: synchronous readbacks, and ones skipped.
 	WriteReadback,
 	WriteReadbackSkipped,
+	// Plain CPU stores into GPU-written pages let through without a readback (writePatch.cpp).
+	WritePatch,
 	Count
 };
 void PerfAdd(PerfCounter counter, uint64_t nanoseconds);

@@ -713,6 +713,12 @@ static bool TryRecoverBadGuestCall(const Common::HostException::ExceptionInfo& i
 static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_info) {
 	const auto* info = &exception_info;
 
+	// The trap after a store that was let through a GPU-written page (see writePatch.cpp);
+	// any other single step belongs to someone else.
+	if (info->type == Common::HostException::ExceptionType::SingleStep) {
+		return Libs::LibKernel::Memory::FinishGpuWritePatch(info->native_context);
+	}
+
 	if (info->type == Common::HostException::ExceptionType::IllegalInstruction &&
 	    Loader::X64InstructionEmulator::TryEmulate(info->native_context)) {
 		return true;
@@ -727,6 +733,11 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			case CoreAccess::Write: access = GpuAccess::Write; break;
 			case CoreAccess::Execute: access = GpuAccess::Execute; break;
 			case CoreAccess::Unknown: return false;
+		}
+		if (access == GpuAccess::Write &&
+		    Libs::LibKernel::Memory::TryGpuWritePatch(info->native_context,
+		                                              info->access_violation_vaddr)) {
+			return true;
 		}
 		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
 			return true;

@@ -279,6 +279,19 @@ struct PageManager::Impl {
 		}
 	}
 
+	void SetTemporaryWrite(uint64_t page, bool writable) {
+		ValidateRange(page, PAGE_SIZE);
+		auto* region = FindRegion(page);
+		if (region == nullptr) {
+			if (writable) Protect(page, PAGE_SIZE, Common::VirtualMemory::Mode::ReadWrite);
+			return;
+		}
+		const auto region_base = Common::AlignDown(page, REGION_SIZE);
+		SpinGuard  lock(region->lock);
+		const auto perms = region->pages[(page - region_base) / PAGE_SIZE].Perms();
+		Protect(page, PAGE_SIZE, writable ? Common::VirtualMemory::Mode::ReadWrite : perms);
+	}
+
 	std::unique_ptr<std::atomic<Region*>[]> regions;
 	std::vector<std::unique_ptr<Region>>    region_storage;
 	std::mutex                              region_mutex;
@@ -292,6 +305,10 @@ PageManager::~PageManager() = default;
 
 uint64_t PageManager::GetPageSize() const {
 	return PAGE_SIZE;
+}
+
+void PageManager::SetTemporaryWrite(uint64_t page, bool writable) {
+	m_impl->SetTemporaryWrite(page, writable);
 }
 
 template <bool track>

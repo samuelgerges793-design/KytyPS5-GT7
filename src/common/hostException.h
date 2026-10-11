@@ -5,7 +5,7 @@
 
 namespace Common::HostException {
 
-enum class ExceptionType { Unknown, AccessViolation, IllegalInstruction };
+enum class ExceptionType { Unknown, AccessViolation, IllegalInstruction, SingleStep };
 
 enum class AccessViolationType { Unknown, Read, Write, Execute };
 

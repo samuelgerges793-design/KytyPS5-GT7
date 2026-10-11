@@ -24,6 +24,8 @@ public:
 	void UpdatePageWatchers(uint64_t vaddr, uint64_t size);
 	template <bool track, bool is_read = false>
 	void UpdatePageWatchersForRegion(uint64_t base_addr, RegionBits& mask);
+	// Opens one page for writing, or restores the protection its watchers require.
+	void SetTemporaryWrite(uint64_t page, bool writable);
 
 private:
 	struct Impl;

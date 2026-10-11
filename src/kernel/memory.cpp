@@ -970,6 +970,15 @@ bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noex
 	return g_gpu_resources != nullptr && g_gpu_resources->HandleFault(access, fault_vaddr);
 }
 
+bool TryGpuWritePatch(void* native_context, uint64_t fault_vaddr) noexcept {
+	return g_gpu_resources != nullptr &&
+	       g_gpu_resources->TryBeginWritePatch(native_context, fault_vaddr);
+}
+
+bool FinishGpuWritePatch(void* native_context) noexcept {
+	return g_gpu_resources != nullptr && g_gpu_resources->FinishWritePatch(native_context);
+}
+
 struct PrtAperture {
 	uint64_t address = 0;
 	uint64_t size    = 0;
