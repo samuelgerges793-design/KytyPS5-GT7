@@ -47,6 +47,7 @@
 #include <string_view>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 #include <xxhash.h>
@@ -619,6 +620,17 @@ struct PipelineCache::ProgramCache {
 	                               ShaderRecompiler::IR::ResourceSpecialization specialization,
 	                               uint32_t                  push_data_start_dword,
 	                               std::span<const uint32_t> function_code) const {
+		const auto loop_cap = ShaderRecompiler::LoopCapFor(options.shader_hash);
+		ShaderRecompiler::SetLoopCapOverride(loop_cap);
+		if (loop_cap != 0) {
+			static std::mutex                   logged_mutex;
+			static std::unordered_set<uint64_t> logged;
+			std::scoped_lock                    lock(logged_mutex);
+			if (logged.insert(options.shader_hash).second) {
+				Log::WriteToConsoleAndLog(fmt::format("watchdog: {} 0x{:016x} loops capped at {}\n",
+				                                      stage_name, options.shader_hash, loop_cap));
+			}
+		}
 		auto result = ShaderRecompiler::CompileProgram(std::move(translated), options,
 		                                               specialization, push_data_start_dword);
 		if (!ValidateShaderSpirv(options.dump_label, options.shader_hash, result.spirv)) {

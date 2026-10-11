@@ -121,6 +121,8 @@ void GuestGpu::ProcessCommands() {
 		}
 		command();
 	}
+	// Stores patched into GPU-written pages reach their buffers before the next packet.
+	m_renderer.GetBufferCache().FlushCpuWrites();
 }
 
 void GuestGpu::SendCommandSync(Common::UniqueFunction<void>&& command) {

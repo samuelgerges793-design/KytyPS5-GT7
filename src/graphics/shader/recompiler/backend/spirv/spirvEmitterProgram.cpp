@@ -7,18 +7,46 @@
 #include <cstdlib>
 #include <functional>
 #include <optional>
+#include <string>
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
+#include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler {
 namespace {
 thread_local uint32_t g_last_waterfall_guards = 0;
+thread_local uint32_t g_loop_cap_override    = 0;
 } // namespace
 
 uint32_t LastWaterfallLoopGuards() {
 	return g_last_waterfall_guards;
+}
+
+void SetLoopCapOverride(uint32_t cap) {
+	g_loop_cap_override = cap;
+}
+
+uint32_t LoopCapFor(uint64_t shader_hash) {
+	static const std::vector<uint64_t> hashes = [] {
+		std::vector<uint64_t> list;
+		if (const char* env = std::getenv("KYTY_LOOP_CAP_SHADERS"); env != nullptr) {
+			const std::string text(env);
+			size_t            start = 0;
+			while (start < text.size()) {
+				const auto end = std::min(text.find(',', start), text.size());
+				if (end > start) list.push_back(std::stoull(text.substr(start, end - start), nullptr, 16));
+				start = end + 1;
+			}
+		}
+		return list;
+	}();
+	static const uint32_t cap = [] {
+		const char* env = std::getenv("KYTY_LOOP_CAP");
+		return env != nullptr ? static_cast<uint32_t>(std::strtoul(env, nullptr, 10)) : 64u;
+	}();
+	return std::ranges::find(hashes, shader_hash) != hashes.end() ? cap : 0u;
 }
 } // namespace Libs::Graphics::ShaderRecompiler
 
@@ -150,9 +178,10 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block) {
 				builder.AddFunction(spv::OpStore, guard->second, counted);
 				// Graphics stages run per pixel or vertex, so a lower cap keeps a runaway loop
 				// within the GPU timeout.
-				const auto limit = ctx.state.loop_watchdog_waterfalls.contains(block) ? 256u
-				                   : ctx.state.program.stage == ShaderType::Compute ? 1u << 16u
-				                                                                    : 1u << 10u;
+				auto limit = ctx.state.loop_watchdog_waterfalls.contains(block) ? 256u
+				             : ctx.state.program.stage == ShaderType::Compute ? 1u << 16u
+				                                                              : 1u << 10u;
+				if (g_loop_cap_override != 0) limit = std::min(limit, g_loop_cap_override);
 				builder.AddFunction(spv::OpUGreaterThan, TypeBool(ctx.state), over, counted,
 				                    ConstantU32(ctx.state, limit));
 				// The exit is the merge target: the header's own merge, for a back-edge block the

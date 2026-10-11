@@ -286,7 +286,7 @@ bool RenderContext::TryBeginWritePatch(void* native_context, uint64_t fault_vadd
 	m_gpu->SendCommandSync([this, &store, &written] {
 		written = Libs::LibKernel::Memory::TryWriteBacking(store.address, store.bytes.data(), store.size);
 		if (written) {
-			m_buffer_cache.ApplyCpuWrite(store.address, store.size);
+			m_buffer_cache.QueueCpuWrite(store.address, store.size);
 		}
 	});
 	if (!written) {

@@ -285,6 +285,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		     vaddr, size);
 	}
 	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write] {
+		FlushCpuWrites();
 		if (is_write && !IsRegionRegistered(vaddr, size)) {
 			return;
 		}
@@ -439,21 +440,54 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	return false;
 }
 
-void BufferCache::ApplyCpuWrite(uint64_t vaddr, uint64_t size) {
-	if (size == 0 || !GuestRange {vaddr, size}.Valid() || !IsRegionRegistered(vaddr, size)) {
+void BufferCache::QueueCpuWrite(uint64_t vaddr, uint64_t size) {
+	if (size != 0 && GuestRange {vaddr, size}.Valid()) {
+		m_pending_cpu_writes.emplace_back(vaddr, size);
+	}
+}
+
+void BufferCache::FlushCpuWrites() {
+	if (m_pending_cpu_writes.empty()) {
 		return;
 	}
 	if (m_scheduler.Current().IsInvalid()) {
-		static std::atomic_bool logged {false};
-		if (!logged.exchange(true)) {
-			Log::WriteToConsoleAndLog("BufferCache: CPU store upload without a command buffer\n");
-		}
-		return;
+		return; // Kept for the next flush.
 	}
-	auto&                         buffer = m_slot_buffers[FindBuffer(vaddr, size)];
-	std::array<vk::BufferCopy, 1> copies {vk::BufferCopy {0, buffer.Offset(vaddr), size}};
-	if (const auto source = UploadCopies(buffer, copies, size)) {
-		RecordBufferUpload(buffer, source, copies);
+	auto ranges = std::move(m_pending_cpu_writes);
+	m_pending_cpu_writes.clear();
+	std::ranges::sort(ranges);
+	// Merge touching and overlapping stores only: bytes between them are stale guest copies of
+	// GPU data. Then one upload per buffer.
+	std::vector<std::pair<uint64_t, uint64_t>> merged;
+	for (const auto& [address, size]: ranges) {
+		if (!merged.empty() && address <= merged.back().first + merged.back().second) {
+			auto& last  = merged.back();
+			last.second = std::max(last.first + last.second, address + size) - last.first;
+		} else {
+			merged.emplace_back(address, size);
+		}
+	}
+	std::vector<std::pair<BufferId, std::pair<uint64_t, uint64_t>>> targets;
+	for (const auto& [address, size]: merged) {
+		if (IsRegionRegistered(address, size)) {
+			targets.emplace_back(FindBuffer(address, size), std::pair {address, size});
+		}
+	}
+	for (size_t first = 0; first < targets.size();) {
+		const auto id   = targets[first].first;
+		auto&      buffer = m_slot_buffers[id];
+		std::vector<vk::BufferCopy> copies;
+		uint64_t                    total = 0;
+		size_t                      next  = first;
+		for (; next < targets.size() && targets[next].first == id; next++) {
+			const auto [address, size] = targets[next].second;
+			copies.emplace_back(total, buffer.Offset(address), size);
+			total += size;
+		}
+		if (const auto source = UploadCopies(buffer, copies, total)) {
+			RecordBufferUpload(buffer, source, copies);
+		}
+		first = next;
 	}
 }
 
@@ -678,6 +712,7 @@ bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 }
 
 void BufferCache::RunGarbageCollector() {
+	FlushCpuWrites();
 	const auto tick = m_gc_tick++;
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();

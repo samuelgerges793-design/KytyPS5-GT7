@@ -82,8 +82,10 @@ public:
 	void               ProcessFaultBuffer();
 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
 	void               RunGarbageCollector();
-	// GPU thread: uploads guest bytes a CPU store wrote into a GPU-written buffer page.
-	void               ApplyCpuWrite(uint64_t vaddr, uint64_t size);
+	// GPU thread: guest bytes a CPU store wrote into a GPU-written buffer page are uploaded in
+	// one batch before the next packet or readback (FlushCpuWrites).
+	void               QueueCpuWrite(uint64_t vaddr, uint64_t size);
+	void               FlushCpuWrites();
 
 private:
 	friend struct BufferCacheTestAccess;
@@ -117,6 +119,7 @@ private:
 	[[nodiscard]] bool SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size,
 	                                     bool is_written, bool is_texel_buffer);
 	void RecordBufferUpload(Buffer& buffer, vk::Buffer source, std::span<const vk::BufferCopy> copies);
+	std::vector<std::pair<uint64_t, uint64_t>> m_pending_cpu_writes;
 	[[nodiscard]] vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
 	                                      uint64_t total_size);
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);

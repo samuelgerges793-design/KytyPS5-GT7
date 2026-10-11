@@ -68,6 +68,10 @@ void               MarkRuntimeCallShader(uint64_t shader_hash);
 [[nodiscard]] bool SkipRuntimeCallShader(uint64_t shader_hash);
 // Waterfall loop guards emitted by this thread's last SPIR-V emission (diagnostics).
 [[nodiscard]] uint32_t LastWaterfallLoopGuards();
+// Loop watchdog cap for this thread's next emissions (0 = the stage default); shaders listed in
+// KYTY_LOOP_CAP_SHADERS get KYTY_LOOP_CAP (default 64).
+void                   SetLoopCapOverride(uint32_t cap);
+[[nodiscard]] uint32_t LoopCapFor(uint64_t shader_hash);
 
 [[nodiscard]] ShaderSource PrepareShaderSource(std::span<const uint32_t> code,
 	                                           const CompileOptions& options);
