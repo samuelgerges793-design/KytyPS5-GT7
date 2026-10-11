@@ -120,11 +120,26 @@ struct PlainStore {
 	uint64_t                address = 0;
 	uint32_t                size    = 0;
 	uint32_t                length  = 0;
-	std::array<uint8_t, 16> bytes {};
+	std::array<uint8_t, 32> bytes {};
 };
 
+// The upper 128 bits of YMM registers live in the context's extended (XSAVE) state.
+bool YmmUpper(CONTEXT& context, uint32_t index, uint8_t* out) {
+	DWORD64 features = 0;
+	if (!GetXStateFeaturesMask(&context, &features) || (features & XSTATE_MASK_AVX) == 0) {
+		return false;
+	}
+	DWORD length = 0;
+	const auto* upper = static_cast<const M128A*>(LocateXStateFeature(&context, XSTATE_AVX, &length));
+	if (upper == nullptr || length < (index + 1u) * sizeof(M128A)) {
+		return false;
+	}
+	std::memcpy(out, &upper[index], sizeof(M128A));
+	return true;
+}
+
 // Decodes a plain store and computes the bytes it writes, or returns false for anything else.
-bool DecodePlainStore(const CONTEXT& context, PlainStore& store) {
+bool DecodePlainStore(CONTEXT& context, PlainStore& store) {
 	ZydisDecoder decoder {};
 	if (!ZYAN_SUCCESS(ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64))) {
 		return false;
@@ -148,13 +163,13 @@ bool DecodePlainStore(const CONTEXT& context, PlainStore& store) {
 	    destination.actions != ZYDIS_OPERAND_ACTION_WRITE ||
 	    destination.mem.type != ZYDIS_MEMOP_TYPE_MEM ||
 	    destination.mem.segment == ZYDIS_REGISTER_FS || destination.mem.segment == ZYDIS_REGISTER_GS ||
-	    destination.size == 0 || destination.size % 8 != 0 || destination.size > 128) {
+	    destination.size == 0 || destination.size % 8 != 0 || destination.size > 256) {
 		return false;
 	}
 	const uint32_t size = destination.size / 8u;
 
-	// The value: the low bytes of a general register, an XMM register or a constant.
-	std::array<uint8_t, 16> value {};
+	// The value: the low bytes of a general register, an XMM or YMM register or a constant.
+	std::array<uint8_t, 32> value {};
 	if (source.type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
 		const uint64_t immediate = source.imm.is_signed ? static_cast<uint64_t>(source.imm.value.s)
 		                                                : source.imm.value.u;
@@ -176,14 +191,20 @@ bool DecodePlainStore(const CONTEXT& context, PlainStore& store) {
 				full >>= 8u;
 			}
 			std::memcpy(value.data(), &full, sizeof(full));
-		} else if (reg_class == ZYDIS_REGCLASS_XMM) {
-			const auto index = static_cast<uint32_t>(source.reg.value - ZYDIS_REGISTER_XMM0);
-			if (index >= 16 || (context.ContextFlags & CONTEXT_FLOATING_POINT) != CONTEXT_FLOATING_POINT) {
+		} else if (reg_class == ZYDIS_REGCLASS_XMM || reg_class == ZYDIS_REGCLASS_YMM) {
+			const bool ymm   = reg_class == ZYDIS_REGCLASS_YMM;
+			const auto index = static_cast<uint32_t>(
+			    source.reg.value - (ymm ? ZYDIS_REGISTER_YMM0 : ZYDIS_REGISTER_XMM0));
+			if (index >= 16 || size > (ymm ? 32u : 16u) ||
+			    (context.ContextFlags & CONTEXT_FLOATING_POINT) != CONTEXT_FLOATING_POINT) {
 				return false;
 			}
 			const auto& xmm = context.FltSave.XmmRegisters[index];
 			std::memcpy(value.data(), &xmm.Low, sizeof(xmm.Low));
 			std::memcpy(value.data() + 8, &xmm.High, sizeof(xmm.High));
+			if (ymm && size > 16u && !YmmUpper(context, index, value.data() + 16)) {
+				return false;
+			}
 		} else {
 			return false;
 		}
@@ -247,7 +268,7 @@ bool BurstLimited(uint64_t page) {
 	if (burst.count == 0 || now - burst.start > std::chrono::milliseconds(50)) {
 		burst = {now, 0};
 	}
-	return ++burst.count > 32u;
+	return ++burst.count > 256u;
 }
 
 } // namespace
@@ -269,9 +290,8 @@ bool RenderContext::TryBeginWritePatch(void* native_context, uint64_t fault_vadd
 		return false;
 	}
 	if (fault_vaddr < store.address || fault_vaddr >= store.address + store.size ||
-	    (store.address & ~(PatchPageSize - 1u)) != page ||
-	    ((store.address + store.size - 1u) & ~(PatchPageSize - 1u)) != page) {
-		NoteFallback(context, "crosses a page");
+	    !IsMapped(store.address, store.size)) {
+		NoteFallback(context, "outside the store or unmapped");
 		return false;
 	}
 	if (BurstLimited(page)) {
