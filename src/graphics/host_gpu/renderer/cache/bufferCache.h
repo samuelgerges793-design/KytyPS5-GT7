@@ -15,6 +15,8 @@
 #include <span>
 #include <utility>
 #include <vector>
+#include <array>
+#include <mutex>
 
 namespace Libs::Graphics {
 
@@ -82,9 +84,11 @@ public:
 	void               ProcessFaultBuffer();
 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
 	void               RunGarbageCollector();
-	// GPU thread: guest bytes a CPU store wrote into a GPU-written buffer page are uploaded in
-	// one batch before the next packet or readback (FlushCpuWrites).
-	void               QueueCpuWrite(uint64_t vaddr, uint64_t size);
+	// Any thread: performs a CPU store into a GPU-written buffer page through the backing view
+	// and queues its upload; the GPU thread uploads the queue in one batch before the next
+	// packet or readback (FlushCpuWrites). A readback that publishes over queued stores
+	// writes them again, so a store is never lost to older GPU data.
+	[[nodiscard]] bool StoreCpuBytes(uint64_t vaddr, const uint8_t* data, uint32_t size);
 	void               FlushCpuWrites();
 
 private:
@@ -119,7 +123,13 @@ private:
 	[[nodiscard]] bool SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size,
 	                                     bool is_written, bool is_texel_buffer);
 	void RecordBufferUpload(Buffer& buffer, vk::Buffer source, std::span<const vk::BufferCopy> copies);
-	std::vector<std::pair<uint64_t, uint64_t>> m_pending_cpu_writes;
+	struct PendingCpuStore {
+		uint64_t                address = 0;
+		uint32_t                size    = 0;
+		std::array<uint8_t, 32> bytes {};
+	};
+	std::mutex                   m_cpu_store_mutex;
+	std::vector<PendingCpuStore> m_cpu_stores;
 	[[nodiscard]] vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
 	                                      uint64_t total_size);
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);

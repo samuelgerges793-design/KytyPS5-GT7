@@ -206,9 +206,20 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	auto publish = [this, mapped, offset, total_size, buffer_address,
 	                copies = std::move(copies), owner = std::move(temporary)] {
 		(owner ? *owner : m_download_buffer).Invalidate(offset, total_size);
+		std::scoped_lock lock(m_cpu_store_mutex);
 		for (const auto& copy: copies) {
 			Libs::LibKernel::Memory::WriteBacking(buffer_address + copy.srcOffset,
 			                                      mapped + (copy.dstOffset - offset), copy.size);
+		}
+		// Queued CPU stores are newer than this download: write them again on top.
+		for (const auto& store: m_cpu_stores) {
+			for (const auto& copy: copies) {
+				const auto begin = buffer_address + copy.srcOffset;
+				if (store.address < begin + copy.size && begin < store.address + store.size) {
+					Libs::LibKernel::Memory::WriteBacking(store.address, store.bytes.data(), store.size);
+					break;
+				}
+			}
 		}
 	};
 	if constexpr (async) {
@@ -440,21 +451,32 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	return false;
 }
 
-void BufferCache::QueueCpuWrite(uint64_t vaddr, uint64_t size) {
-	if (size != 0 && GuestRange {vaddr, size}.Valid()) {
-		m_pending_cpu_writes.emplace_back(vaddr, size);
+bool BufferCache::StoreCpuBytes(uint64_t vaddr, const uint8_t* data, uint32_t size) {
+	if (size == 0 || size > 32 || !GuestRange {vaddr, size}.Valid()) {
+		return false;
 	}
+	std::scoped_lock lock(m_cpu_store_mutex);
+	if (!Libs::LibKernel::Memory::TryWriteBacking(vaddr, data, size)) {
+		return false;
+	}
+	auto& store   = m_cpu_stores.emplace_back();
+	store.address = vaddr;
+	store.size    = size;
+	std::memcpy(store.bytes.data(), data, size);
+	return true;
 }
 
 void BufferCache::FlushCpuWrites() {
-	if (m_pending_cpu_writes.empty()) {
-		return;
+	std::vector<std::pair<uint64_t, uint64_t>> ranges;
+	{
+		std::scoped_lock lock(m_cpu_store_mutex);
+		if (m_cpu_stores.empty() || m_scheduler.Current().IsInvalid()) {
+			return; // Kept for the next flush.
+		}
+		ranges.reserve(m_cpu_stores.size());
+		for (const auto& store: m_cpu_stores) ranges.emplace_back(store.address, store.size);
+		m_cpu_stores.clear();
 	}
-	if (m_scheduler.Current().IsInvalid()) {
-		return; // Kept for the next flush.
-	}
-	auto ranges = std::move(m_pending_cpu_writes);
-	m_pending_cpu_writes.clear();
 	std::ranges::sort(ranges);
 	// Merge touching and overlapping stores only: bytes between them are stale guest copies of
 	// GPU data. Then one upload per buffer.

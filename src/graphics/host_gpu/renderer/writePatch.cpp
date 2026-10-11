@@ -268,7 +268,7 @@ bool BurstLimited(uint64_t page) {
 	if (burst.count == 0 || now - burst.start > std::chrono::milliseconds(50)) {
 		burst = {now, 0};
 	}
-	return ++burst.count > 256u;
+	return ++burst.count > 64u;
 }
 
 } // namespace
@@ -300,16 +300,8 @@ bool RenderContext::TryBeginWritePatch(void* native_context, uint64_t fault_vadd
 	}
 	// Images over the stored bytes see the CPU write, as on the readback path.
 	m_texture_cache.InvalidateMemory(store.address, store.size);
-	// On the GPU thread, after any readback of this page already queued (whose publish would
-	// otherwise land on top of the store): guest memory, then the GPU buffer.
-	bool written = false;
-	m_gpu->SendCommandSync([this, &store, &written] {
-		written = Libs::LibKernel::Memory::TryWriteBacking(store.address, store.bytes.data(), store.size);
-		if (written) {
-			m_buffer_cache.QueueCpuWrite(store.address, store.size);
-		}
-	});
-	if (!written) {
+	// Guest memory now; the GPU buffer before its next use (see BufferCache::StoreCpuBytes).
+	if (!m_buffer_cache.StoreCpuBytes(store.address, store.bytes.data(), store.size)) {
 		return false;
 	}
 	context.Rip += store.length;
