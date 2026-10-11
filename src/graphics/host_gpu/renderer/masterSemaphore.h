@@ -83,6 +83,9 @@ enum class PerfCounter {
 	// Writable-binding verification: bytes copied back (MB/s), and pages released per second.
 	WriteVerifyBytes,
 	WriteVerifyReleased,
+	// KYTY_LEARN_WRITES: bytes bound writable but not marked (MB/s), and late GPU writes found.
+	LearnedSkipBytes,
+	LearnedLateWrites,
 	Count
 };
 void PerfAdd(PerfCounter counter, uint64_t nanoseconds);

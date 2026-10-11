@@ -629,16 +629,33 @@ void BufferCache::VerifyWrites(uint64_t tick, const std::vector<std::pair<uint64
 		const auto offset  = pages[i].second;
 		const auto size    = pages[i + 1].first;
 		for (uint64_t page = address; page < address + size; page += 0x1000) {
+			static const bool learn = std::getenv("KYTY_LEARN_WRITES") != nullptr;
+			const auto*       gpu_page = gpu + offset + (page - address);
+			const bool        marked   = m_gpu_modified_ranges.Intersects(page, 0x1000);
+			if (learn && Libs::LibKernel::Memory::TryReadBacking(page, guest.data(), guest.size())) {
+				const bool same  = std::memcmp(gpu_page, guest.data(), guest.size()) == 0;
+				auto&      state = m_page_learn[page >> 12u];
+				if (!same) {
+					if (!marked && state >= LearnedCleanCount && state != PageWritten &&
+					    !m_memory_tracker.IsRegionCpuModified(page, 0x1000)) {
+						// A learned-clean page the GPU wrote after all: make the bytes visible.
+						Libs::LibKernel::Memory::WriteBacking(page, gpu_page, guest.size());
+						PerfAdd(PerfCounter::LearnedLateWrites, 0);
+					}
+					state = PageWritten;
+				} else if (state != PageWritten && state < LearnedCleanCount) {
+					state++;
+				}
+			}
 			const auto mark = m_page_last_mark.find(page >> 12u);
 			if (mark == m_page_last_mark.end() || mark->second != tick) {
 				continue; // Marked again by later work, or already handled.
 			}
 			m_page_last_mark.erase(mark);
-			if (!m_gpu_modified_ranges.Intersects(page, 0x1000) ||
-			    !Libs::LibKernel::Memory::TryReadBacking(page, guest.data(), guest.size())) {
+			if (!marked || !Libs::LibKernel::Memory::TryReadBacking(page, guest.data(), guest.size())) {
 				continue;
 			}
-			if (std::memcmp(gpu + offset + (page - address), guest.data(), guest.size()) != 0) {
+			if (std::memcmp(gpu_page, guest.data(), guest.size()) != 0) {
 				continue; // Written by the GPU: stays GPU-owned.
 			}
 			m_gpu_modified_ranges.Subtract(page, 0x1000);
@@ -815,10 +832,38 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	}
 	auto& buffer = m_slot_buffers[id];
 	TouchBuffer(buffer);
-	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
+	static const bool learn  = std::getenv("KYTY_LEARN_WRITES") != nullptr;
+	static const bool verify = learn || std::getenv("KYTY_WRITE_VERIFY") != nullptr;
+	if (is_written && learn) {
+		// Mark only pages not yet learned clean; the rest are uploaded like reads.
+		uint64_t run_begin = vaddr;
+		bool     run_mark  = true;
+		bool     first     = true;
+		const auto end     = vaddr + size;
+		for (uint64_t page = vaddr & ~uint64_t {0xfff}; page < end; page += 0x1000) {
+			const auto found = m_page_learn.find(page >> 12u);
+			const bool mark  = found == m_page_learn.end() || found->second < LearnedCleanCount ||
+			                  found->second == PageWritten;
+			const auto begin = std::max(page, vaddr);
+			if (first) {
+				run_mark = mark;
+				first    = false;
+			} else if (mark != run_mark) {
+				(void)SynchronizeBuffer(buffer, run_begin, begin - run_begin, run_mark, is_texel_buffer);
+				if (run_mark) m_gpu_modified_ranges.Add(run_begin, begin - run_begin);
+				else PerfAdd(PerfCounter::LearnedSkipBytes, begin - run_begin);
+				run_begin = begin;
+				run_mark  = mark;
+			}
+		}
+		(void)SynchronizeBuffer(buffer, run_begin, end - run_begin, run_mark, is_texel_buffer);
+		if (run_mark) m_gpu_modified_ranges.Add(run_begin, end - run_begin);
+		else PerfAdd(PerfCounter::LearnedSkipBytes, end - run_begin);
+	} else {
+		(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
+		if (is_written) m_gpu_modified_ranges.Add(vaddr, size);
+	}
 	if (is_written) {
-		m_gpu_modified_ranges.Add(vaddr, size);
-		static const bool verify = std::getenv("KYTY_WRITE_VERIFY") != nullptr;
 		if (verify) {
 			const auto tick = m_scheduler.CurrentTick();
 			for (uint64_t page = vaddr >> 12u; page <= (vaddr + size - 1u) >> 12u; page++) {

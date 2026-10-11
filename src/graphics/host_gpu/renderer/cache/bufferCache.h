@@ -148,6 +148,13 @@ private:
 	                                                    const uint8_t* gpu);
 	std::vector<std::pair<uint64_t, uint64_t>> m_tick_written_ranges;
 	std::unordered_map<uint64_t, uint64_t>     m_page_last_mark;
+	// KYTY_LEARN_WRITES (implies verification): per 4 KiB page of writable bindings, how many
+	// verifications in a row found it unchanged (PageWritten once the GPU changed it). Pages
+	// unchanged LearnedCleanCount times are no longer marked GPU-written at bind; they are still
+	// verified, and a change found later publishes the GPU's bytes and marks them written.
+	static constexpr uint8_t                   PageWritten       = 0xff;
+	static constexpr uint8_t                   LearnedCleanCount = 3;
+	std::unordered_map<uint64_t, uint8_t>      m_page_learn;
 	uint64_t                               m_address_write_epoch = 1;
 	std::unordered_map<uint64_t, uint64_t> m_command_page_epochs;
 	std::mutex                   m_cpu_store_mutex;
