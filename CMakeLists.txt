@@ -40,6 +40,11 @@ if (NOT (WIN32 OR LINUX OR APPLE))
     message(FATAL_ERROR "only Windows, Linux, and macOS builds are supported")
 endif()
 
+if(WIN32)
+	# Prevent Windows headers from defining min/max macros in all targets.
+	add_compile_definitions(NOMINMAX)
+endif()
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -405,7 +410,7 @@ add_executable(scalar_provenance_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtWalker.cpp"
 )
-target_link_libraries(scalar_provenance_tests fmt::fmt)
+target_link_libraries(scalar_provenance_tests fmt::fmt xbyak::xbyak)
 target_include_directories(scalar_provenance_tests PRIVATE ${inc_headers})
 
 add_executable(page_manager_tests EXCLUDE_FROM_ALL
@@ -473,7 +478,7 @@ add_executable(resource_materialization_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtWalker.cpp"
 )
-target_link_libraries(resource_materialization_tests fmt::fmt)
+target_link_libraries(resource_materialization_tests fmt::fmt xbyak::xbyak)
 target_include_directories(resource_materialization_tests PRIVATE ${inc_headers})
 
 add_executable(resource_tracking_tests EXCLUDE_FROM_ALL
@@ -486,7 +491,7 @@ add_executable(resource_tracking_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ShaderInfoCollection.cpp"
 )
-target_link_libraries(resource_tracking_tests fmt::fmt)
+target_link_libraries(resource_tracking_tests fmt::fmt xbyak::xbyak)
 target_include_directories(resource_tracking_tests PRIVATE ${inc_headers})
 
 add_executable(audio_out2_port_tests EXCLUDE_FROM_ALL
