@@ -265,6 +265,55 @@ void NoteFallback(const CONTEXT& context, const char* reason) {
 	                                      mnemonic != nullptr ? mnemonic : "?", reason));
 }
 
+// Counts a store the patching refused by instruction kind: stores that extract part of a
+// register or a flag (could be emulated), read-modify-writes (need current bytes), and others.
+PerfCounter StoreFallbackKind(const CONTEXT& context) {
+	ZydisDecoder            decoder {};
+	ZydisDecodedInstruction instruction {};
+	ZydisDecodedOperand     operands[ZYDIS_MAX_OPERAND_COUNT] {};
+	if (!ZYAN_SUCCESS(ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64)) ||
+	    !ZYAN_SUCCESS(ZydisDecoderDecodeFull(&decoder, reinterpret_cast<const void*>(context.Rip),
+	                                         ZYDIS_MAX_INSTRUCTION_LENGTH, &instruction, operands))) {
+		return PerfCounter::PatchRefusedOtherInsn;
+	}
+	for (uint32_t i = 0; i < instruction.operand_count_visible; i++) {
+		const auto& operand = operands[i];
+		if (operand.type == ZYDIS_OPERAND_TYPE_MEMORY && (operand.actions & ZYDIS_OPERAND_ACTION_MASK_WRITE) != 0 &&
+		    (operand.actions & ZYDIS_OPERAND_ACTION_MASK_READ) != 0) {
+			return PerfCounter::PatchRefusedRmw;
+		}
+	}
+	switch (instruction.mnemonic) {
+		case ZYDIS_MNEMONIC_VEXTRACTPS:
+		case ZYDIS_MNEMONIC_EXTRACTPS:
+		case ZYDIS_MNEMONIC_VPEXTRB:
+		case ZYDIS_MNEMONIC_VPEXTRW:
+		case ZYDIS_MNEMONIC_VPEXTRD:
+		case ZYDIS_MNEMONIC_VPEXTRQ:
+		case ZYDIS_MNEMONIC_PEXTRB:
+		case ZYDIS_MNEMONIC_PEXTRW:
+		case ZYDIS_MNEMONIC_PEXTRD:
+		case ZYDIS_MNEMONIC_PEXTRQ:
+		case ZYDIS_MNEMONIC_VMOVHPS:
+		case ZYDIS_MNEMONIC_VMOVHPD:
+		case ZYDIS_MNEMONIC_MOVHPS:
+		case ZYDIS_MNEMONIC_MOVHPD:
+		case ZYDIS_MNEMONIC_VMOVLPS:
+		case ZYDIS_MNEMONIC_VMOVLPD:
+		case ZYDIS_MNEMONIC_MOVLPS:
+		case ZYDIS_MNEMONIC_MOVLPD:
+		case ZYDIS_MNEMONIC_VEXTRACTF128:
+		case ZYDIS_MNEMONIC_VEXTRACTI128:
+		case ZYDIS_MNEMONIC_VCVTPS2PH:
+			return PerfCounter::PatchRefusedExtract;
+		default: break;
+	}
+	if (instruction.mnemonic >= ZYDIS_MNEMONIC_SETB && instruction.mnemonic <= ZYDIS_MNEMONIC_SETZ) {
+		return PerfCounter::PatchRefusedExtract;
+	}
+	return PerfCounter::PatchRefusedOtherInsn;
+}
+
 // Bursts of stores into one page are cheaper as one readback, which hands the page to the CPU.
 bool BurstLimited(uint64_t page) {
 	struct Burst {
@@ -282,14 +331,18 @@ bool BurstLimited(uint64_t page) {
 	if (burst.count == 0 || now - burst.start > std::chrono::milliseconds(50)) {
 		burst = {now, 0};
 	}
-	return ++burst.count > 64u;
+	// KYTY_WRITE_PATCH_BURST: stores per page per 50 ms before handing the page over (0 = never).
+	static const uint32_t limit = [] {
+		const char* value = std::getenv("KYTY_WRITE_PATCH_BURST");
+		return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 64u;
+	}();
+	return limit != 0 && ++burst.count > limit;
 }
 
 } // namespace
 
 bool RenderContext::TryBeginWritePatch(void* native_context, uint64_t fault_vaddr) noexcept {
-	if (!WritePatchEnabled() || native_context == nullptr || GuestGpu::IsGpuThread() ||
-	    CommandScheduler::InDeferredOperation() || m_gpu == nullptr || m_gpu->IsStopping() ||
+	if (!WritePatchEnabled() || native_context == nullptr || m_gpu == nullptr ||
 	    !IsMapped(fault_vaddr, 1)) {
 		return false;
 	}
@@ -297,16 +350,26 @@ bool RenderContext::TryBeginWritePatch(void* native_context, uint64_t fault_vadd
 	if (!m_buffer_cache.IsRegionGpuModified(page, PatchPageSize)) {
 		return false;
 	}
+	if (GuestGpu::IsGpuThread()) {
+		PerfAdd(PerfCounter::PatchRefusedGpuThread, 0);
+		return false;
+	}
+	if (CommandScheduler::InDeferredOperation() || m_gpu->IsStopping()) {
+		PerfAdd(PerfCounter::PatchRefusedOther, 0);
+		return false;
+	}
 	m_buffer_cache.NoteGpuOwnedAccess(fault_vaddr);
 	auto&      context = *static_cast<CONTEXT*>(native_context);
 	PlainStore store;
 	if (!DecodePlainStore(context, store)) {
 		NoteFallback(context, "not a plain store");
+		PerfAdd(StoreFallbackKind(context), 0);
 		return false;
 	}
 	if (fault_vaddr < store.address || fault_vaddr >= store.address + store.size ||
 	    !IsMapped(store.address, store.size)) {
 		NoteFallback(context, "outside the store or unmapped");
+		PerfAdd(PerfCounter::PatchRefusedOther, 0);
 		return false;
 	}
 	if (BurstLimited(page)) {

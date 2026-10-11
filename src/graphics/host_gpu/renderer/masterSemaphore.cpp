@@ -265,7 +265,9 @@ void PerfReport(double fps) {
 	                                        "mark-untracked-binding-MB", "mark-other-MB",
 	                                        "track-released-pages", "track-download-released-pages",
 	                                        "cand-nohistory", "cand-cmd-clean", "cand-cmd-written",
-	                                        "cand-clean", "cand-written"};
+	                                        "cand-clean", "cand-written", "refused-gpu-thread",
+	                                        "refused-extract", "refused-rmw", "refused-other-insn",
+	                                        "refused-other", "readback-explicit"};
 	std::string text = fmt::format("perf: {:.1f} fps | longest-gpu-wait {:.0f} ms |", fps,
 	                               static_cast<double>(g_longest_wait_ns.exchange(0)) / 1e6);
 	for (size_t i = 0; i < g_perf.size(); i++) {

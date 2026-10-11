@@ -109,6 +109,14 @@ enum class PerfCounter {
 	CandidateCommandWritten,
 	CandidateClean,
 	CandidateWritten,
+	// Stores to GPU-owned pages the patching refused (each then reads back), by reason, and
+	// explicit invalidations of GPU-owned memory.
+	PatchRefusedGpuThread,
+	PatchRefusedExtract,
+	PatchRefusedRmw,
+	PatchRefusedOtherInsn,
+	PatchRefusedOther,
+	ReadbackExplicit,
 	Count
 };
 void PerfAdd(PerfCounter counter, uint64_t nanoseconds);

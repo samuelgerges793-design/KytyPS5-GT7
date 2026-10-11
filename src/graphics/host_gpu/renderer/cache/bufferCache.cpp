@@ -762,6 +762,9 @@ uint64_t BufferCache::SyncGpuWrittenRange(uint64_t vaddr, uint64_t size, bool fo
 		return 0;
 	}
 	uint64_t differing = 0;
+	// Stores other threads emulated during the wait are in guest memory and queued, but not in
+	// the GPU copy: hold the queue and write them again on top, as downloads do.
+	std::scoped_lock store_lock(m_cpu_store_mutex);
 	for (uint64_t page = vaddr & ~uint64_t {0xfff}; page < vaddr + size; page += 0x1000) {
 		const auto begin = std::max(page, vaddr);
 		const auto end   = std::min(page + 0x1000, vaddr + size);
@@ -774,6 +777,13 @@ uint64_t BufferCache::SyncGpuWrittenRange(uint64_t vaddr, uint64_t size, bool fo
 		// The CPU's own newer bytes win on pages it changed after the GPU buffer was filled.
 		if (!m_memory_tracker.IsRegionCpuModified(page, 0x1000)) {
 			Libs::LibKernel::Memory::WriteBacking(begin, a, end - begin);
+		}
+	}
+	if (differing != 0) {
+		for (const auto& store: m_cpu_stores) {
+			if (store.address < vaddr + size && vaddr < store.address + store.size) {
+				Libs::LibKernel::Memory::WriteBacking(store.address, store.bytes.data(), store.size);
+			}
 		}
 	}
 	m_scheduler.DeferOperation([owner = std::move(staging)]() mutable { owner.reset(); });

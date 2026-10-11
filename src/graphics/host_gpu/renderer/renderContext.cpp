@@ -86,6 +86,9 @@ bool RenderContext::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	if (!IsMapped(vaddr, size)) {
 		return false;
 	}
+	if (m_buffer_cache.IsRegionGpuModified(vaddr, size)) {
+		PerfAdd(PerfCounter::ReadbackExplicit, 0);
+	}
 	m_buffer_cache.InvalidateMemory(vaddr, size);
 	m_texture_cache.InvalidateMemory(vaddr, size);
 	return true;
