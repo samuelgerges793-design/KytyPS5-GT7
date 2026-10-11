@@ -493,8 +493,10 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		                                     view.layer_count},
 		              buffer.Handle());
 		const auto extent       = target.Extent();
-		state.width             = std::min(state.width, extent.width);
-		state.height            = std::min(state.height, extent.height);
+		state.width             = std::min({state.width, extent.width,
+		                                    std::max(image.info.extent.width >> view.base_level, 1u)});
+		state.height            = std::min({state.height, extent.height,
+		                                    std::max(image.info.extent.height >> view.base_level, 1u)});
 		state.num_layers        = std::min(state.num_layers, view.layer_count);
 		state.num_color_attachments = std::max(state.num_color_attachments, target.target_slot + 1);
 		auto& attachment            = state.color_attachments[target.target_slot];
@@ -555,8 +557,12 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		              ImageSubresourceRange {view.base_level, view.level_count, view.base_layer,
 		                                     view.layer_count},
 		              buffer.Handle());
-		state.width               = std::min(state.width, depth.desc.info.extent.width);
-		state.height              = std::min(state.height, depth.desc.info.extent.height);
+		// The view's mip level, not the image's base size: a render area wider than the depth
+		// view is an NVIDIA "3D WIDTH ZT Violation" (graphics exception, device lost).
+		state.width  = std::min({state.width, std::max(depth.desc.info.extent.width >> view.base_level, 1u),
+		                         std::max(image.info.extent.width >> view.base_level, 1u)});
+		state.height = std::min({state.height, std::max(depth.desc.info.extent.height >> view.base_level, 1u),
+		                         std::max(image.info.extent.height >> view.base_level, 1u)});
 		state.num_layers          = std::min(state.num_layers, view.layer_count);
 		const auto aspects        = ImageViewOps::DepthAspectMask(depth.desc.view_info.format);
 		auto&      attachment     = state.depth_stencil_attachment;
