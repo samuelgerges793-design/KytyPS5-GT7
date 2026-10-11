@@ -15,6 +15,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "kernel/memory.h"
 
+#include <bit>
 #include <algorithm>
 #include <atomic>
 #include <cinttypes>
@@ -523,10 +524,8 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		// the access too (KYTY_READBACK_WINDOW_KB, e.g. 256; default 0 = just the access), so the
 		// next accesses do not each need one. Pages it hands back stay clean for CPU-write
 		// tracking. Opt-in: GT7 races froze more often with it (timing, see GT7-PROGRESS Day 6).
-		static const uint64_t window = [] {
-			const char* value = std::getenv("KYTY_READBACK_WINDOW_KB");
-			return (value != nullptr ? std::strtoull(value, nullptr, 10) : 0ull) * 1024ull;
-		}();
+		static LiveSetting window_kb("KYTY_READBACK_WINDOW_KB", 0);
+		const uint64_t     window = window_kb.Get() == 0 ? 0 : std::bit_floor(window_kb.Get()) * 1024ull;
 		uint64_t begin = vaddr;
 		uint64_t end   = vaddr + size;
 		if (window != 0) {

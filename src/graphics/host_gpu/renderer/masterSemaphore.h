@@ -131,12 +131,32 @@ enum class PerfCounter {
 	// All-zero command buffers waited for (yielding to other queues), and given up on.
 	ZeroBufferWait,
 	ZeroBufferGaveUp,
+	// End-of-pipe labels written when the GPU completes (KYTY_DEFERRED_LABELS).
+	DeferredLabel,
 	Count
 };
 void PerfAdd(PerfCounter counter, uint64_t nanoseconds);
+
+// Experimental switches that can change while the game runs: the value starts from the
+// environment variable of the same name (or the default) and follows NAME=value lines in
+// _kyty_live.txt in the working directory, reread with the perf report (every 5 s).
+class LiveSetting {
+public:
+	LiveSetting(const char* name, uint64_t default_value);
+	[[nodiscard]] uint64_t Get() const noexcept { return m_value.load(std::memory_order_relaxed); }
+
+	const char*           m_name;
+	uint64_t              m_initial = 0; // From the environment or the default.
+	std::atomic<uint64_t> m_value;
+};
+void ReloadLiveSettings();
+// Asks Windows not to throttle the emulator when its window is minimized or in the background.
+void DisablePowerThrottling();
 // Diagnostics (KYTY_WATCH_RANGE=hexaddr,hexsize): GPU writes into that range are logged.
 bool WatchedRange(uint64_t vaddr, uint64_t size);
 void NoteWatchedWrite(const std::string& what);
+// The GPU queue whose submission the GPU thread is processing (watch logs name it).
+void SetCurrentGpuQueue(int queue);
 void PerfReport(double fps);
 // Background compile threads yield to the game and GPU threads.
 void LowerCurrentThreadPriority();

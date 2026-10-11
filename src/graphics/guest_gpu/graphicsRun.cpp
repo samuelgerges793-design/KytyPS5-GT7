@@ -462,10 +462,8 @@ void GuestGpu::Enqueue(Submission submission) {
 	// rewrites buffers still queued here. Graphics submitters wait while KYTY_MAX_QUEUED_SUBMITS
 	// (default 0 = no limit) are queued, at most 250 ms in case the GPU thread waits for
 	// something the game does next. GT7's graphics queue never got deep, so this is opt-in.
-	static const uint32_t limit = [] {
-		const char* value = std::getenv("KYTY_MAX_QUEUED_SUBMITS");
-		return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 0u;
-	}();
+	static LiveSetting live_limit("KYTY_MAX_QUEUED_SUBMITS", 0);
+	const auto         limit = live_limit.Get();
 	if (limit != 0 && submission.queue_id == 0 && !IsGpuThread()) {
 		const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
 		while (m_queues[0].size() >= limit && m_accepting) {
@@ -541,7 +539,8 @@ void GuestGpu::ThreadRun(void* data) {
 			} else {
 				// KYTY_GPU_COMPUTE_FIRST: serve compute queues before graphics (experiment; the
 				// default is a plain round robin over all queues).
-				static const bool fair = std::getenv("KYTY_GPU_COMPUTE_FIRST") == nullptr;
+				static LiveSetting compute_first("KYTY_GPU_COMPUTE_FIRST", 0);
+				const bool         fair = compute_first.Get() == 0;
 				int selected_queue = -1;
 				for (uint32_t offset = 0; offset < QueueCount; offset++) {
 					const auto id = (gpu->m_next_queue + offset) % QueueCount;
@@ -557,8 +556,14 @@ void GuestGpu::ThreadRun(void* data) {
 					gpu->m_processing = false;
 					{
 						// Every queue is suspended on a wait packet; this polls for its condition.
+						// Deferred labels only appear once recorded work runs: submit it first and
+						// poll often.
+						static LiveSetting deferred("KYTY_DEFERRED_LABELS", 0);
+						if (deferred.Get() != 0) {
+							gpu->m_renderer.GetCommandScheduler().Flush();
+						}
 						PerfScope blocked(PerfCounter::GpuThreadBlocked);
-						gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
+						gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, deferred.Get() != 0 ? 1 : 100);
 					}
 					for (auto& queue: gpu->m_queues) {
 						if (!queue.empty()) {
@@ -576,6 +581,7 @@ void GuestGpu::ThreadRun(void* data) {
 				g_selections.fetch_add(1, std::memory_order_relaxed);
 				if (selected_queue == 0) g_graphics_selections.fetch_add(1, std::memory_order_relaxed);
 				g_running_queue.store(selected_queue, std::memory_order_relaxed);
+				SetCurrentGpuQueue(selected_queue);
 				g_running_since.store(std::chrono::steady_clock::now().time_since_epoch().count(),
 				                      std::memory_order_relaxed);
 				gpu->m_processing = true;
@@ -833,10 +839,8 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			// GT7 builds some command buffers with compute work on another queue; one read as
 			// zeros was not written yet. Yield to the other queues, as a wait packet does, and
 			// read it again; give up (padding) after KYTY_ZERO_IB_WAIT_MS (default 0 = off).
-			static const uint32_t wait_ms = [] {
-				const char* value = std::getenv("KYTY_ZERO_IB_WAIT_MS");
-				return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 0u;
-			}();
+			static LiveSetting live_wait("KYTY_ZERO_IB_WAIT_MS", 0);
+			const auto         wait_ms = live_wait.Get();
 			const auto now     = std::chrono::steady_clock::now();
 			auto [entry, fresh] = m_zero_buffer_waits.try_emplace(address, now);
 			if (wait_ms != 0 && now - entry->second < std::chrono::milliseconds(wait_ms)) {
@@ -846,8 +850,14 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			}
 			m_zero_buffer_waits.erase(entry);
 			PerfAdd(PerfCounter::ZeroBufferGaveUp, 0);
-		} else if (cursor.offset_dw == 0u && !m_zero_buffer_waits.empty()) {
-			m_zero_buffer_waits.erase(reinterpret_cast<uint64_t>(packet));
+		} else if (cursor.offset_dw == 0u) {
+			if (!m_zero_buffer_waits.empty()) {
+				m_zero_buffer_waits.erase(reinterpret_cast<uint64_t>(packet));
+			}
+			if (WatchedRange(reinterpret_cast<uint64_t>(packet), 4)) {
+				NoteWatchedWrite(fmt::format("read commands 0x{:x} ({} dwords) first 0x{:08x}",
+				                             reinterpret_cast<uint64_t>(packet), total_dw, packet[0]));
+			}
 		}
 		// GT7 submits command buffers whose tail is zero-filled; treat zero dwords as padding.
 		if (packet_header == 0u) {
@@ -1208,6 +1218,29 @@ void CommandProcessor::WaitFlipDone(uint32_t video_out_handle, uint32_t display_
 	                                      static_cast<int>(display_buffer_index));
 }
 
+// The guest waits on end-of-pipe labels before reusing memory the GPU work touches. Written at
+// record time (the default), the game runs ahead of the GPU and rewrites buffers (command
+// buffers among them) that work still to run will overwrite or read. With KYTY_DEFERRED_LABELS
+// the label is written when the GPU has finished everything recorded so far.
+void CommandProcessor::PublishLabel(void* dst, const void* src, size_t size) {
+	static LiveSetting deferred("KYTY_DEFERRED_LABELS", 0);
+	if (deferred.Get() == 0 || size > 8u) {
+		std::memcpy(dst, src, size);
+		return;
+	}
+	std::array<uint8_t, 8> bytes {};
+	std::memcpy(bytes.data(), src, size);
+	const auto address = reinterpret_cast<uint64_t>(dst);
+	auto&      cache   = m_renderer.GetBufferCache();
+	PerfAdd(PerfCounter::DeferredLabel, 0);
+	m_renderer.GetCommandScheduler().DeferPriorityOperation([&cache, address, bytes, size] {
+		// Through the backing (the page may be GPU-owned and protected), queued for the GPU copy.
+		if (!cache.StoreCpuBytes(address, bytes.data(), static_cast<uint32_t>(size))) {
+			std::memcpy(reinterpret_cast<void*>(address), bytes.data(), size);
+		}
+	});
+}
+
 template <typename T>
 void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_write_dest,
                                         uint32_t eop_event_type, uint32_t cache_action,
@@ -1260,7 +1293,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 	auto write32 = [&](bool with_writeback) {
 		auto* dst  = static_cast<uint32_t*>(dst_gpu_addr);
 		auto  data = static_cast<uint32_t>(value);
-		std::memcpy(dst, &data, sizeof(data));
+		PublishLabel(dst, &data, sizeof(data));
 
 		if (with_interrupt) {
 			if (with_writeback) {
@@ -1314,7 +1347,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 				}
 				auto write64 = [&](bool with_writeback) {
 					auto* dst = static_cast<uint64_t*>(dst_gpu_addr);
-					std::memcpy(dst, &value, sizeof(value));
+					PublishLabel(dst, &value, sizeof(value));
 
 					if (with_interrupt) {
 						if (with_writeback) {

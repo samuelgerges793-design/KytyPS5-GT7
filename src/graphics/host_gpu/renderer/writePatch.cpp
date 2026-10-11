@@ -165,10 +165,8 @@ bool YmmUpper(CONTEXT& context, uint32_t index, uint8_t* out) {
 	DWORD64 features = 0;
 	// A context that carries extended state but not the AVX component: assumed to hold YMM upper
 	// halves in their initial state (zero). Unverified; KYTY_YMM_ASSUME_ZERO=0 refuses instead.
-	static const bool assume_zero = [] {
-		const char* value = std::getenv("KYTY_YMM_ASSUME_ZERO");
-		return value == nullptr || value[0] != '0';
-	}();
+	static LiveSetting live_assume_zero("KYTY_YMM_ASSUME_ZERO", 1);
+	const bool         assume_zero = live_assume_zero.Get() != 0;
 	if ((context.ContextFlags & CONTEXT_XSTATE) == CONTEXT_XSTATE &&
 	    GetXStateFeaturesMask(&context, &features) && (features & XSTATE_MASK_AVX) == 0) {
 		PerfAdd(PerfCounter::YmmAssumedZero, 0);
@@ -366,10 +364,8 @@ bool BurstLimited(uint64_t page) {
 		uint32_t                              count = 0;
 	};
 	// KYTY_WRITE_PATCH_BURST: stores per page per 50 ms before handing the page over (0 = never).
-	static const uint32_t limit = [] {
-		const char* value = std::getenv("KYTY_WRITE_PATCH_BURST");
-		return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 64u;
-	}();
+	static LiveSetting live_limit("KYTY_WRITE_PATCH_BURST", 64);
+	const auto         limit = live_limit.Get();
 	if (limit == 0) {
 		return false;
 	}

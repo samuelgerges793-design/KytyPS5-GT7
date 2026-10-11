@@ -7,6 +7,8 @@
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
+#include <fstream>
+#include <filesystem>
 #include <windows.h>
 #endif
 
@@ -161,6 +163,65 @@ std::vector<uint64_t> ParseHashList(const char* name) {
 
 } // namespace
 
+namespace {
+std::mutex&                       LiveMutex() { static std::mutex m; return m; }
+std::vector<LiveSetting*>&        LiveRegistry() { static std::vector<LiveSetting*> r; return r; }
+std::map<std::string, uint64_t>&  LiveFileValues() { static std::map<std::string, uint64_t> v; return v; }
+} // namespace
+
+LiveSetting::LiveSetting(const char* name, uint64_t default_value): m_name(name), m_value(default_value) {
+	if (const char* env = std::getenv(name); env != nullptr) {
+		m_value.store(std::strtoull(env, nullptr, 0), std::memory_order_relaxed);
+	}
+	m_initial = m_value.load(std::memory_order_relaxed);
+	std::scoped_lock lock(LiveMutex());
+	if (const auto found = LiveFileValues().find(name); found != LiveFileValues().end()) {
+		m_value.store(found->second, std::memory_order_relaxed);
+	}
+	LiveRegistry().push_back(this);
+}
+
+void ReloadLiveSettings() {
+	static std::filesystem::file_time_type last {};
+	std::error_code                       error;
+	const auto time = std::filesystem::last_write_time("_kyty_live.txt", error);
+	if (error || time == last) {
+		return;
+	}
+	last = time;
+	std::ifstream                   file("_kyty_live.txt");
+	std::map<std::string, uint64_t> values;
+	for (std::string line; std::getline(file, line);) {
+		const auto equals = line.find('=');
+		if (equals == std::string::npos || line.empty() || line[0] == '#') continue;
+		auto name = line.substr(0, equals);
+		while (!name.empty() && (name.back() == ' ' || name.back() == '\t')) name.pop_back();
+		values[name] = std::strtoull(line.c_str() + equals + 1, nullptr, 0);
+	}
+	std::scoped_lock lock(LiveMutex());
+	LiveFileValues() = values;
+	for (auto* setting: LiveRegistry()) {
+		// Names missing from the file return to their starting value.
+		const auto found = values.find(setting->m_name);
+		const auto value = found != values.end() ? found->second : setting->m_initial;
+		if (value != setting->Get()) {
+			setting->m_value.store(value, std::memory_order_relaxed);
+			Log::WriteToConsoleAndLog(fmt::format("live: {}={}\n", setting->m_name, value));
+		}
+	}
+	Log::WriteToConsoleAndLog("live: settings file read\n");
+}
+
+void DisablePowerThrottling() {
+#ifdef _WIN32
+	PROCESS_POWER_THROTTLING_STATE state {};
+	state.Version     = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+	state.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION;
+	state.StateMask   = 0;
+	(void)SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &state, sizeof(state));
+#endif
+}
+
 bool WatchedRange(uint64_t vaddr, uint64_t size) {
 	static const std::pair<uint64_t, uint64_t> range = [] {
 		std::pair<uint64_t, uint64_t> result {0, 0};
@@ -174,10 +235,16 @@ bool WatchedRange(uint64_t vaddr, uint64_t size) {
 	return range.second != 0 && vaddr < range.first + range.second && range.first < vaddr + size;
 }
 
+static std::atomic<int> g_current_gpu_queue {-1};
+
+void SetCurrentGpuQueue(int queue) {
+	g_current_gpu_queue.store(queue, std::memory_order_relaxed);
+}
+
 void NoteWatchedWrite(const std::string& what) {
 	static std::atomic<uint32_t> logged {0};
-	if (logged.fetch_add(1, std::memory_order_relaxed) < 400) {
-		Log::WriteToConsoleAndLog("watch: " + what + "\n");
+	if (logged.fetch_add(1, std::memory_order_relaxed) < 600) {
+		Log::WriteToConsoleAndLog(fmt::format("watch [queue {}]: {}\n", g_current_gpu_queue.load(), what));
 	}
 }
 
@@ -266,6 +333,7 @@ void PerfReport(double fps) {
 	static uint64_t last = PerfNow();
 	const auto      now  = PerfNow();
 	if (now - last < 5'000'000'000ull) return;
+	ReloadLiveSettings();
 	const double seconds = static_cast<double>(now - last) / 1e9;
 	last                 = now;
 	static constexpr const char* Names[] = {"gpu-wait",      "shader-read-sync", "serialized-dispatch",
@@ -290,7 +358,8 @@ void PerfReport(double fps) {
 	                                        "refused-other", "readback-explicit", "ymm-assumed-zero",
 	                                        "verify-match", "verify-MISMATCH",
 	                                        "readback-window-MB", "submit-queue-wait",
-	                                        "submit-queue-timeout", "zero-ib-wait", "zero-ib-gave-up"};
+	                                        "submit-queue-timeout", "zero-ib-wait", "zero-ib-gave-up",
+	                                        "deferred-labels"};
 	std::string text = fmt::format("perf: {:.1f} fps | longest-gpu-wait {:.0f} ms |", fps,
 	                               static_cast<double>(g_longest_wait_ns.exchange(0)) / 1e6);
 	for (size_t i = 0; i < g_perf.size(); i++) {

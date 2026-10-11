@@ -160,6 +160,8 @@ public:
 	void SyncCommandMemory(std::span<const uint32_t> commands);
 
 private:
+	// End-of-pipe label write: now, or when the GPU finishes the work (KYTY_DEFERRED_LABELS).
+	void PublishLabel(void* dst, const void* src, size_t size);
 	// All-zero command buffers being waited for (address -> first seen), see ProcessPm4.
 	std::unordered_map<uint64_t, std::chrono::steady_clock::time_point> m_zero_buffer_waits;
 	template <typename T>
