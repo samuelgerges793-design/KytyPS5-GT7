@@ -951,6 +951,12 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		        (pipeline_bind_point == vk::PipelineBindPoint::eCompute &&
 		         shader_stage != vk::ShaderStageFlagBits::eCompute));
 	}
+	for (const auto* prepared: prepared_bindings) {
+		if (prepared->runtime->program->has_address_writes) {
+			m_context.GetBufferCache().NoteAddressWrites();
+			break;
+		}
+	}
 	for (const auto* reader: prepared_bindings) {
 		const auto& reads = reader->runtime->resources->specialization_reads;
 		if (reads.empty()) continue;

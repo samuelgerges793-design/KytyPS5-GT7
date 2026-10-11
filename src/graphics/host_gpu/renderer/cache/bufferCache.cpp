@@ -457,6 +457,21 @@ uint64_t BufferCache::SyncGpuWrittenRange(uint64_t vaddr, uint64_t size) {
 	    !IsRegionRegistered(vaddr, size) || m_scheduler.Current().IsInvalid()) {
 		return 0;
 	}
+	// Pages synced after the last raw-address write work cannot hold newer GPU bytes.
+	bool stale = false;
+	for (uint64_t page = vaddr >> 12u; page <= (vaddr + size - 1u) >> 12u; page++) {
+		const auto found = m_command_page_epochs.find(page);
+		stale |= found == m_command_page_epochs.end() || found->second != m_address_write_epoch;
+	}
+	if (!stale) {
+		return 0;
+	}
+	if (m_command_page_epochs.size() > 65536) {
+		m_command_page_epochs.clear();
+	}
+	for (uint64_t page = vaddr >> 12u; page <= (vaddr + size - 1u) >> 12u; page++) {
+		m_command_page_epochs[page] = m_address_write_epoch;
+	}
 	PerfScope perf(PerfCounter::CommandMemorySync);
 	FlushCpuWrites();
 	auto&      buffer = m_slot_buffers[FindBuffer(vaddr, size)];

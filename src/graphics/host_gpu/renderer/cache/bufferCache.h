@@ -11,12 +11,13 @@
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
+#include <array>
 #include <map>
+#include <mutex>
 #include <span>
+#include <unordered_map>
 #include <utility>
 #include <vector>
-#include <array>
-#include <mutex>
 
 namespace Libs::Graphics {
 
@@ -95,6 +96,9 @@ public:
 	// (except on pages the CPU changed since), so commands the GPU wrote through raw addresses
 	// are seen. Returns the number of bytes that differed.
 	uint64_t           SyncGpuWrittenRange(uint64_t vaddr, uint64_t size);
+	// GPU thread: work recorded with a shader that writes through raw addresses. Command memory
+	// synced since the last such work is skipped.
+	void               NoteAddressWrites() { m_address_write_epoch++; }
 
 private:
 	friend struct BufferCacheTestAccess;
@@ -133,6 +137,8 @@ private:
 		uint32_t                size    = 0;
 		std::array<uint8_t, 32> bytes {};
 	};
+	uint64_t                               m_address_write_epoch = 1;
+	std::unordered_map<uint64_t, uint64_t> m_command_page_epochs;
 	std::mutex                   m_cpu_store_mutex;
 	std::vector<PendingCpuStore> m_cpu_stores;
 	[[nodiscard]] vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
