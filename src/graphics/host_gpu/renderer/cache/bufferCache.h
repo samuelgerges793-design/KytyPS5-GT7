@@ -102,7 +102,8 @@ public:
 	// Writable bindings mark their whole range GPU-written. At the end of each command buffer,
 	// the pages marked in it are copied back; when that work completes, pages whose GPU bytes
 	// equal guest memory (the shaders did not change them) are released to the CPU, unless a
-	// later command buffer marked them again. KYTY_NO_WRITE_VERIFY turns it off.
+	// later command buffer marked them again. Opt-in (KYTY_WRITE_VERIFY): GT7 marks the same
+	// pages again every frame, so it released little for its copying.
 	void               RecordWriteVerification();
 
 private:

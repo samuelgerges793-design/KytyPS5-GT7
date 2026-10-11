@@ -818,7 +818,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
 	if (is_written) {
 		m_gpu_modified_ranges.Add(vaddr, size);
-		static const bool verify = std::getenv("KYTY_NO_WRITE_VERIFY") == nullptr;
+		static const bool verify = std::getenv("KYTY_WRITE_VERIFY") != nullptr;
 		if (verify) {
 			const auto tick = m_scheduler.CurrentTick();
 			for (uint64_t page = vaddr >> 12u; page <= (vaddr + size - 1u) >> 12u; page++) {
