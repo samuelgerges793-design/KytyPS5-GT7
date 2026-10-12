@@ -944,14 +944,17 @@ void EmitProgram(EmitterState& state) {
 				                          TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
 				                          counter, spv::StorageClassFunction);
 				state.loop_watchdogs.emplace(block, counter);
-				if (reset_counters) {
-					if (const auto* merge = innermost_merge(block); merge != nullptr) {
-						state.loop_watchdog_resets[merge].push_back(counter);
-					}
-				}
 				if (!waterfall_ranges.empty() && in_waterfall(block)) {
 					state.loop_watchdog_waterfalls.insert(block);
 					g_last_waterfall_guards++;
+					// Waterfall loops end on their own (each pass retires a lane): restart their count
+					// each time they are entered. Other loops keep one count per invocation, which
+					// bounds runaway nested loops (resetting those too gave 1.3 s GPU stalls in GT7).
+					if (reset_counters) {
+						if (const auto* merge = innermost_merge(block); merge != nullptr) {
+							state.loop_watchdog_resets[merge].push_back(counter);
+						}
+					}
 				}
 			}
 		}

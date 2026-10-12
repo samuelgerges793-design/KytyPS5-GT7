@@ -475,13 +475,13 @@ struct ProfileSlice {
 };
 constexpr uint32_t                       ProfileSliceSize  = 4096;
 constexpr uint32_t                       ProfileSliceCount = 128;
-vk::QueryPool                            g_profile_pool    = nullptr;
-vk::Device                               g_profile_device  = nullptr;
-float                                    g_profile_period  = 1.0f;
-std::array<ProfileSlice, ProfileSliceCount> g_profile_slices;
-uint32_t                                 g_profile_next    = 0;
-ProfileSlice*                            g_profile_current = nullptr;
-uint32_t                                 g_profile_base    = 0;
+thread_local vk::QueryPool               g_profile_pool    = nullptr;
+thread_local vk::Device                  g_profile_device  = nullptr;
+thread_local float                       g_profile_period  = 1.0f;
+thread_local std::array<ProfileSlice, ProfileSliceCount> g_profile_slices;
+thread_local uint32_t                    g_profile_next    = 0;
+thread_local ProfileSlice*               g_profile_current = nullptr;
+thread_local uint32_t                    g_profile_base    = 0;
 std::mutex                               g_profile_mutex;
 std::unordered_map<uint64_t, std::pair<uint64_t, uint64_t>> g_profile_totals; // label -> ns, count
 
