@@ -319,6 +319,7 @@ private:
 	// m_completed_store_seq on may not be in the GPU's copy yet.
 	std::deque<std::pair<uint64_t, uint64_t>> m_store_flushes;
 	uint64_t                  m_completed_store_seq = 0;
+	uint64_t                  m_last_flush_store    = 0; // store sequence at the last FlushCpuWrites
 	vk::CommandPool           m_rb_pool[2]    = {};
 	vk::CommandBuffer         m_rb_command[2] = {};
 	vk::Fence                 m_rb_fence[2]   = {};

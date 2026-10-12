@@ -944,8 +944,10 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 				native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost, {}, 1,
 				                       &after, 0, nullptr, 0, nullptr);
 				prefetch_seq = m_write_seq;
+				// Stores since the last flush are not in the GPU copy (they upload at the next flush,
+				// after the copy): replay from there when the copy is handed over.
 				std::scoped_lock lock(m_cpu_store_mutex);
-				prefetch_store = m_recent_store_count;
+				prefetch_store = m_last_flush_store;
 			} else {
 				prefetch_copies.clear();
 			}
@@ -1692,13 +1694,18 @@ void BufferCache::FlushCpuWrites() {
 	std::vector<std::pair<uint64_t, uint64_t>> ranges;
 	{
 		std::scoped_lock lock(m_cpu_store_mutex);
-		if (m_cpu_stores.empty() || m_scheduler.Current().IsInvalid()) {
+		if (m_cpu_stores.empty()) {
+			m_last_flush_store = m_recent_store_count; // Every store so far is uploaded.
+			return;
+		}
+		if (m_scheduler.Current().IsInvalid()) {
 			return; // Kept for the next flush.
 		}
 		ranges.reserve(m_cpu_stores.size());
 		for (const auto& store: m_cpu_stores) ranges.emplace_back(store.address, store.size);
 		m_cpu_stores.clear();
 		m_store_flushes.emplace_back(m_scheduler.CurrentTick(), m_recent_store_count);
+		m_last_flush_store = m_recent_store_count;
 	}
 	std::ranges::sort(ranges);
 	// Merge touching and overlapping stores only: bytes between them are stale guest copies of
