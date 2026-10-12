@@ -1251,9 +1251,15 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (state.ps_active && HasShaderBufferWrites(state.ps_input_info.stage)) {
 		shader_write_stages |= vk::PipelineStageFlagBits::eFragmentShader;
 	}
+	// KYTY_SKIP_DRAW_WRITE_BARRIER=1 (experiment, unsafe): no render-pass break and barrier after
+	// draws whose shaders write buffers (each break stores and reloads the render targets).
+	static LiveSetting skip_write_barrier("KYTY_SKIP_DRAW_WRITE_BARRIER", 0);
 	if (shader_write_stages) {
-		m_context.GetCommandScheduler().EndRendering();
-		ShaderWriteBarrier(vk_buffer, shader_write_stages);
+		PerfAdd(PerfCounter::DrawWriteBarrier, 0);
+		if (skip_write_barrier.Get() == 0) {
+			m_context.GetCommandScheduler().EndRendering();
+			ShaderWriteBarrier(vk_buffer, shader_write_stages);
+		}
 	}
 	LogDrawPhase(draw.Name(), "DrawComplete");
 	if (!draw.IsIndexed()) {

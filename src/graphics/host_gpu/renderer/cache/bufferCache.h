@@ -279,6 +279,25 @@ private:
 	std::deque<InflightWrite> m_inflight_writes;
 	uint64_t                  m_inflight_dropped_tick = 0;
 	void                      NoteGpuWrite(uint64_t vaddr, uint64_t size);
+	// Readback prefetch (KYTY_READBACK_PREFETCH_KB): GPU-written pages around a readback are
+	// copied in the same wait but kept here, and handed to the guest only when it touches them,
+	// if no GPU write was recorded on them since (m_write_marks).
+	struct PrefetchedPage {
+		std::array<uint8_t, 4096>                  bytes {};
+		std::vector<std::pair<uint16_t, uint16_t>> ranges; // offset, size within the page
+		uint64_t                                   write_seq   = 0;
+		uint64_t                                   first_store = 0;
+	};
+	struct WriteMark {
+		uint64_t begin;
+		uint64_t end;
+		uint64_t seq;
+	};
+	std::unordered_map<uint64_t, std::unique_ptr<PrefetchedPage>> m_prefetched;
+	std::deque<WriteMark>     m_write_marks;
+	uint64_t                  m_write_seq = 0;
+	void                      LogWriteMark(uint64_t begin, uint64_t end);
+	bool                      TryPublishPrefetched(uint64_t vaddr, uint64_t size);
 	// Writes noted from m_open_writes on belong to work not recorded yet (a sync between binding
 	// and the draw moves it to a later tick): they count as the current tick until committed.
 	size_t                    m_open_writes = 0;

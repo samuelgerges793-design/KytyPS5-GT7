@@ -723,13 +723,71 @@ void BufferCache::CommitGpuWrites() {
 }
 
 void BufferCache::NoteAddressWrites() {
+	LogWriteMark(0, UINT64_MAX);
 	m_address_write_epoch++;
 	m_address_write_tick = m_scheduler.CurrentTick();
 	m_address_write_open = true;
 }
 
+void BufferCache::LogWriteMark(uint64_t begin, uint64_t end) {
+	m_write_marks.push_back({begin, end, ++m_write_seq});
+	if (m_write_marks.size() > 65536) m_write_marks.pop_front();
+}
+
+bool BufferCache::TryPublishPrefetched(uint64_t vaddr, uint64_t size) {
+	if (m_prefetched.empty()) return false;
+	const auto first_page = vaddr >> 12u;
+	const auto last_page  = (vaddr + size - 1u) >> 12u;
+	// Every page must have a copy that no recorded GPU write has made stale.
+	for (uint64_t page = first_page; page <= last_page; page++) {
+		const auto found = m_prefetched.find(page);
+		if (found == m_prefetched.end()) return false;
+		const auto& entry = *found->second;
+		bool        stale = m_write_marks.empty() ? false : m_write_marks.front().seq > entry.write_seq + 1u;
+		uint32_t    scanned = 0;
+		for (auto it = m_write_marks.rbegin(); !stale && it != m_write_marks.rend() && it->seq > entry.write_seq; ++it) {
+			stale = (it->begin < ((page + 1u) << 12u) && (page << 12u) < it->end) || ++scanned > 8192u;
+		}
+		{
+			std::scoped_lock lock(m_cpu_store_mutex);
+			stale |= m_recent_store_count - entry.first_store > m_recent_stores.size() / 2;
+		}
+		if (stale) {
+			m_prefetched.erase(found);
+			PerfAdd(PerfCounter::PrefetchStale, 0);
+			return false;
+		}
+	}
+	std::scoped_lock lock(m_cpu_store_mutex);
+	for (uint64_t page = first_page; page <= last_page; page++) {
+		const auto  found   = m_prefetched.find(page);
+		const auto& entry   = *found->second;
+		const auto  address = page << 12u;
+		for (const auto [offset, bytes]: entry.ranges) {
+			// Only bytes the GPU still owns: others were handed over or rewritten since.
+			m_gpu_modified_ranges.ForEachInRange(address + offset, bytes, [&](uint64_t start, uint64_t end) {
+				Libs::LibKernel::Memory::WriteBacking(start, entry.bytes.data() + (start - address), end - start);
+			});
+			m_gpu_modified_ranges.Subtract(address + offset, bytes);
+		}
+		const auto replay = [&](const auto& store) {
+			if (store.address < address + 0x1000u && address < store.address + store.size) {
+				Libs::LibKernel::Memory::WriteBacking(store.address, store.bytes.data(), store.size);
+			}
+		};
+		for (uint64_t sequence = entry.first_store; sequence < m_recent_store_count; sequence++) {
+			replay(m_recent_stores[sequence % m_recent_stores.size()]);
+		}
+		for (const auto& store: m_cpu_stores) replay(store);
+		m_memory_tracker.UnmarkRegionAsGpuModified(address, 0x1000);
+		m_prefetched.erase(found);
+	}
+	return true;
+}
+
 void BufferCache::NoteGpuWrite(uint64_t vaddr, uint64_t size) {
 	DebugNoteWrite(vaddr, size, 'b');
+	LogWriteMark(vaddr, vaddr + size);
 	const auto tick = m_scheduler.CurrentTick();
 	if (!m_inflight_writes.empty()) {
 		const auto& last = m_inflight_writes.back();
@@ -825,9 +883,100 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 				return;
 			}
 		}
-		if (DownloadBufferMemory<false>(buffer, begin, end - begin)) {
+		static LiveSetting prefetch_kb("KYTY_READBACK_PREFETCH_KB", 0);
+		std::unique_ptr<Buffer>     prefetch;
+		std::vector<vk::BufferCopy> prefetch_copies;
+		uint64_t                    prefetch_seq   = 0;
+		uint64_t                    prefetch_store = 0;
+		if (window == 0 && prefetch_kb.Get() != 0) {
+			if (TryPublishPrefetched(vaddr, size)) {
+				PerfAdd(PerfCounter::PrefetchHit, 0);
+				if (is_write) m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+				return;
+			}
+			const uint64_t pf         = std::bit_floor(prefetch_kb.Get()) * 1024ull;
+			const auto     pf_begin   = std::max(buffer.CpuAddress(), vaddr & ~(pf - 1u));
+			const auto     pf_end     = std::min(buffer.CpuAddress() + buffer.Size(), (vaddr + size + pf - 1u) & ~(pf - 1u));
+			const auto     page_begin = vaddr & ~uint64_t {0xfff};
+			const auto     page_end   = (vaddr + size + 0xfffu) & ~uint64_t {0xfff};
+			// Pages a bound but not yet recorded draw writes are left out: the copy would come first.
+			const auto open_write = [&](uint64_t page_address) {
+				if (m_address_write_open) return true;
+				for (size_t i = m_open_writes; i < m_inflight_writes.size(); i++) {
+					const auto& w = m_inflight_writes[i];
+					if (w.begin < page_address + 0x1000u && page_address < w.end) return true;
+				}
+				return false;
+			};
+			uint64_t total = 0;
+			if (pf_begin < pf_end) {
+				m_memory_tracker.ForEachDownloadRange<false>(
+				    pf_begin, pf_end - pf_begin, [&](uint64_t address, uint64_t bytes) noexcept {
+					    m_gpu_modified_ranges.ForEachInRange(address, bytes, [&](uint64_t start, uint64_t end) {
+						    for (uint64_t cursor = start; cursor < end;) {
+							    const auto page_address = cursor & ~uint64_t {0xfff};
+							    const auto stop         = std::min(end, page_address + 0x1000u);
+							    if ((page_address < page_begin || page_address >= page_end) && !open_write(page_address)) {
+								    prefetch_copies.emplace_back(cursor - buffer.CpuAddress(), total, stop - cursor);
+								    total += Common::AlignUp(stop - cursor, 16);
+							    }
+							    cursor = stop;
+						    }
+					    });
+				    });
+			}
+			if (!prefetch_copies.empty() && total <= 4 * MiB) {
+				prefetch = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
+				                                    vk::BufferUsageFlagBits::eTransferDst, total);
+				auto& command = m_scheduler.Current();
+				command.EndRendering();
+				const auto        native = command.Handle();
+				vk::MemoryBarrier before {};
+				before.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
+				before.dstAccessMask = vk::AccessFlagBits::eTransferRead;
+				native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eTransfer, {}, 1,
+				                       &before, 0, nullptr, 0, nullptr);
+				native.copyBuffer(buffer.Handle(), prefetch->Handle(), static_cast<uint32_t>(prefetch_copies.size()),
+				                  prefetch_copies.data());
+				vk::MemoryBarrier after {};
+				after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+				after.dstAccessMask = vk::AccessFlagBits::eHostRead;
+				native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost, {}, 1,
+				                       &after, 0, nullptr, 0, nullptr);
+				prefetch_seq = m_write_seq;
+				std::scoped_lock lock(m_cpu_store_mutex);
+				prefetch_store = m_recent_store_count;
+			} else {
+				prefetch_copies.clear();
+			}
+		}
+		const bool downloaded = DownloadBufferMemory<false>(buffer, begin, end - begin);
+		if (downloaded) {
 			m_memory_tracker.UnmarkRegionAsGpuModified(begin, end - begin);
 			PerfAdd(PerfCounter::ReadbackWindowBytes, end - begin);
+		}
+		if (prefetch) {
+			// The download waited for the whole tick, which holds the prefetch copies too.
+			if (downloaded) {
+				prefetch->Invalidate(0, prefetch->Size());
+				const auto* mapped = prefetch->Mapped().data();
+				if (m_prefetched.size() > 8192) m_prefetched.clear();
+				for (const auto& copy: prefetch_copies) {
+					const auto address = buffer.CpuAddress() + copy.srcOffset;
+					const auto page    = address >> 12u;
+					auto&      entry   = m_prefetched[page];
+					if (!entry || entry->write_seq != prefetch_seq) {
+						entry              = std::make_unique<PrefetchedPage>();
+						entry->write_seq   = prefetch_seq;
+						entry->first_store = prefetch_store;
+					}
+					const auto offset = address & 0xfffu;
+					std::memcpy(entry->bytes.data() + offset, mapped + copy.dstOffset, copy.size);
+					entry->ranges.emplace_back(static_cast<uint16_t>(offset), static_cast<uint16_t>(copy.size));
+				}
+				PerfAdd(PerfCounter::PrefetchPages, prefetch_copies.size());
+			}
+			m_scheduler.DeferOperation([owner = std::move(prefetch)]() mutable { owner.reset(); });
 		}
 		if (is_write) {
 			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);

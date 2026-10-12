@@ -140,6 +140,13 @@ enum class PerfCounter {
 	ReadbackWriterRecording,
 	// Readbacks copied on the second queue (time is the copy wait).
 	ReadbackSideQueue,
+	// Draws followed by a render-pass break and barrier because their shaders write buffers.
+	DrawWriteBarrier,
+	// Readback prefetch: readbacks served from earlier copies, copies dropped as stale, and
+	// page pieces prefetched.
+	PrefetchHit,
+	PrefetchStale,
+	PrefetchPages,
 	Count
 };
 void PerfAdd(PerfCounter counter, uint64_t nanoseconds);
