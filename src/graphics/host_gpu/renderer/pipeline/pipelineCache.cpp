@@ -1424,7 +1424,17 @@ void PipelineCache::InitializeDriverCache(const std::filesystem::path& cache_pat
 		Common::File file(m_driver_cache_path, Common::File::Mode::Read);
 		const auto   file_size = file.IsInvalid() ? 0 : file.Size();
 		const auto   signature = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
-		if (file_size >= signature.size() + sizeof(uint64_t) &&
+		// The driver cache only grows: past KYTY_PIPELINE_CACHE_MAX_MB (default 1536) it starts over,
+		// as GT7's reached the 4 GiB save limit and every later save failed.
+		static const uint64_t max_bytes = [] {
+			const char* env = std::getenv("KYTY_PIPELINE_CACHE_MAX_MB");
+			return (env != nullptr ? std::strtoull(env, nullptr, 10) : 1536ull) * 1024ull * 1024ull;
+		}();
+		if (file_size > max_bytes) {
+			file.Close();
+			PipelineCacheLog("Vulkan pipeline cache: {} is {} MB, over the limit; starting empty", path,
+			                 file_size >> 20u);
+		} else if (file_size >= signature.size() + sizeof(uint64_t) &&
 		    file_size <= std::numeric_limits<uint32_t>::max()) {
 			std::string cached_signature(signature.size(), '\0');
 			uint64_t    payload_hash = 0;
