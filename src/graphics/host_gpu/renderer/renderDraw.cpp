@@ -1225,6 +1225,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x500u);
 	}
+	m_context.GetCommandScheduler().ProfileMark('?', 0);
 	if (mesh_active) {
 		vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
 	} else {
@@ -1232,6 +1233,11 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			EmitDrawPrimitives(ucfg, vk_buffer, draw, emit);
 		}
 	}
+	if (GpuProfileEnabled()) {
+		const auto ps = GpuProfileLastShader(2);
+		m_context.GetCommandScheduler().ProfileMark('D', ps != 0 ? ps : GpuProfileLastShader(1));
+	}
+	m_context.GetBufferCache().CommitGpuWrites();
 
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x600u);

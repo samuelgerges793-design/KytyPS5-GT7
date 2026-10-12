@@ -26,6 +26,8 @@ public:
 	void           Begin(HW::Context& registers, HW::UserConfig& user_config, HW::Shader& shaders);
 	void           BeginRendering(const RenderState& state);
 	void           EndRendering();
+	// KYTY_GPU_PROFILE: GPU time from the previous mark to here is charged to this label.
+	void           ProfileMark(char kind, uint64_t hash);
 	void           Flush();
 	void           Flush(SubmitInfo& submit);
 	void           FlushAndWait();

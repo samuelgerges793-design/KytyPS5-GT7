@@ -335,6 +335,8 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 	EXIT_IF(!m_command.IsInvalid());
 	m_command.m_buffer = m_command_pool.Commit();
 	m_command.Begin();
+	GpuProfileBegin(m_graphics.device, m_graphics.GetPhysicalDeviceProperties().limits.timestampPeriod,
+	                m_command.m_buffer, m_master.CurrentTick(), m_master.KnownGpuTick());
 	m_dynamic_state.Invalidate();
 	return m_command;
 }
@@ -349,6 +351,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		m_pre_submit->RecordWriteVerification();
 		m_in_pre_submit = false;
 	}
+	GpuProfileEnd(m_command.m_buffer);
 	m_command.End();
 	const auto buffer   = m_command.m_buffer;
 	auto&      graphics = m_graphics;
@@ -395,6 +398,10 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		DebugClearNotedShaders();
 	}
 	return tick;
+}
+
+void CommandScheduler::ProfileMark(char kind, uint64_t hash) {
+	if (!m_command.IsInvalid()) GpuProfileMark(m_command.m_buffer, kind, hash);
 }
 
 void CommandScheduler::BeginNext() {

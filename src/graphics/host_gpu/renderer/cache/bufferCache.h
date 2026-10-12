@@ -21,6 +21,7 @@
 #include <span>
 #include <unordered_map>
 #include <utility>
+#include <deque>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -118,7 +119,11 @@ public:
 	[[nodiscard]] std::string DescribeRecentStores(uint64_t vaddr, uint64_t size);
 	// GPU thread: work recorded with a shader that writes through raw addresses. Command memory
 	// synced since the last such work is skipped.
-	void               NoteAddressWrites() { m_address_write_epoch++; }
+	void               NoteAddressWrites();
+	// Called once the draw, dispatch or copy that bound written ranges is recorded.
+	void               CommitGpuWrites();
+	// Draws and dispatches recorded into the current tick so far.
+	[[nodiscard]] uint32_t WorkInCurrentTick();
 	// Writable bindings mark their whole range GPU-written. At the end of each command buffer,
 	// the pages marked in it are copied back; when that work completes, pages whose GPU bytes
 	// equal guest memory (the shaders did not change them) are released to the CPU, unless a
@@ -233,6 +238,9 @@ private:
 	std::unordered_set<uint64_t>                        m_track_last_written;
 	std::unordered_set<uint64_t>                        m_track_last_tracked;
 	uint64_t                               m_address_write_epoch = 1;
+	// Tick of the last work that writes through raw addresses (anywhere in guest memory).
+	uint64_t                               m_address_write_tick  = 0;
+	bool                                   m_address_write_open  = false;
 	std::unordered_map<uint64_t, uint64_t> m_command_page_epochs;
 	std::mutex                   m_cpu_store_mutex;
 	std::vector<PendingCpuStore> m_cpu_stores;
@@ -261,6 +269,44 @@ private:
 	BufferMap                                         m_buffers;
 	PageTable                                         m_page_table;
 	RangeSet                                          m_gpu_modified_ranges;
+	// GPU writes recorded since the last completed tick (oldest first): which readbacks need to
+	// wait for which work.
+	struct InflightWrite {
+		uint64_t begin;
+		uint64_t end;
+		uint64_t tick;
+	};
+	std::deque<InflightWrite> m_inflight_writes;
+	uint64_t                  m_inflight_dropped_tick = 0;
+	void                      NoteGpuWrite(uint64_t vaddr, uint64_t size);
+	// Writes noted from m_open_writes on belong to work not recorded yet (a sync between binding
+	// and the draw moves it to a later tick): they count as the current tick until committed.
+	size_t                    m_open_writes = 0;
+	uint64_t                  m_work_tick  = 0;
+	uint32_t                  m_work_count = 0;
+	// Diagnostics for KYTY_FAST_READBACK=2: every recorded GPU write into buffers.
+	struct DebugWrite {
+		uint64_t begin = 0, end = 0, tick = 0;
+		char     kind  = '?';
+	};
+	std::array<DebugWrite, 8192> m_debug_writes {};
+	uint64_t                     m_debug_write_count = 0;
+	void DebugNoteWrite(uint64_t vaddr, uint64_t size, char kind) {
+		auto& w = m_debug_writes[m_debug_write_count++ % m_debug_writes.size()];
+		w       = {vaddr, vaddr + size, m_scheduler_tick_for_debug(), kind};
+	}
+	uint64_t                  m_scheduler_tick_for_debug();
+	// Emulated stores flushed per tick (tick, store sequence at the flush): stores from
+	// m_completed_store_seq on may not be in the GPU's copy yet.
+	std::deque<std::pair<uint64_t, uint64_t>> m_store_flushes;
+	uint64_t                  m_completed_store_seq = 0;
+	vk::CommandPool           m_rb_pool[2]    = {};
+	vk::CommandBuffer         m_rb_command[2] = {};
+	vk::Fence                 m_rb_fence[2]   = {};
+	std::unique_ptr<Buffer>   m_rb_download;
+	bool                      m_rb_nothing = false;
+	bool                      DownloadOnReadbackQueue(Buffer& buffer, uint64_t vaddr, uint64_t size);
+	uint64_t                  LastInflightWriteTick(uint64_t vaddr, uint64_t size);
 	MemoryTracker                                     m_memory_tracker;
 	StreamBuffer                                      m_staging_buffer;
 	StreamBuffer                                      m_stream_buffer;

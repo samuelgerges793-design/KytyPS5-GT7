@@ -416,11 +416,31 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	EXIT_IF(physical_device == nullptr);
 	EXIT_IF(queue_family == static_cast<uint32_t>(-1));
 
-	const float               queue_priority = 1.0f;
+	const float               queue_priorities[2] = {1.0f, 1.0f};
+	uint32_t                  family_count       = 0;
+	physical_device.getQueueFamilyProperties(&family_count, nullptr);
+	std::vector<vk::QueueFamilyProperties> families(family_count);
+	physical_device.getQueueFamilyProperties(&family_count, families.data());
 	vk::DeviceQueueCreateInfo queue_create_info {};
 	queue_create_info.queueFamilyIndex = queue_family;
-	queue_create_info.queueCount       = 1;
-	queue_create_info.pQueuePriorities = &queue_priority;
+	queue_create_info.queueCount       = queue_family < family_count && families[queue_family].queueCount >= 2 ? 2 : 1;
+	queue_create_info.pQueuePriorities = queue_priorities;
+	graphics.queue_count               = queue_create_info.queueCount;
+	// A transfer-only family (the copy engines) for readbacks, when there is one.
+	std::array<vk::DeviceQueueCreateInfo, 2> queue_create_infos {queue_create_info, {}};
+	uint32_t                                 queue_create_count = 1;
+	for (uint32_t i = 0; i < family_count; i++) {
+		const auto flags = families[i].queueFlags;
+		if (i != queue_family && (flags & vk::QueueFlagBits::eTransfer) &&
+		    !(flags & (vk::QueueFlagBits::eGraphics | vk::QueueFlagBits::eCompute))) {
+			queue_create_infos[1].queueFamilyIndex = i;
+			queue_create_infos[1].queueCount       = 1;
+			queue_create_infos[1].pQueuePriorities = queue_priorities;
+			queue_create_count                     = 2;
+			graphics.transfer_family               = i;
+			break;
+		}
+	}
 
 	vk::PhysicalDeviceColorWriteEnableFeaturesEXT color_write_ext {};
 	color_write_ext.colorWriteEnable = VK_TRUE;
@@ -655,8 +675,8 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		maintenance8.pNext = const_cast<void*>(create_info.pNext);
 		create_info.pNext = &maintenance8;
 	}
-	create_info.pQueueCreateInfos       = &queue_create_info;
-	create_info.queueCreateInfoCount    = 1;
+	create_info.pQueueCreateInfos       = queue_create_infos.data();
+	create_info.queueCreateInfoCount    = queue_create_count;
 	create_info.enabledExtensionCount   = static_cast<uint32_t>(device_extensions.size());
 	create_info.ppEnabledExtensionNames = device_extensions.data();
 	create_info.pEnabledFeatures        = &device_features;
@@ -1060,6 +1080,12 @@ void WindowContext::CreateVulkan() {
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(graphic_ctx.device);
 	graphic_ctx.device.getQueue(graphic_ctx.queue_family, 0, &graphic_ctx.queue);
 	EXIT_IF(graphic_ctx.queue == nullptr);
+	if (graphic_ctx.queue_count >= 2) {
+		graphic_ctx.device.getQueue(graphic_ctx.queue_family, 1, &graphic_ctx.readback_queue);
+	}
+	if (graphic_ctx.transfer_family != static_cast<uint32_t>(-1)) {
+		graphic_ctx.device.getQueue(graphic_ctx.transfer_family, 0, &graphic_ctx.transfer_queue);
+	}
 
 	if (!graphic_ctx.CreateAllocator()) {
 		EXIT("Could not create Vulkan memory allocator");

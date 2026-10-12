@@ -17,6 +17,7 @@
 
 #include <bit>
 #include <algorithm>
+#include <chrono>
 #include <atomic>
 #include <cinttypes>
 #include <cstdlib>
@@ -64,6 +65,7 @@ void BufferCache::WriteDataBuffer(Buffer& buffer, uint64_t address, const void* 
 		command.pipelineBarrier2(dependency);
 		const vk::BufferCopy copy {offset, destination_offset, chunk};
 		command.copyBuffer(m_staging_buffer.Handle(), buffer.Handle(), 1, &copy);
+		NoteGpuWrite(address, chunk);
 		auto after          = before;
 		after.srcStageMask  = vk::PipelineStageFlagBits2::eTransfer;
 		after.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
@@ -192,8 +194,10 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 	                       vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr, 1, &before, 0,
 	                       nullptr);
+	m_scheduler.ProfileMark('?', 0);
 	native.copyBuffer(buffer.Handle(), download.Handle(),
 	                  static_cast<uint32_t>(copies.size()), copies.data());
+	m_scheduler.ProfileMark('R', 0);
 
 	auto after          = before;
 	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
@@ -491,6 +495,274 @@ void BufferCache::ProcessPendingMerges() {
 	}
 }
 
+
+// KYTY_FAST_READBACK=1 (experimental, GT7 still corrupts data at boot): readbacks with no pending
+// writer copy on a second queue instead of draining the main queue; 2 = verify against a drain.
+static LiveSetting fast_verify("KYTY_FAST_READBACK", 0);
+
+// A readback whose range no pending GPU work writes: the buffer already holds the final bytes,
+// so copy them on the second queue and wait only for that copy, not for the main queue to drain.
+bool BufferCache::DownloadOnReadbackQueue(Buffer& buffer, uint64_t vaddr, uint64_t size) {
+	auto& master = m_scheduler.GetMasterSemaphore();
+	std::vector<vk::BufferCopy> copies;
+	uint64_t                    total_size     = 0;
+	const auto                  buffer_address = buffer.CpuAddress();
+	m_memory_tracker.ForEachDownloadRange<false>(
+	    vaddr, size, [&](uint64_t address, uint64_t bytes) noexcept {
+		    m_gpu_modified_ranges.ForEachInRange(address, bytes, [&](uint64_t start, uint64_t end) {
+			    copies.emplace_back(start - buffer_address, total_size, end - start);
+			    total_size += Common::AlignUp(end - start, 64);
+		    });
+	    });
+	if (copies.empty()) {
+		m_rb_nothing = true; // Like the draining path: nothing copied, nothing unmarked.
+		return true;
+	}
+	m_rb_nothing = false;
+	// The copied ranges reach past the access (whole GPU-written ranges): wait for their own
+	// newest writers, or take the draining path if one is still being recorded.
+	uint64_t needed = 0;
+	for (const auto& copy: copies) {
+		needed = std::max(needed, LastInflightWriteTick(buffer_address + copy.srcOffset, copy.size));
+	}
+	if (needed >= m_scheduler.CurrentTick()) {
+		return false;
+	}
+	if (needed != 0) master.Wait(needed);
+	master.Refresh();
+	const auto done = master.KnownGpuTick();
+	uint64_t   first_store = 0;
+	{
+		std::scoped_lock lock(m_cpu_store_mutex);
+		while (!m_store_flushes.empty() && m_store_flushes.front().first <= done) {
+			m_completed_store_seq = m_store_flushes.front().second;
+			m_store_flushes.pop_front();
+		}
+		first_store = m_completed_store_seq;
+		if (m_recent_store_count - first_store > m_recent_stores.size() / 2) {
+			return false; // Too many stores to replay: take the draining path.
+		}
+	}
+	constexpr uint64_t RbSize = 16 * MiB;
+	if (total_size > RbSize) {
+		return false;
+	}
+	const auto& device = m_graphics.device;
+	// KYTY_RB_QUEUE=1: copy on the transfer-only family (copy engines) instead of a second
+	// graphics queue. Buffers are not handed over between families (fine on NVIDIA).
+	static LiveSetting rb_queue("KYTY_RB_QUEUE", 0);
+	const uint32_t     kind  = rb_queue.Get() != 0 && m_graphics.transfer_queue ? 1u : 0u;
+	const auto         queue = kind == 1 ? m_graphics.transfer_queue : m_graphics.readback_queue;
+	auto&              m_rb_pool_k = m_rb_pool[kind];
+	if (!m_rb_pool_k) {
+		vk::CommandPoolCreateInfo pool {};
+		pool.flags            = vk::CommandPoolCreateFlagBits::eResetCommandBuffer;
+		pool.queueFamilyIndex = kind == 1 ? m_graphics.transfer_family : m_graphics.queue_family;
+		m_rb_pool_k           = device.createCommandPool(pool).value;
+		vk::CommandBufferAllocateInfo allocate {};
+		allocate.commandPool        = m_rb_pool_k;
+		allocate.level              = vk::CommandBufferLevel::ePrimary;
+		allocate.commandBufferCount = 1;
+		m_rb_command[kind]          = device.allocateCommandBuffers(allocate).value.front();
+		m_rb_fence[kind]            = device.createFence({}).value;
+		if (!m_rb_download) m_rb_download = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
+		                                         vk::BufferUsageFlagBits::eTransferDst, RbSize);
+	}
+	// The ranges are no longer GPU-written once copied.
+	m_memory_tracker.ForEachDownloadRange<false>(
+	    vaddr, size, [&](uint64_t address, uint64_t bytes) noexcept {
+		    m_gpu_modified_ranges.Subtract(address, bytes);
+	    });
+
+	(void)m_rb_command[kind].reset();
+	vk::CommandBufferBeginInfo begin {};
+	begin.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
+	(void)m_rb_command[kind].begin(begin);
+	m_rb_command[kind].copyBuffer(buffer.Handle(), m_rb_download->Handle(), static_cast<uint32_t>(copies.size()),
+	                        copies.data());
+	vk::MemoryBarrier after {};
+	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	after.dstAccessMask = vk::AccessFlagBits::eHostRead;
+	m_rb_command[kind].pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost, {}, 1,
+	                             &after, 0, nullptr, 0, nullptr);
+	(void)m_rb_command[kind].end();
+
+	// Waiting on the completed main-queue value makes its writes visible to the copy.
+	const auto                       semaphore = master.Handle();
+	const vk::PipelineStageFlags     wait_stage = vk::PipelineStageFlagBits::eTransfer;
+	vk::TimelineSemaphoreSubmitInfo  timeline {};
+	timeline.waitSemaphoreValueCount = 1;
+	timeline.pWaitSemaphoreValues    = &done;
+	vk::SubmitInfo submit {};
+	submit.pNext              = &timeline;
+	submit.waitSemaphoreCount = done != 0 ? 1u : 0u;
+	submit.pWaitSemaphores    = &semaphore;
+	submit.pWaitDstStageMask  = &wait_stage;
+	submit.commandBufferCount = 1;
+	submit.pCommandBuffers    = &m_rb_command[kind];
+	const auto wait_start = std::chrono::steady_clock::now();
+	EXIT_NOT_IMPLEMENTED(queue.submit(1, &submit, m_rb_fence[kind]) != vk::Result::eSuccess);
+	EXIT_NOT_IMPLEMENTED(device.waitForFences(1, &m_rb_fence[kind], VK_TRUE, UINT64_MAX) != vk::Result::eSuccess);
+	EXIT_NOT_IMPLEMENTED(device.resetFences(1, &m_rb_fence[kind]) != vk::Result::eSuccess);
+	PerfAdd(PerfCounter::ReadbackSideQueue, static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - wait_start).count()));
+	m_rb_download->Invalidate(0, total_size);
+	// KYTY_FAST_READBACK=2: also copy on the main queue after it drains and compare.
+	if (fast_verify.Get() == 2) {
+		auto verify = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
+		                                       vk::BufferUsageFlagBits::eTransferDst, total_size);
+		auto& command = m_scheduler.Current();
+		command.EndRendering();
+		const auto              native = command.Handle();
+		vk::MemoryBarrier       before {};
+		before.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
+		before.dstAccessMask = vk::AccessFlagBits::eTransferRead;
+		native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eTransfer, {}, 1,
+		                       &before, 0, nullptr, 0, nullptr);
+		native.copyBuffer(buffer.Handle(), verify->Handle(), static_cast<uint32_t>(copies.size()), copies.data());
+		vk::MemoryBarrier after_verify {};
+		after_verify.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+		after_verify.dstAccessMask = vk::AccessFlagBits::eHostRead;
+		native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost, {}, 1,
+		                       &after_verify, 0, nullptr, 0, nullptr);
+		m_scheduler.Wait(m_scheduler.CurrentTick());
+		verify->Invalidate(0, total_size);
+		std::vector<uint8_t> fast_image(m_rb_download->Mapped().data(), m_rb_download->Mapped().data() + total_size);
+		std::vector<uint8_t> slow_image(verify->Mapped().data(), verify->Mapped().data() + total_size);
+		{
+			// Both get the stores the publish replays: only GPU-side differences remain.
+			std::scoped_lock lock(m_cpu_store_mutex);
+			const auto apply = [&](const auto& store) {
+				for (const auto& copy: copies) {
+					const auto start = buffer_address + copy.srcOffset;
+					const auto lo = std::max<uint64_t>(store.address, start);
+					const auto hi = std::min<uint64_t>(store.address + store.size, start + copy.size);
+					if (lo >= hi) continue;
+					const auto at = copy.dstOffset + (lo - start);
+					std::memcpy(fast_image.data() + at, store.bytes.data() + (lo - store.address), hi - lo);
+					std::memcpy(slow_image.data() + at, store.bytes.data() + (lo - store.address), hi - lo);
+				}
+			};
+			for (uint64_t sequence = first_store; sequence < m_recent_store_count; sequence++) {
+				apply(m_recent_stores[sequence % m_recent_stores.size()]);
+			}
+			for (const auto& store: m_cpu_stores) apply(store);
+		}
+		const auto* fast_bytes = fast_image.data();
+		const auto* slow_bytes = slow_image.data();
+		for (const auto& copy: copies) {
+			if (std::memcmp(fast_bytes + copy.dstOffset, slow_bytes + copy.dstOffset, copy.size) == 0) continue;
+			uint64_t first = 0;
+			while (first < copy.size && fast_bytes[copy.dstOffset + first] == slow_bytes[copy.dstOffset + first]) first++;
+			static std::atomic<uint32_t> logged {0};
+			if (logged.fetch_add(1) < 40) {
+				Log::WriteToConsoleAndLog(fmt::format(
+				    "fast readback MISMATCH at 0x{:x} fast {:02x} slow {:02x} (range 0x{:x}+0x{:x}) writer-done={} current={} known={};{}\n",
+				    buffer_address + copy.srcOffset + first, fast_bytes[copy.dstOffset + first],
+				    slow_bytes[copy.dstOffset + first], buffer_address + copy.srcOffset, copy.size, done,
+				    m_scheduler.CurrentTick(), master.KnownGpuTick(),
+				    DescribePages(buffer_address + copy.srcOffset + first, 1)));
+				const auto at = buffer_address + copy.srcOffset + first;
+				std::string writes;
+				const auto  n = std::min<uint64_t>(m_debug_write_count, m_debug_writes.size());
+				for (uint64_t k = 0; k < n; k++) {
+					const auto& w = m_debug_writes[(m_debug_write_count - 1 - k) % m_debug_writes.size()];
+					if (w.begin <= at && at < w.end && writes.size() < 300) {
+						writes += fmt::format(" {}@{}[0x{:x}+0x{:x}]", w.kind, w.tick, w.begin, w.end - w.begin);
+					}
+				}
+				Log::WriteToConsoleAndLog(fmt::format("  writes covering it (newest first):{} addr-write-tick={} open={}\n", writes,
+				                                      m_address_write_tick, m_address_write_open));
+			}
+			PerfAdd(PerfCounter::PatchVerifyMismatch, 0);
+		}
+		std::memcpy(m_rb_download->Mapped().data(), verify->Mapped().data(), total_size); // Publish the drained copy.
+		m_scheduler.DeferOperation([owner = std::move(verify)]() mutable { owner.reset(); });
+	}
+
+	const auto*      mapped = m_rb_download->Mapped().data();
+	std::scoped_lock lock(m_cpu_store_mutex);
+	for (const auto& copy: copies) {
+		Libs::LibKernel::Memory::WriteBacking(buffer_address + copy.srcOffset, mapped + copy.dstOffset, copy.size);
+	}
+	const auto reapply = [&](const auto& store) {
+		for (const auto& copy: copies) {
+			const auto start = buffer_address + copy.srcOffset;
+			if (store.address < start + copy.size && start < store.address + store.size) {
+				Libs::LibKernel::Memory::WriteBacking(store.address, store.bytes.data(), store.size);
+				break;
+			}
+		}
+	};
+	// Stores whose upload the GPU has not run yet are newer than the copy, oldest first.
+	for (uint64_t sequence = first_store; sequence < m_recent_store_count; sequence++) {
+		reapply(m_recent_stores[sequence % m_recent_stores.size()]);
+	}
+	for (const auto& store: m_cpu_stores) reapply(store);
+	return true;
+}
+
+uint64_t BufferCache::m_scheduler_tick_for_debug() {
+	return m_scheduler.CurrentTick();
+}
+
+uint32_t BufferCache::WorkInCurrentTick() {
+	return m_work_tick == m_scheduler.CurrentTick() ? m_work_count : 0;
+}
+
+void BufferCache::CommitGpuWrites() {
+	const auto tick = m_scheduler.CurrentTick();
+	if (m_work_tick != tick) {
+		m_work_tick  = tick;
+		m_work_count = 0;
+	}
+	m_work_count++;
+	for (size_t i = m_open_writes; i < m_inflight_writes.size(); i++) m_inflight_writes[i].tick = tick;
+	m_open_writes = m_inflight_writes.size();
+	m_address_write_open = false;
+	if (m_address_write_tick != 0) m_address_write_tick = std::max(m_address_write_tick, tick);
+}
+
+void BufferCache::NoteAddressWrites() {
+	m_address_write_epoch++;
+	m_address_write_tick = m_scheduler.CurrentTick();
+	m_address_write_open = true;
+}
+
+void BufferCache::NoteGpuWrite(uint64_t vaddr, uint64_t size) {
+	DebugNoteWrite(vaddr, size, 'b');
+	const auto tick = m_scheduler.CurrentTick();
+	if (!m_inflight_writes.empty()) {
+		const auto& last = m_inflight_writes.back();
+		if (last.tick == tick && last.begin == vaddr && last.end == vaddr + size) return;
+	}
+	if (m_inflight_writes.size() >= 16384 && m_open_writes > 0) {
+		m_inflight_dropped_tick = std::max(m_inflight_dropped_tick, m_inflight_writes.front().tick);
+		m_inflight_writes.pop_front();
+		m_open_writes--;
+	}
+	m_inflight_writes.push_back({vaddr, vaddr + size, tick});
+}
+
+uint64_t BufferCache::LastInflightWriteTick(uint64_t vaddr, uint64_t size) {
+	m_scheduler.GetMasterSemaphore().Refresh();
+	const auto done = m_scheduler.GetMasterSemaphore().KnownGpuTick();
+	while (m_open_writes > 0 && m_inflight_writes.front().tick <= done) {
+		m_inflight_writes.pop_front();
+		m_open_writes--;
+	}
+	const auto current = m_scheduler.CurrentTick();
+	uint64_t   last    = m_inflight_dropped_tick > done ? m_inflight_dropped_tick : 0;
+	if (m_address_write_open) return current;
+	if (m_address_write_tick > done) last = std::max(last, m_address_write_tick);
+	for (size_t i = 0; i < m_inflight_writes.size(); i++) {
+		const auto& write = m_inflight_writes[i];
+		if (write.begin < vaddr + size && vaddr < write.end) {
+			last = std::max(last, i >= m_open_writes ? current : write.tick);
+		}
+	}
+	return last;
+}
+
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	if (!GuestGpu::IsGpuThread() && CommandScheduler::InDeferredOperation()) {
 		EXIT("unsupported buffer readback from an asynchronous GPU completion, "
@@ -533,6 +805,24 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			end   = std::min(buffer.CpuAddress() + buffer.Size(), (vaddr + size + window - 1u) & ~(window - 1u));
 			begin = std::min(begin, vaddr);
 			end   = std::max(end, vaddr + size);
+		}
+		const auto writer = LastInflightWriteTick(begin, end - begin);
+		if (writer == 0) {
+			PerfAdd(PerfCounter::ReadbackNoWriter, 0);
+		} else {
+			PerfAdd(writer < m_scheduler.CurrentTick() ? PerfCounter::ReadbackWriterSubmitted
+			                                           : PerfCounter::ReadbackWriterRecording, 0);
+		}
+		if (fast_verify.Get() != 0 && m_graphics.readback_queue && writer < m_scheduler.CurrentTick()) {
+			if (writer != 0) m_scheduler.GetMasterSemaphore().Wait(writer);
+			if (DownloadOnReadbackQueue(buffer, begin, end - begin)) {
+				if (!m_rb_nothing) {
+					m_memory_tracker.UnmarkRegionAsGpuModified(begin, end - begin);
+					PerfAdd(PerfCounter::ReadbackWindowBytes, end - begin);
+				}
+				if (is_write) m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+				return;
+			}
 		}
 		if (DownloadBufferMemory<false>(buffer, begin, end - begin)) {
 			m_memory_tracker.UnmarkRegionAsGpuModified(begin, end - begin);
@@ -620,8 +910,11 @@ void BufferCache::JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumul
 	if (accumulate_stream_score) {
 		new_buffer.IncreaseStreamScore(overlap.StreamScore() + 1);
 	}
+	m_scheduler.ProfileMark('?', 0);
 	new_buffer.CopyFrom(m_scheduler.Current(), overlap, 0,
 	                    overlap.CpuAddress() - new_buffer.CpuAddress(), overlap.Size());
+	NoteGpuWrite(overlap.CpuAddress(), overlap.Size()); // The copy is a GPU write into the new buffer.
+	m_scheduler.ProfileMark('M', 0);
 	DeleteBuffer(overlap_id);
 }
 
@@ -791,7 +1084,9 @@ uint64_t BufferCache::SyncGpuWrittenRange(uint64_t vaddr, uint64_t size, bool fo
 	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eTransfer,
 	                       {}, 1, &before, 0, nullptr, 0, nullptr);
 	const vk::BufferCopy copy {buffer.Offset(vaddr), 0, size};
+	m_scheduler.ProfileMark('?', 0);
 	native.copyBuffer(buffer.Handle(), staging->Handle(), 1, &copy);
+	m_scheduler.ProfileMark('S', 0);
 	vk::MemoryBarrier after {};
 	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
 	after.dstAccessMask = vk::AccessFlagBits::eHostRead;
@@ -1246,6 +1541,7 @@ void BufferCache::FlushCpuWrites() {
 		ranges.reserve(m_cpu_stores.size());
 		for (const auto& store: m_cpu_stores) ranges.emplace_back(store.address, store.size);
 		m_cpu_stores.clear();
+		m_store_flushes.emplace_back(m_scheduler.CurrentTick(), m_recent_store_count);
 	}
 	std::ranges::sort(ranges);
 	// Merge touching and overlapping stores only: bytes between them are stale guest copies of
@@ -1285,6 +1581,7 @@ void BufferCache::FlushCpuWrites() {
 
 void BufferCache::RecordBufferUpload(Buffer& buffer, vk::Buffer source,
                                      std::span<const vk::BufferCopy> copies) {
+	for (const auto& copy: copies) DebugNoteWrite(buffer.CpuAddress() + copy.dstOffset, copy.size, 'u');
 	{
 		auto& command = m_scheduler.Current();
 		command.EndRendering();
@@ -1302,8 +1599,10 @@ void BufferCache::RecordBufferUpload(Buffer& buffer, vk::Buffer source,
 		native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 		                       vk::PipelineStageFlagBits::eTransfer,
 		                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &before, 0, nullptr);
+		m_scheduler.ProfileMark('?', 0);
 		native.copyBuffer(source, buffer.Handle(), static_cast<uint32_t>(copies.size()),
 		                  copies.data());
+		m_scheduler.ProfileMark('U', 0);
 		auto after          = before;
 		after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
 		after.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
@@ -1411,20 +1710,21 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 				first    = false;
 			} else if (mark != run_mark) {
 				(void)SynchronizeBuffer(buffer, run_begin, begin - run_begin, run_mark, is_texel_buffer);
-				if (run_mark) m_gpu_modified_ranges.Add(run_begin, begin - run_begin);
+				if (run_mark) { m_gpu_modified_ranges.Add(run_begin, begin - run_begin); NoteGpuWrite(run_begin, begin - run_begin); }
 				else PerfAdd(PerfCounter::TrackSkipBytes, begin - run_begin);
 				run_begin = begin;
 				run_mark  = mark;
 			}
 		}
 		(void)SynchronizeBuffer(buffer, run_begin, end - run_begin, run_mark, is_texel_buffer);
-		if (run_mark) m_gpu_modified_ranges.Add(run_begin, end - run_begin);
+		if (run_mark) { m_gpu_modified_ranges.Add(run_begin, end - run_begin); NoteGpuWrite(run_begin, end - run_begin); }
 		else PerfAdd(PerfCounter::TrackSkipBytes, end - run_begin);
 		PerfAdd(PerfCounter::MarkTrackedBytes, size);
 	} else {
 		(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
 		if (is_written) {
 			m_gpu_modified_ranges.Add(vaddr, size);
+			NoteGpuWrite(vaddr, size);
 			for (uint64_t page = vaddr >> 12u;
 			     ShaderRecompiler::IR::WriteTrackingEnabled() && page <= (vaddr + size - 1u) >> 12u; page++) {
 				if (track != ShaderRecompiler::IR::WriteTrackUntracked) {
@@ -1505,6 +1805,7 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 	m_texture_cache.InvalidateMemoryFromGPU(vaddr, size);
 	auto [dst, dst_offset] = ObtainBuffer(vaddr, size, true, true);
 	dst->Fill(dst_offset, size, value);
+	CommitGpuWrites();
 }
 
 void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
@@ -1542,6 +1843,7 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 	auto [dst, dst_offset] = dst_memory ? ObtainBuffer(dst_vaddr, size, true, true, dst_id)
 	                                    : std::pair {&m_gds_buffer, dst_vaddr};
 	dst->CopyFrom(command, *src, src_offset, dst_offset, size);
+	CommitGpuWrites();
 }
 
 bool BufferCache::IsRegionRegistered(uint64_t vaddr, uint64_t size) {

@@ -33,6 +33,7 @@
 namespace Libs::Graphics {
 
 namespace {
+std::array<std::atomic<uint64_t>, 16> g_last_stage_hash {};
 
 struct NotedShader {
 	uint64_t hash       = 0;
@@ -67,6 +68,7 @@ std::string FormatNoted(const std::vector<NotedShader>& list) {
 } // namespace
 
 void DebugNoteShader(uint64_t hash, uint32_t stage) {
+	if (stage < 16) g_last_stage_hash[stage].store(hash, std::memory_order_relaxed);
 	std::scoped_lock lock(g_noted_mutex);
 	const auto found = std::ranges::find_if(
 	    g_recording, [&](const NotedShader& n) { return n.hash == hash && n.stage == stage; });
@@ -275,8 +277,9 @@ uint64_t PerfNow() {
 } // namespace
 
 struct WaitSite {
-	uint64_t count = 0;
-	uint64_t ns    = 0;
+	uint64_t  count = 0;
+	uint64_t  ns    = 0;
+	uintptr_t chain[5] {};
 };
 std::mutex                       g_wait_sites_mutex;
 std::unordered_map<uintptr_t, WaitSite> g_wait_sites;
@@ -305,16 +308,19 @@ std::unordered_map<uint64_t, FaultPage> g_fault_pages;
 
 void NoteWaitSite(uint64_t ns) {
 #ifdef _WIN32
-	void*      frames[4] {};
-	const auto count = RtlCaptureStackBackTrace(2, 4, frames, nullptr);
+	void*      frames[5] {};
+	const auto count = RtlCaptureStackBackTrace(2, 5, frames, nullptr);
 	const auto base  = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
-	// The first frame outside the scheduler wrappers names who waited.
+	// Five callers deep: the scheduler wrappers are the first ones.
 	uintptr_t site = 0;
-	for (USHORT i = 0; i < count && site == 0; i++) {
-		site = reinterpret_cast<uintptr_t>(frames[i]) - base;
+	uintptr_t chain[5] {};
+	for (USHORT i = 0; i < count; i++) {
+		chain[i] = reinterpret_cast<uintptr_t>(frames[i]) - base;
+		site     = site * 1000003u ^ chain[i];
 	}
 	std::scoped_lock lock(g_wait_sites_mutex);
 	auto&            entry = g_wait_sites[site];
+	std::copy(std::begin(chain), std::end(chain), std::begin(entry.chain));
 	entry.count++;
 	entry.ns += ns;
 #else
@@ -459,6 +465,129 @@ void HwWatchStart() {
 	Log::WriteToConsoleAndLog(fmt::format("hwwatch: watching {} addresses\n", g_hw_watch.size()));
 }
 
+
+namespace {
+struct ProfileSlice {
+	uint64_t              tick    = 0;
+	uint32_t              count   = 0;
+	bool                  pending = false;
+	std::vector<uint64_t> labels;
+};
+constexpr uint32_t                       ProfileSliceSize  = 4096;
+constexpr uint32_t                       ProfileSliceCount = 128;
+vk::QueryPool                            g_profile_pool    = nullptr;
+vk::Device                               g_profile_device  = nullptr;
+float                                    g_profile_period  = 1.0f;
+std::array<ProfileSlice, ProfileSliceCount> g_profile_slices;
+uint32_t                                 g_profile_next    = 0;
+ProfileSlice*                            g_profile_current = nullptr;
+uint32_t                                 g_profile_base    = 0;
+std::mutex                               g_profile_mutex;
+std::unordered_map<uint64_t, std::pair<uint64_t, uint64_t>> g_profile_totals; // label -> ns, count
+
+void GpuProfileCollect(uint64_t completed) {
+	std::vector<uint64_t> stamps;
+	for (uint32_t i = 0; i < ProfileSliceCount; i++) {
+		auto& slice = g_profile_slices[i];
+		if (!slice.pending || slice.tick > completed || slice.count < 2) {
+			if (slice.pending && slice.count < 2 && slice.tick <= completed) slice.pending = false;
+			continue;
+		}
+		stamps.resize(slice.count);
+		const auto result = g_profile_device.getQueryPoolResults(
+		    g_profile_pool, i * ProfileSliceSize, slice.count, stamps.size() * sizeof(uint64_t), stamps.data(),
+		    sizeof(uint64_t), vk::QueryResultFlagBits::e64);
+		slice.pending = false;
+		if (result != vk::Result::eSuccess) continue;
+		std::scoped_lock lock(g_profile_mutex);
+		for (uint32_t k = 1; k < slice.count; k++) {
+			if (stamps[k] < stamps[k - 1]) continue;
+			auto& total = g_profile_totals[slice.labels[k]];
+			total.first += static_cast<uint64_t>(static_cast<double>(stamps[k] - stamps[k - 1]) * g_profile_period);
+			total.second++;
+		}
+	}
+}
+} // namespace
+
+bool GpuProfileEnabled() {
+	static LiveSetting enabled("KYTY_GPU_PROFILE", 0);
+	return enabled.Get() != 0;
+}
+
+uint64_t GpuProfileLastShader(uint32_t stage) {
+	return stage < g_last_stage_hash.size() ? g_last_stage_hash[stage].load(std::memory_order_relaxed) : 0;
+}
+
+void GpuProfileBegin(const vk::Device& device, float period, vk::CommandBuffer command, uint64_t tick,
+                     uint64_t completed) {
+	g_profile_current = nullptr;
+	if (!GpuProfileEnabled()) return;
+	if (!g_profile_pool) {
+		vk::QueryPoolCreateInfo info {};
+		info.queryType  = vk::QueryType::eTimestamp;
+		info.queryCount = ProfileSliceSize * ProfileSliceCount;
+		auto created    = device.createQueryPool(info);
+		if (created.result != vk::Result::eSuccess) return;
+		g_profile_pool   = created.value;
+		g_profile_device = device;
+		g_profile_period = period;
+	}
+	GpuProfileCollect(completed);
+	auto& slice = g_profile_slices[g_profile_next];
+	if (slice.pending) return; // Still on the GPU: this command buffer goes unmeasured.
+	g_profile_base    = g_profile_next * ProfileSliceSize;
+	g_profile_next    = (g_profile_next + 1) % ProfileSliceCount;
+	slice.tick        = tick;
+	slice.count       = 0;
+	slice.labels.resize(ProfileSliceSize);
+	command.resetQueryPool(g_profile_pool, g_profile_base, ProfileSliceSize);
+	g_profile_current = &slice;
+	GpuProfileMark(command, 'B', 0);
+}
+
+void GpuProfileMark(vk::CommandBuffer command, char kind, uint64_t hash) {
+	auto* slice = g_profile_current;
+	if (slice == nullptr || slice->count + 1 >= ProfileSliceSize) return;
+	command.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, g_profile_pool, g_profile_base + slice->count);
+	slice->labels[slice->count++] = (static_cast<uint64_t>(static_cast<uint8_t>(kind)) << 56u) |
+	                                (hash & 0x00ffffffffffffffull);
+}
+
+void GpuProfileEnd(vk::CommandBuffer command) {
+	if (g_profile_current == nullptr) return;
+	GpuProfileMark(command, 'Z', 0);
+	g_profile_current->pending = true;
+	g_profile_current          = nullptr;
+}
+
+std::string GpuProfileTake(double seconds) {
+	std::vector<std::pair<uint64_t, std::pair<uint64_t, uint64_t>>> items;
+	{
+		std::scoped_lock lock(g_profile_mutex);
+		items.assign(g_profile_totals.begin(), g_profile_totals.end());
+		g_profile_totals.clear();
+	}
+	if (items.empty()) return {};
+	uint64_t total = 0;
+	std::unordered_map<char, uint64_t> kinds;
+	for (const auto& [label, value]: items) {
+		total += value.first;
+		kinds[static_cast<char>(label >> 56u)] += value.first;
+	}
+	std::ranges::sort(items, [](const auto& a, const auto& b) { return a.second.first > b.second.first; });
+	std::string text = fmt::format(" | gpu-time {:.0f} ms/s by kind:", static_cast<double>(total) / 1e6 / seconds);
+	for (const auto& [kind, ns]: kinds) text += fmt::format(" {}={:.0f}", kind, static_cast<double>(ns) / 1e6 / seconds);
+	text += " top:";
+	for (size_t i = 0; i < items.size() && i < 14; i++) {
+		text += fmt::format(" {}:{:x} {:.1f}ms/s({})", static_cast<char>(items[i].first >> 56u),
+		                    items[i].first & 0x00ffffffffffffffull,
+		                    static_cast<double>(items[i].second.first) / 1e6 / seconds,
+		                    static_cast<uint64_t>(static_cast<double>(items[i].second.second) / seconds));
+	}
+	return text;
+}
+
 void PerfAdd(PerfCounter counter, uint64_t nanoseconds) {
 	auto& totals = g_perf[static_cast<size_t>(counter)];
 	totals.ns.fetch_add(nanoseconds, std::memory_order_relaxed);
@@ -501,7 +630,7 @@ void PerfReport(double fps) {
 	                                        "verify-match", "verify-MISMATCH",
 	                                        "readback-window-MB", "submit-queue-wait",
 	                                        "submit-queue-timeout", "zero-ib-wait", "zero-ib-gave-up",
-	                                        "deferred-labels"};
+	                                        "deferred-labels", "rb-no-writer", "rb-writer-submitted", "rb-writer-recording", "rb-side-queue"};
 	std::string text = fmt::format("perf: {:.1f} fps | longest-gpu-wait {:.0f} ms |", fps,
 	                               static_cast<double>(g_longest_wait_ns.exchange(0)) / 1e6);
 	for (size_t i = 0; i < g_perf.size(); i++) {
@@ -518,7 +647,8 @@ void PerfReport(double fps) {
 		std::ranges::sort(sites, [](const auto& a, const auto& b) { return a.second.ns > b.second.ns; });
 		if (!sites.empty()) text += " waits by caller:";
 		for (size_t i = 0; i < sites.size() && i < 5; i++) {
-			text += fmt::format(" rva=0x{:x} {:.0f}ms/{}", sites[i].first,
+			const auto& c = sites[i].second.chain;
+			text += fmt::format(" rva=0x{:x}<0x{:x}<0x{:x}<0x{:x}<0x{:x} {:.0f}ms/{}", c[0], c[1], c[2], c[3], c[4],
 			                    static_cast<double>(sites[i].second.ns) / 1e6, sites[i].second.count);
 		}
 	}
@@ -548,6 +678,7 @@ void PerfReport(double fps) {
 			                    bindings[i].second.count, bindings[i].second.shader);
 		}
 	}
+	text += GpuProfileTake(seconds);
 	Log::WriteToConsoleAndLog(text + "\n");
 }
 

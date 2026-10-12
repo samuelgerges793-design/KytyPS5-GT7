@@ -133,6 +133,13 @@ enum class PerfCounter {
 	ZeroBufferGaveUp,
 	// End-of-pipe labels written when the GPU completes (KYTY_DEFERRED_LABELS).
 	DeferredLabel,
+	// Readbacks by the newest GPU work writing the range: none in flight, submitted, or still
+	// being recorded (only the last needs a submit; none need the whole GPU drained).
+	ReadbackNoWriter,
+	ReadbackWriterSubmitted,
+	ReadbackWriterRecording,
+	// Readbacks copied on the second queue (time is the copy wait).
+	ReadbackSideQueue,
 	Count
 };
 void PerfAdd(PerfCounter counter, uint64_t nanoseconds);
@@ -158,6 +165,15 @@ void NoteWatchedWrite(const std::string& what);
 // Diagnostics (KYTY_HW_WATCH=addr[,addr...], up to 4): CPU debug registers on every thread catch
 // each write to those 8-byte guest locations; direct-backing writes are logged too.
 void HwWatchStart();
+// Diagnostics (KYTY_GPU_PROFILE=1): GPU time per draw, dispatch and copy kind, from timestamps
+// written after each one; reported with the perf line. Labels are kind << 56 | shader hash.
+bool        GpuProfileEnabled();
+void        GpuProfileBegin(const vk::Device& device, float period, vk::CommandBuffer command, uint64_t tick,
+                            uint64_t completed);
+void        GpuProfileMark(vk::CommandBuffer command, char kind, uint64_t hash);
+void        GpuProfileEnd(vk::CommandBuffer command);
+uint64_t    GpuProfileLastShader(uint32_t stage);
+std::string GpuProfileTake(double seconds);
 bool HwWatchOverlaps(uint64_t vaddr, uint64_t size) noexcept;
 void HwWatchNoteBackingWrite(uint64_t vaddr, const void* data, uint64_t size) noexcept;
 // The GPU queue whose submission the GPU thread is processing (watch logs name it).

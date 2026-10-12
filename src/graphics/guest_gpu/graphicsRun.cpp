@@ -940,6 +940,17 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		}
 		cursor.offset_dw += packet_dw;
 		execution.m_made_progress = true;
+		{
+			// Submit every N draws/dispatches (KYTY_SUBMIT_EVERY, 0 = off) so the GPU starts on
+			// work while the next is recorded; a readback then waits only for the rest.
+			static LiveSetting submit_every("KYTY_SUBMIT_EVERY", 0);
+			const auto         every = submit_every.Get();
+			if (every != 0 && m_renderer.GetBufferCache().WorkInCurrentTick() >= every) {
+				auto& scheduler = m_renderer.GetCommandScheduler();
+				scheduler.EndRendering();
+				scheduler.Flush();
+			}
+		}
 		if (!execution.m_next_buffer.empty()) {
 			SyncCommandMemory(execution.m_next_buffer);
 			// Chains and taken branches reuse the fetcher; only calls retain a return cursor.
