@@ -758,6 +758,68 @@ bool BufferCache::TryPublishPrefetched(uint64_t vaddr, uint64_t size) {
 			return false;
 		}
 	}
+	// KYTY_READBACK_PREFETCH_VERIFY=1: compare each copy with the GPU's current bytes (drains the
+	// queue) and log differences with the GPU writes recorded on them.
+	static LiveSetting prefetch_verify("KYTY_READBACK_PREFETCH_VERIFY", 0);
+	if (prefetch_verify.Get() != 0) {
+		auto& buffer = m_slot_buffers[FindBuffer(first_page << 12u, (last_page - first_page + 1u) << 12u)];
+		std::vector<vk::BufferCopy> copies;
+		uint64_t                    total = 0;
+		for (uint64_t page = first_page; page <= last_page; page++) {
+			for (const auto [offset, bytes]: m_prefetched[page]->ranges) {
+				copies.emplace_back((page << 12u) + offset - buffer.CpuAddress(), total, bytes);
+				total += Common::AlignUp(uint64_t {bytes}, 16);
+			}
+		}
+		if (total != 0) {
+			auto staging = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
+			                                        vk::BufferUsageFlagBits::eTransferDst, total);
+			auto& command = m_scheduler.Current();
+			command.EndRendering();
+			const auto        native = command.Handle();
+			vk::MemoryBarrier before {};
+			before.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
+			before.dstAccessMask = vk::AccessFlagBits::eTransferRead;
+			native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eTransfer, {}, 1,
+			                       &before, 0, nullptr, 0, nullptr);
+			native.copyBuffer(buffer.Handle(), staging->Handle(), static_cast<uint32_t>(copies.size()), copies.data());
+			vk::MemoryBarrier after {};
+			after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+			after.dstAccessMask = vk::AccessFlagBits::eHostRead;
+			native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost, {}, 1, &after,
+			                       0, nullptr, 0, nullptr);
+			m_scheduler.Wait(m_scheduler.CurrentTick());
+			staging->Invalidate(0, total);
+			const auto* now = staging->Mapped().data();
+			for (const auto& copy: copies) {
+				const auto  address = buffer.CpuAddress() + copy.srcOffset;
+				const auto& entry   = *m_prefetched[address >> 12u];
+				const auto* old     = entry.bytes.data() + (address & 0xfffu);
+				if (std::memcmp(old, now + copy.dstOffset, copy.size) == 0) continue;
+				uint64_t first = 0;
+				while (old[first] == now[copy.dstOffset + first]) first++;
+				static std::atomic<uint32_t> logged {0};
+				if (logged.fetch_add(1) < 30) {
+					std::string writes;
+					const auto  n = std::min<uint64_t>(m_debug_write_count, m_debug_writes.size());
+					for (uint64_t k = 0; k < n && writes.size() < 240; k++) {
+						const auto& w = m_debug_writes[(m_debug_write_count - 1 - k) % m_debug_writes.size()];
+						if (w.begin <= address + first && address + first < w.end) {
+							writes += fmt::format(" {}@{}", w.kind, w.tick);
+						}
+					}
+					Log::WriteToConsoleAndLog(fmt::format(
+					    "prefetch MISMATCH at 0x{:x} old {:02x} now {:02x} (copy seq {}, now seq {}, tick {}); writes:{}\n",
+					    address + first, old[first], now[copy.dstOffset + first], entry.write_seq, m_write_seq,
+					    m_scheduler.CurrentTick(), writes));
+				}
+				PerfAdd(PerfCounter::PatchVerifyMismatch, 0);
+				// Publish the GPU's current bytes instead.
+				std::memcpy(m_prefetched[address >> 12u]->bytes.data() + (address & 0xfffu), now + copy.dstOffset, copy.size);
+			}
+			m_scheduler.DeferOperation([owner = std::move(staging)]() mutable { owner.reset(); });
+		}
+	}
 	std::scoped_lock lock(m_cpu_store_mutex);
 	for (uint64_t page = first_page; page <= last_page; page++) {
 		const auto  found   = m_prefetched.find(page);
