@@ -255,6 +255,7 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	args << "--sync-raw-image-buffers" << BoolArg(info.sync_raw_image_buffers);
 	args << "--trophy-notifications" << BoolArg(info.trophy_enabled);
 	args << "--skip-notice-screen" << BoolArg(info.skip_notice_screen);
+	args << "--network-connected" << BoolArg(info.network_connected);
 	if (info.tessellation_enabled) {
 		args << "--tessellation";
 	}

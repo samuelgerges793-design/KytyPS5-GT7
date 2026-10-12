@@ -39,13 +39,7 @@ enum class CommandBufferDebugOp : uint32_t {
 	DispatchDirect,
 	DrawIndex,
 	DrawIndexAuto,
-	EopWrite,
-	EopInterrupt,
-	EopWriteBack,
-	EopFlip,
-	EopWriteBackFlip,
-	EopOnlyFlip,
-	DispatchIndirect,
+	DispatchIndirect = 9,
 	Unknown,
 };
 

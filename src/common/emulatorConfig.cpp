@@ -100,6 +100,10 @@ bool VulkanValidationEnabled() {
 	return g_config->vulkan_validation_enabled;
 }
 
+bool IsNetworkConnected() {
+	return g_config->network_connected;
+}
+
 bool ShaderValidationEnabled() {
 	return g_config->shader_validation_enabled;
 }

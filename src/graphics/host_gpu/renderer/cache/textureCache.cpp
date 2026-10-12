@@ -2020,6 +2020,9 @@ void TextureCache::RunGarbageCollector() {
 }
 
 void TextureCache::ProcessDownloadImages() {
+	if (!m_readback_linear_images) {
+		return;
+	}
 	std::scoped_lock lock {m_lock};
 	for (const auto id: m_download_images) {
 		const auto owner = m_slot_images.try_get(id);

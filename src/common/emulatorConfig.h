@@ -58,6 +58,7 @@ struct ConfigOptions {
 	bool                   splash_enabled              = true;
 	bool                   vr_enabled                  = false;
 	bool                   amd_cpu_enabled             = false;
+	bool                   network_connected           = false;
 	uint32_t               vblank_frequency            = 60;
 	uint32_t               console_language            = DEFAULT_CONSOLE_LANGUAGE;
 	bool                   vulkan_validation_enabled   = false;
@@ -105,6 +106,7 @@ bool     HdrEnabled();
 bool     HideCursorEnabled();
 bool     VrEnabled();
 bool     AmdCpuEnabled();
+bool     IsNetworkConnected();
 uint32_t GetVblankFrequency();
 uint32_t GetConsoleLanguage();
 bool     VulkanValidationEnabled();
