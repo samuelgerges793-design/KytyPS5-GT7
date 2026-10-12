@@ -793,10 +793,11 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
 
 		// The CPU sweeps through these buffers: one wait downloads the GPU-written pages around
-		// the access too (KYTY_READBACK_WINDOW_KB, default 64; 0 = just the access), so the
+		// the access too (KYTY_READBACK_WINDOW_KB, e.g. 64; default 0 = just the access), so the
 		// next accesses do not each need one. Pages it hands back stay clean for CPU-write
-		// tracking. GT7 races: +40% fps (the freezes it seemed to cause were the CP sync bug).
-		static LiveSetting window_kb("KYTY_READBACK_WINDOW_KB", 64);
+		// tracking. Off: in GT7 it copied stale GPU data over command buffers the game had just
+		// written in the same window (hardware watchpoints, Oct 12), freezing or crashing races.
+		static LiveSetting window_kb("KYTY_READBACK_WINDOW_KB", 0);
 		const uint64_t     window = window_kb.Get() == 0 ? 0 : std::bit_floor(window_kb.Get()) * 1024ull;
 		uint64_t begin = vaddr;
 		uint64_t end   = vaddr + size;
@@ -1121,7 +1122,13 @@ uint64_t BufferCache::SyncGpuWrittenRange(uint64_t vaddr, uint64_t size, bool fo
 			// output: writing it back emptied GT7's compute command buffers and froze race loads
 			// (KYTY_CP_SYNC_ZERO_GUARD=0 turns the guard off).
 			static LiveSetting zero_guard("KYTY_CP_SYNC_ZERO_GUARD", 1);
-			if (zero_guard.Get() != 0 && std::all_of(a, a + (end - begin), [](uint8_t v) { return v == 0; })) {
+			// Only when the guest bytes start like a PM4 packet (type 3, sane length): other bytes
+			// there are stale data, not commands.
+			uint32_t guest_header = 0;
+			std::memcpy(&guest_header, b, std::min<uint64_t>(4, end - begin));
+			const bool looks_like_commands = (guest_header >> 30u) == 3u && ((guest_header >> 16u) & 0x3fffu) < 0x400u;
+			if (zero_guard.Get() != 0 && looks_like_commands &&
+			    std::all_of(a, a + (end - begin), [](uint8_t v) { return v == 0; })) {
 				static std::atomic<uint32_t> guard_logged {0};
 				if (guard_logged.fetch_add(1, std::memory_order_relaxed) < 16) {
 					uint32_t first = 0;

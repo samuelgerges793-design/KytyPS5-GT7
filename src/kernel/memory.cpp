@@ -930,6 +930,10 @@ bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 	return TryReadBacking(vaddr, data, size);
 }
 
+uint64_t TryClampRangeSize(uint64_t vaddr, uint64_t size) {
+	return g_virtual_ranges == nullptr ? 0 : g_virtual_ranges->ClampRangeSize(vaddr, size);
+}
+
 uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
 	EXIT_IF(g_virtual_ranges == nullptr);
 

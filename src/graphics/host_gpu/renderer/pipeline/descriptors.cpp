@@ -813,8 +813,18 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 					size = std::min({size, uint64_t {256} * 1024 * 1024, limit});
 				}
 			}
-			size = Libs::LibKernel::Memory::ClampRangeSize(address, size);
-			source = {address, size, cache.FindBuffer(address, size)};
+			// A buffer at an unmapped address (stale setup data, or memory the game freed) binds
+			// the null buffer instead of exiting.
+			size = Libs::LibKernel::Memory::TryClampRangeSize(address, size);
+			if (size == 0) {
+				static std::atomic<uint32_t> logged {0};
+				if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+					Log::WriteToConsoleAndLog(fmt::format("descriptors: buffer at unmapped address 0x{:x}; bound as null\n", address));
+				}
+				source = {0, 0, NULL_BUFFER_ID};
+			} else {
+				source = {address, size, cache.FindBuffer(address, size)};
+			}
 		}
 	}
 }
