@@ -1039,6 +1039,7 @@ std::string BufferCache::DescribePages(uint64_t vaddr, uint64_t size) {
 }
 
 uint64_t BufferCache::SyncGpuWrittenRange(uint64_t vaddr, uint64_t size, bool force) {
+	NoteCommandPages(vaddr, size);
 	static const bool enabled = std::getenv("KYTY_NO_CP_SYNC") == nullptr;
 	if (!enabled || size == 0 || !GuestRange {vaddr, size}.Valid() ||
 	    !IsRegionRegistered(vaddr, size) || m_scheduler.Current().IsInvalid()) {

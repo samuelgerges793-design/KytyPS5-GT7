@@ -1855,8 +1855,9 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 		for (uint64_t page_offset = 0; page_offset < range.size;) {
 			const auto address = range.address + page_offset;
 			const auto bytes   = std::min<uint64_t>(4096u - (address & 4095u), range.size - page_offset);
-			if (LibKernel::Memory::TryReadBacking(address, current.data(), bytes) &&
-			    std::memcmp(current.data(), before->data() + page_offset, bytes) != 0) {
+			if (IsRecentCommandPage(address) ||
+			    (LibKernel::Memory::TryReadBacking(address, current.data(), bytes) &&
+			     std::memcmp(current.data(), before->data() + page_offset, bytes) != 0)) {
 				kept_pages++;
 			} else {
 				LibKernel::Memory::WriteBacking(address, mapped + page_offset, bytes);

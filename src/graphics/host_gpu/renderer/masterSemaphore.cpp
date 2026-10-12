@@ -590,6 +590,25 @@ std::string GpuProfileTake(double seconds) {
 	return text;
 }
 
+namespace {
+std::mutex                             g_command_pages_mutex;
+std::unordered_map<uint64_t, uint64_t> g_command_pages; // page -> last read (PerfNow ns)
+} // namespace
+
+void NoteCommandPages(uint64_t vaddr, uint64_t size) {
+	if (size == 0) return;
+	const auto       now = PerfNow();
+	std::scoped_lock lock(g_command_pages_mutex);
+	if (g_command_pages.size() > 65536) g_command_pages.clear();
+	for (uint64_t page = vaddr >> 12u; page <= (vaddr + size - 1u) >> 12u; page++) g_command_pages[page] = now;
+}
+
+bool IsRecentCommandPage(uint64_t vaddr) {
+	std::scoped_lock lock(g_command_pages_mutex);
+	const auto       found = g_command_pages.find(vaddr >> 12u);
+	return found != g_command_pages.end() && PerfNow() - found->second < 10'000'000'000ull;
+}
+
 void PerfAdd(PerfCounter counter, uint64_t nanoseconds) {
 	auto& totals = g_perf[static_cast<size_t>(counter)];
 	totals.ns.fetch_add(nanoseconds, std::memory_order_relaxed);
