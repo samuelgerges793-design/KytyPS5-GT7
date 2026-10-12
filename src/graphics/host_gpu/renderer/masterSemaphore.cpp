@@ -439,6 +439,8 @@ void HwWatchNoteBackingWrite(uint64_t vaddr, const void* data, uint64_t size) no
 			Log::WriteToConsoleAndLog(fmt::format("hwwatch: backing write [{:x}] <- {:016x} (range 0x{:x}+0x{:x}, was {:016x}) t={:.3f} gpu-thread={}\n",
 			                                      address, value, vaddr, size, ReadGuest64(address),
 			                                      static_cast<double>(PerfNow()) / 1e9, GuestGpu::IsGpuThread()));
+			static std::atomic<uint32_t> traced {0};
+			if (traced.fetch_add(1, std::memory_order_relaxed) < 60) DebugPrintHostBacktrace("hwwatch backing write");
 		}
 	}
 }
