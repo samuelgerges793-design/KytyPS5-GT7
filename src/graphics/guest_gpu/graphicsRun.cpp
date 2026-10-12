@@ -690,12 +690,7 @@ bool GuestGpu::Process(Submission& submission) {
 				}
 			}
 			if (progressed) {
-				if (complete) {
-					m_renderer.RunGarbageCollector();
-				}
 				cp.BufferFlush();
-			} else if (complete) {
-				m_renderer.RunGarbageCollector();
 			}
 			break;
 		}
@@ -716,20 +711,16 @@ bool GuestGpu::Process(Submission& submission) {
 			complete = cp.Process(submission.command_execution, submission.commands) ==
 			           Pm4ProcessResult::Complete;
 			if (submission.command_execution.MadeProgress()) {
-				if (complete) {
-					m_renderer.RunGarbageCollector();
-				}
 				cp.BufferFlush();
-			} else if (complete) {
-				m_renderer.RunGarbageCollector();
 			}
 			break;
 		}
 		case SubmissionType::FlipPreparation:
-			m_renderer.RunGarbageCollector();
 			cp.PrepareCpuFlip(submission.flip_request_id);
 			break;
 		case SubmissionType::SuspendPoint:
+			// Age caches at the frame boundary, not once per command list.
+			m_renderer.RunGarbageCollector();
 			cp.EmitGlobalBarrier();
 			m_renderer.GetCommandScheduler().DeferPriorityOperation(
 			    [ready = m_suspend_point_ready] { ready->release(); });

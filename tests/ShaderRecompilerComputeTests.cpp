@@ -166,6 +166,8 @@ struct BufferCacheTestAccess {
   static_assert(std::same_as<decltype(BufferCache::m_slot_buffers),
                              Common::SlotVector<Buffer>>);
 
+  static uint64_t GcTick(const BufferCache &cache) { return cache.m_gc_tick; }
+
   static void SetGarbageCollectionThresholds(BufferCache &cache,
                                              uint64_t trigger,
                                              uint64_t critical) {
@@ -230,6 +232,8 @@ struct TextureCacheTestAccess {
   static_assert(TextureCache::ImagePageTable::kPageBits == 20);
   static_assert(TextureCache::ImagePageTable::kAddressSpaceBits == 44);
   static_assert(TextureCache::ImagePageTable::kFirstLevelBits == 14);
+
+  static uint64_t GcTick(const TextureCache &cache) { return cache.m_gc_tick; }
 
   static std::unique_lock<TrackingSpinLock> Lock(TextureCache &cache) {
     return std::unique_lock(cache.m_lock);
@@ -2621,6 +2625,31 @@ public:
       packet[4] = value;
     };
 
+    const auto cache_ticks = [&] {
+      std::pair<uint64_t, uint64_t> ticks;
+      gpu.SendCommandSync([&] {
+        ticks = {TextureCacheTestAccess::GcTick(context.GetTextureCache()),
+                 BufferCacheTestAccess::GcTick(context.GetBufferCache())};
+      });
+      return ticks;
+    };
+    const auto initial_cache_ticks = cache_ticks();
+    uint32_t graphics_value = 0;
+    uint32_t async_value = 0;
+    std::array<uint32_t, 5> graphics_list{}, compute_list{};
+    write(graphics_list.data(), &graphics_value, 17);
+    write(compute_list.data(), &async_value, 29);
+    // A frame can contain many lists; completing them must not age either cache.
+    for (uint32_t i = 0; i < 32; ++i) {
+      gpu.Submit(graphics_list, {});
+      gpu.SubmitCompute(0x20, compute_list);
+    }
+    finish();
+    Require(name, "command-list cache lifetime",
+            graphics_value == 17 && async_value == 29 &&
+                cache_ticks() == initial_cache_ticks,
+            "individual graphics or compute lists aged the caches within a frame");
+
     gpu.SendCommandSync([&] {
       setup.BufferInit();
       SubmitInfo blocked;
@@ -2655,6 +2684,10 @@ public:
     parser.join();
     Require(name, "marker insertion", parser_nonblocking,
             "inserting a suspend point blocked the GPU command thread");
+    Require(name, "frame cache maintenance",
+            cache_ticks() == std::pair{initial_cache_ticks.first + 1,
+                                      initial_cache_ticks.second + 1},
+            "a suspend point did not age both caches exactly once");
 
     std::binary_semaphore second_entered{0};
     std::binary_semaphore second_returned{0};
@@ -2692,6 +2725,10 @@ public:
             "or the host command lane");
     Require(name, "frame count", gpu.GetFrameNum() == 2,
             "suspend-point insertion did not advance the frame counter once");
+    Require(name, "async cache lifetime",
+            cache_ticks() == std::pair{initial_cache_ticks.first + 2,
+                                      initial_cache_ticks.second + 2},
+            "asynchronous work aged the caches between frame boundaries");
 
     // A marker must stay behind a stalled graphics stream, then clear its
     // predicate before the next stream. Async compute releases that stream.
@@ -6868,6 +6905,99 @@ public:
               "buffer-backed refresh incorrectly transferred dirty ownership "
               "to the image");
       texture_cache.MarkGpuWritten(mirror_refresh);
+
+      // Unity copies BC mip regions and packed mip tails through integer images.
+      // The CPU allocation remains white; later array sampling must see GPU writes.
+      for (uint32_t format_index = 0; format_index < 3; ++format_index) {
+        constexpr std::array formats{vk::Format::eBc4UnormBlock,
+                                     vk::Format::eBc5UnormBlock,
+                                     vk::Format::eBc7UnormBlock};
+        constexpr std::array guest_formats{Prospero::BufferFormat::kBc4UNorm,
+                                           Prospero::BufferFormat::kBc5UNorm,
+                                           Prospero::BufferFormat::kBc7UNorm};
+        constexpr uint32_t width = 128, levels = 8, layers = 3;
+        const uint32_t block_bytes = format_index == 0 ? 8 : 16;
+        const uint64_t address = base + 0x1900000 + format_index * 0x40000;
+        auto array = MakeLinearDesc(address, 0, formats[format_index],
+            guest_formats[format_index], Prospero::ImageType::kColor2D,
+            {width, width, 1}, layers, block_bytes, 1);
+        array.info.resources.levels = levels;
+        array.info.tile_mode = Prospero::TileMode::kStandard4KB;
+        array.info.UpdateSize();
+        array.view_info.level_count = levels;
+        std::memset(memory + address - base, 0xff, array.info.data.size);
+        auto value_for = [&](uint32_t layer, uint64_t offset) {
+          return 0x7c000000u | (format_index << 16) | (layer << 8) |
+                 static_cast<uint32_t>(offset / 4096);
+        };
+        auto write_raw = [&](uint32_t layer, uint32_t level, uint32_t value) {
+          const auto &mip = array.info.mip_layout[level];
+          auto raw = MakeLinearDesc(
+              address + layer * array.info.tiled_slice_stride + mip.offset, 0,
+              block_bytes == 8 ? vk::Format::eR32G32Uint
+                               : vk::Format::eR32G32B32A32Uint,
+              block_bytes == 8 ? Prospero::BufferFormat::k32_32UInt
+                               : Prospero::BufferFormat::k32_32_32_32UInt,
+              Prospero::ImageType::kColor2D, {mip.pitch, mip.height, 1},
+              1, block_bytes, 1);
+          raw.type = BindingType::Storage;
+          raw.info.tile_mode = array.info.tile_mode;
+          raw.info.UpdateSize();
+          raw.view_info.usage = vk::ImageUsageFlagBits::eStorage;
+          const auto producer = texture_cache.FindImage(raw);
+          (void)texture_cache.FindTexture(producer, raw);
+          vk::ClearValue clear{};
+          std::fill_n(clear.color.uint32.data(), 4, value);
+          TextureCacheTestAccess::ClearImage(texture_cache, scheduler.Current(),
+              producer, {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, clear);
+        };
+        for (const uint32_t layer : {0u, 2u}) {
+          uint64_t previous_offset = UINT64_MAX;
+          for (uint32_t level = 0; level < levels; ++level) {
+            const auto offset = array.info.mip_layout[level].offset;
+            if (offset == previous_offset) continue;
+            previous_offset = offset;
+            write_raw(layer, level, value_for(layer, offset));
+          }
+        }
+        std::vector<vk::BufferImageCopy> probes;
+        std::vector<uint32_t> expected;
+        for (uint32_t layer = 0; layer < layers; ++layer) {
+          for (uint32_t level = 0; level < levels; ++level) {
+            vk::BufferImageCopy copy{};
+            copy.bufferOffset = expected.size() * sizeof(uint32_t);
+            copy.imageSubresource = {vk::ImageAspectFlagBits::eColor, level, layer, 1};
+            copy.imageExtent = {std::min(width >> level, 4u),
+                                std::min(width >> level, 4u), 1};
+            probes.push_back(copy);
+            expected.insert(expected.end(), block_bytes / sizeof(uint32_t),
+                layer == 1 ? UINT32_MAX
+                           : value_for(layer, array.info.mip_layout[level].offset));
+          }
+        }
+        auto verify_array = [&] {
+          const auto consumer = texture_cache.FindImage(array);
+          (void)texture_cache.FindTexture(consumer, array);
+          auto readback = CreateHostBuffer(name, expected.size() * sizeof(uint32_t),
+              vk::BufferUsageFlagBits::eTransferDst, std::vector<uint32_t>(expected.size()));
+          texture_cache.GetImage(consumer).Download(probes, readback.buffer, 0, readback.size);
+          HostReadBarrier(readback.buffer, readback.size, vk::PipelineStageFlagBits::eTransfer,
+                          vk::AccessFlagBits::eTransferWrite);
+          scheduler.Finish();
+          Require(name, "raw image producers populate BC array",
+                  ReadBuffer(name, readback, expected.size()) == expected,
+                  "BC array lost GPU mip/tail writes or overwrote an untouched layer");
+          DestroyBuffer(&readback);
+        };
+        verify_array();
+        constexpr uint32_t replacement = 0x13579bdfu;
+        write_raw(2, array.info.first_tail_level, replacement);
+        for (uint32_t level = array.info.first_tail_level; level < levels; ++level) {
+          const auto word = (2 * levels + level) * block_bytes / sizeof(uint32_t);
+          std::fill_n(expected.begin() + word, block_bytes / sizeof(uint32_t), replacement);
+        }
+        verify_array();
+      }
 
       // A write through a separate buffer must not replace untouched image
       // texels with stale backing bytes. Exact-base writes still refresh it.
