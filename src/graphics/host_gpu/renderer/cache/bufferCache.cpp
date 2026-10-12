@@ -951,7 +951,9 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		uint64_t                    prefetch_seq   = 0;
 		uint64_t                    prefetch_store = 0;
 		if (window == 0 && prefetch_kb.Get() != 0) {
-			if (TryPublishPrefetched(vaddr, size)) {
+			// KYTY_READBACK_PREFETCH_USE=0: copies are made but never handed over (diagnostics).
+			static LiveSetting prefetch_use("KYTY_READBACK_PREFETCH_USE", 1);
+			if (prefetch_use.Get() != 0 && TryPublishPrefetched(vaddr, size)) {
 				PerfAdd(PerfCounter::PrefetchHit, 0);
 				if (is_write) m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
 				return;
