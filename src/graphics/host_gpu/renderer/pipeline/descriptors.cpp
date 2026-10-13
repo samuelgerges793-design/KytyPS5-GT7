@@ -316,6 +316,12 @@ static bool IsSupportedStorageTextureEncoding(const ShaderRecompiler::IR::ImageR
 		return common && descriptor.fields[4] == 0 && descriptor.fields[5] == 0 &&
 		       descriptor.fields[6] == 0 && descriptor.fields[7] == 0;
 	}
+	// A 256-bit resource given an all-zero upper half (GT7 at boot when readbacks are fast):
+	// the lower half is a complete description; depth and array base are zero.
+	if (common && descriptor.fields[4] == 0 && descriptor.fields[5] == 0 && descriptor.fields[6] == 0 &&
+	    descriptor.fields[7] == 0) {
+		return true;
+	}
 	return common && descriptor.fields[4] == expected_field4 &&
 	       (descriptor.fields[5] & ~field5_max_mip_mask) == field5_expected;
 }
