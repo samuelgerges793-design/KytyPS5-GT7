@@ -738,8 +738,15 @@ bool BufferCache::TryPublishPrefetched(uint64_t vaddr, uint64_t size) {
 	if (m_prefetched.empty()) return false;
 	const auto first_page = vaddr >> 12u;
 	const auto last_page  = (vaddr + size - 1u) >> 12u;
-	// Every page must have a copy that no recorded GPU write has made stale.
+	// Every page the GPU still owns must have a copy that no recorded GPU write has made stale.
+	// Copies of pages handed over since are dropped: their store replay would be old data.
+	std::vector<uint64_t> owned;
 	for (uint64_t page = first_page; page <= last_page; page++) {
+		if (!m_memory_tracker.IsRegionGpuModified(page << 12u, 0x1000)) {
+			m_prefetched.erase(page);
+			continue;
+		}
+		owned.push_back(page);
 		const auto found = m_prefetched.find(page);
 		if (found == m_prefetched.end()) return false;
 		const auto& entry = *found->second;
@@ -765,7 +772,7 @@ bool BufferCache::TryPublishPrefetched(uint64_t vaddr, uint64_t size) {
 		auto& buffer = m_slot_buffers[FindBuffer(first_page << 12u, (last_page - first_page + 1u) << 12u)];
 		std::vector<vk::BufferCopy> copies;
 		uint64_t                    total = 0;
-		for (uint64_t page = first_page; page <= last_page; page++) {
+		for (const auto page: owned) {
 			for (const auto [offset, bytes]: m_prefetched[page]->ranges) {
 				copies.emplace_back((page << 12u) + offset - buffer.CpuAddress(), total, bytes);
 				total += Common::AlignUp(uint64_t {bytes}, 16);
@@ -820,8 +827,9 @@ bool BufferCache::TryPublishPrefetched(uint64_t vaddr, uint64_t size) {
 			m_scheduler.DeferOperation([owner = std::move(staging)]() mutable { owner.reset(); });
 		}
 	}
+	if (owned.empty()) return false;
 	std::scoped_lock lock(m_cpu_store_mutex);
-	for (uint64_t page = first_page; page <= last_page; page++) {
+	for (const auto page: owned) {
 		const auto  found   = m_prefetched.find(page);
 		const auto& entry   = *found->second;
 		const auto  address = page << 12u;
@@ -1017,6 +1025,9 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			}
 		}
 		const bool downloaded = DownloadBufferMemory<false>(buffer, begin, end - begin);
+		for (uint64_t page = begin >> 12u; !m_prefetched.empty() && page <= (end - 1u) >> 12u; page++) {
+			m_prefetched.erase(page); // Handed over by this download.
+		}
 		if (downloaded) {
 			m_memory_tracker.UnmarkRegionAsGpuModified(begin, end - begin);
 			PerfAdd(PerfCounter::ReadbackWindowBytes, end - begin);
