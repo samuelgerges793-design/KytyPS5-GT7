@@ -736,6 +736,15 @@ void BufferCache::LogWriteMark(uint64_t begin, uint64_t end) {
 
 bool BufferCache::TryPublishPrefetched(uint64_t vaddr, uint64_t size) {
 	if (m_prefetched.empty()) return false;
+	// A normal readback also runs the completion work queued for the GPU (image downloads into
+	// guest memory, interrupts): finish what is done, and drain normally if more is pending.
+	auto& master = m_scheduler.GetMasterSemaphore();
+	master.Refresh();
+	m_scheduler.WaitPriorityOperations(master.KnownGpuTick());
+	if (m_scheduler.HasPendingPriorityOperations()) {
+		PerfAdd(PerfCounter::PrefetchStale, 0);
+		return false;
+	}
 	const auto first_page = vaddr >> 12u;
 	const auto last_page  = (vaddr + size - 1u) >> 12u;
 	// Every page the GPU still owns must have a copy that no recorded GPU write has made stale.
