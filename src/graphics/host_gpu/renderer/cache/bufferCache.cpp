@@ -755,6 +755,10 @@ bool BufferCache::TryPublishPrefetched(uint64_t vaddr, uint64_t size) {
 			m_prefetched.erase(page);
 			continue;
 		}
+		if (IsRecentCommandPage(page << 12u)) {
+			m_prefetched.erase(page);
+			return false; // Command memory: always the full wait.
+		}
 		owned.push_back(page);
 		const auto found = m_prefetched.find(page);
 		if (found == m_prefetched.end()) return false;
@@ -1024,7 +1028,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 						    for (uint64_t cursor = start; cursor < end;) {
 							    const auto page_address = cursor & ~uint64_t {0xfff};
 							    const auto stop         = std::min(end, page_address + 0x1000u);
-							    if ((page_address < page_begin || page_address >= page_end) && !open_write(page_address)) {
+							    if ((page_address < page_begin || page_address >= page_end) && !open_write(page_address) && !IsRecentCommandPage(page_address)) {
 								    prefetch_copies.emplace_back(cursor - buffer.CpuAddress(), total, stop - cursor);
 								    total += Common::AlignUp(stop - cursor, 16);
 							    }
