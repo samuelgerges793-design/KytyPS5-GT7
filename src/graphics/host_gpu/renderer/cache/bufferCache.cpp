@@ -806,11 +806,37 @@ bool BufferCache::TryPublishPrefetched(uint64_t vaddr, uint64_t size) {
 			                       0, nullptr, 0, nullptr);
 			m_scheduler.Wait(m_scheduler.CurrentTick());
 			staging->Invalidate(0, total);
-			const auto* now = staging->Mapped().data();
-			for (const auto& copy: copies) {
+			std::vector<uint8_t> now_image(staging->Mapped().data(), staging->Mapped().data() + total);
+			std::vector<std::vector<uint8_t>> old_images;
+			{
+				// Both sides get the stores the handover replays: only GPU-side differences remain.
+				std::scoped_lock lock(m_cpu_store_mutex);
+				for (const auto& copy: copies) {
+					const auto address = buffer.CpuAddress() + copy.srcOffset;
+					const auto& entry  = *m_prefetched[address >> 12u];
+					old_images.emplace_back(entry.bytes.data() + (address & 0xfffu),
+					                        entry.bytes.data() + (address & 0xfffu) + copy.size);
+					auto&      old_image = old_images.back();
+					const auto apply     = [&](const auto& store) {
+                        const auto lo = std::max<uint64_t>(store.address, address);
+                        const auto hi = std::min<uint64_t>(store.address + store.size, address + copy.size);
+                        if (lo >= hi) return;
+                        std::memcpy(old_image.data() + (lo - address), store.bytes.data() + (lo - store.address), hi - lo);
+                        std::memcpy(now_image.data() + copy.dstOffset + (lo - address),
+                                    store.bytes.data() + (lo - store.address), hi - lo);
+					};
+					for (uint64_t sequence = entry.first_store; sequence < m_recent_store_count; sequence++) {
+						apply(m_recent_stores[sequence % m_recent_stores.size()]);
+					}
+					for (const auto& store: m_cpu_stores) apply(store);
+				}
+			}
+			const auto* now = now_image.data();
+			for (size_t copy_index = 0; copy_index < copies.size(); copy_index++) {
+				const auto& copy    = copies[copy_index];
 				const auto  address = buffer.CpuAddress() + copy.srcOffset;
 				const auto& entry   = *m_prefetched[address >> 12u];
-				const auto* old     = entry.bytes.data() + (address & 0xfffu);
+				const auto* old     = old_images[copy_index].data();
 				if (std::memcmp(old, now + copy.dstOffset, copy.size) == 0) continue;
 				uint64_t first = 0;
 				while (old[first] == now[copy.dstOffset + first]) first++;
@@ -831,7 +857,8 @@ bool BufferCache::TryPublishPrefetched(uint64_t vaddr, uint64_t size) {
 				}
 				PerfAdd(PerfCounter::PatchVerifyMismatch, 0);
 				// Publish the GPU's current bytes instead.
-				std::memcpy(m_prefetched[address >> 12u]->bytes.data() + (address & 0xfffu), now + copy.dstOffset, copy.size);
+				std::memcpy(m_prefetched[address >> 12u]->bytes.data() + (address & 0xfffu),
+				            staging->Mapped().data() + copy.dstOffset, copy.size);
 			}
 			m_scheduler.DeferOperation([owner = std::move(staging)]() mutable { owner.reset(); });
 		}
