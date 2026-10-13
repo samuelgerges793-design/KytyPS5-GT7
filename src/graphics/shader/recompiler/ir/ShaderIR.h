@@ -20,6 +20,7 @@
 #include <memory>
 #include <optional>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 namespace Xbyak {
@@ -27,6 +28,11 @@ class CodeGenerator;
 }
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
+
+class SrtWalker;
+
+// Finite descriptor domains also bound the arithmetic used to prove their indices.
+constexpr uint32_t MaxIndirectDescriptorProbes = 65536u;
 
 enum class ResourceKind {
 	None,
@@ -519,9 +525,23 @@ struct ShaderInfo {
 struct DescriptorSource {
 	struct IndirectDescriptor {
 		struct SelectorRead {
+			struct CountedRows {
+				uint32_t source = UINT32_MAX;
+				uint32_t stride = 0; // Byte spacing between selector rows, not their length.
+
+				bool operator==(const CountedRows& other) const = default;
+			};
 			uint32_t source = UINT32_MAX;
 			uint32_t stride = 0;
 			uint32_t offset = 0;
+			uint32_t maximum = UINT32_MAX;
+			uint32_t bit_offset = 0;
+			uint32_t bit_mask = UINT32_MAX;
+			bool global = false;
+			// Four DWORD bitmap words per record; set-bit ranks subtract from the last key.
+			bool bitset = false;
+			std::optional<CountedRows> rows;
+			std::vector<std::pair<uint32_t, uint32_t>> byte_ranges;
 
 			bool operator==(const SelectorRead& other) const = default;
 		};
@@ -532,8 +552,11 @@ struct DescriptorSource {
 		uint32_t table_stride    = 0;
 		uint32_t table_record_bytes = 0;
 		bool     table_scalar = false;
+		bool     indexed_store = false;
+		bool     signed_count = false;
 		uint32_t workgroup_axis  = UINT32_MAX;
 		Value    key_count;
+		// First selector index, or first descriptor key for a direct or bitmap range.
 		Value                 selector_first;
 		Value    selector_mask;
 		std::vector<uint32_t> sources;
@@ -600,6 +623,9 @@ struct ResourcePlan {
 
 		std::vector<Entry> values;
 		uint64_t           generation = 0;
+		const SrtWalker*    session = nullptr;
+		Value              active_mask;
+		uint8_t            read_policy = 0;
 	};
 
 	ResourcePlan();
@@ -618,6 +644,7 @@ struct ResourcePlan {
 	std::vector<MemoryInfo>             memory_info;
 	std::vector<DescriptorSource>       descriptor_sources;
 	std::vector<ResourceBlock>          control_flow;
+	std::unordered_map<const Inst*, std::vector<uint32_t>> control_phi_predecessors;
 	std::vector<SrtRead>                srt_reads;
 	std::vector<GpuScalarRead>                 gpu_scalar_reads;
 	bool                                requires_specialization_memory = false;
@@ -631,9 +658,9 @@ struct ResourcePlan {
 	// GPU-thread scratch for nested clean/EXEC memos, activity and material keys.
 	mutable std::deque<EvaluationContext> evaluation_contexts;
 	mutable uint32_t                       evaluation_value_count = 0;
-	mutable uint32_t                       evaluation_depth       = 0;
 	mutable std::vector<uint8_t>            active_sources;
 	mutable std::vector<uint8_t>            visited_blocks;
+	mutable std::vector<uint8_t>            reachable_blocks;
 	mutable std::vector<uint32_t>           pending_blocks;
 	mutable std::vector<uint32_t>           material_keys;
 };
