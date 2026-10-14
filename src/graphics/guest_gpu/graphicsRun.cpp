@@ -925,6 +925,21 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 
 		const auto packet_dw =
 		    handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
+		if (packet_dw > remaining_dw) {
+			// Garbage command data: log where it is (KYTY_HW_WATCH can then catch the writer).
+			const auto offset = total_dw - remaining_dw;
+			auto* const base  = packet - offset;
+			std::string text  = fmt::format("bad PM4 packet: header {:08x} claims {} dwords, {} left, at 0x{:x} "
+			                                "(offset 0x{:05x} of buffer 0x{:x}, {} dwords):",
+			                                packet_header, packet_dw, remaining_dw,
+			                                reinterpret_cast<uint64_t>(packet), offset,
+			                                reinterpret_cast<uint64_t>(base), total_dw);
+			for (uint32_t i = (offset > 8 ? offset - 8 : 0); i < std::min<uint32_t>(total_dw, offset + 16); i++) {
+				text += fmt::format("{}{:05x}{} {:08x}", i % 4 == 0 ? "\n  " : "  ", i, i == offset ? "*" : " ",
+				                    base[i]);
+			}
+			Log::WriteToConsoleAndLog(text + "\n");
+		}
 		EXIT_IF(packet_dw > remaining_dw);
 		if (execution.m_suspended) {
 			return;

@@ -25,6 +25,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdlib>
 #include <fmt/format.h>
 #include <list>
 #include <thread>
@@ -1446,6 +1447,8 @@ KYTY_SYSV_ABI int VideoOutRegisterBuffers2(int handle, int set_index, int buffer
 	     buffer_index_start, buffer_num, set_index, attribute->pixel_format, attribute->tiling_mode,
 	     attribute->aspect_ratio, attribute->width, attribute->height, attribute->pitch_in_pixel,
 	     attribute->option, category);
+	Log::WriteToConsoleAndLog(fmt::format("videoout: display buffers {}x{} (set {}, {} buffers)\n",
+	                                      attribute->width, attribute->height, set_index, buffer_num));
 
 	if (option != nullptr) {
 		return VIDEO_OUT_ERROR_INVALID_OPTION;
@@ -1796,6 +1799,16 @@ KYTY_SYSV_ABI int VideoOutGetOutputStatus(int handle, VideoOutOutputStatus* stat
 	// Primary output reports 4K unless param.json Video-out Info enables resolution detection.
 	status->resolution =
 	    ((attribute3 & 4) != 0 && ctx->width < 3840 && ctx->height < 2160 ? 1u : 2u);
+	// KYTY_OUTPUT_RESOLUTION=<code> reports that output resolution code instead (experiments
+	// with the resolution a title renders at).
+	if (const char* forced = std::getenv("KYTY_OUTPUT_RESOLUTION"); forced != nullptr && *forced != 0) {
+		status->resolution = static_cast<uint32_t>(std::atoi(forced));
+	}
+	static std::atomic_bool logged_status {false};
+	if (!logged_status.exchange(true)) {
+		Log::WriteToConsoleAndLog(fmt::format("videoout: output status resolution {} (attribute3 0x{:x})\n",
+		                                      status->resolution, attribute3));
+	}
 	status->dynamicRange = hdr_allowed && DriverState().IsHdrSupported() ? 2u : 1u;
 	status->refreshRate =
 	    (ctx->output_mode == VIDEO_OUT_OUTPUT_MODE_119_88HZ || Config::GetVblankFrequency() >= 119

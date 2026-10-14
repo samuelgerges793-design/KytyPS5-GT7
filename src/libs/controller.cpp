@@ -17,7 +17,13 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <chrono>
+#include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <sstream>
+#include <string>
+#include <thread>
 #include <vector>
 
 namespace Libs::Controller {
@@ -397,11 +403,95 @@ static int32_t TriggerEffectState(const PadTriggerEffectCommand& command, int va
 	}
 }
 
+// Scripted pad input for unattended tests (KYTY_PAD_FILE=<path>): lines appended to the file are
+// run in order as player-1 input, so no window focus or host keyboard is needed. Commands:
+// "press <buttons> [ms]" (buttons joined with '+', default 150 ms), "down <buttons>",
+// "up <buttons>", "wait <ms>". Buttons: up down left right cross circle square triangle l1 r1 l2
+// r2 l3 r3 options. Each finished line is counted in <path>.ack.
+static uint32_t PadScriptButtons(const std::string& names) {
+	static const std::pair<const char*, uint32_t> map[] = {
+	    {"up", PAD_BUTTON_UP},         {"down", PAD_BUTTON_DOWN},     {"left", PAD_BUTTON_LEFT},
+	    {"right", PAD_BUTTON_RIGHT},   {"cross", PAD_BUTTON_CROSS},   {"circle", PAD_BUTTON_CIRCLE},
+	    {"square", PAD_BUTTON_SQUARE}, {"triangle", PAD_BUTTON_TRIANGLE}, {"l1", PAD_BUTTON_L1},
+	    {"r1", PAD_BUTTON_R1},         {"l2", PAD_BUTTON_L2},         {"r2", PAD_BUTTON_R2},
+	    {"l3", PAD_BUTTON_L3},         {"r3", PAD_BUTTON_R3},         {"options", PAD_BUTTON_OPTIONS}};
+	uint32_t          buttons = 0;
+	std::stringstream ss(names);
+	std::string       name;
+	while (std::getline(ss, name, '+')) {
+		for (const auto& [n, b]: map) {
+			if (name == n) buttons |= b;
+		}
+	}
+	return buttons;
+}
+
+static void PadScriptSet(uint32_t buttons, bool down) {
+	for (uint32_t bit = 1; bit != 0; bit <<= 1) {
+		if ((buttons & bit) == 0) continue;
+		if (bit == PAD_BUTTON_L2 || bit == PAD_BUTTON_R2) {
+			// Triggers are analog: the axis also sets the digital bit (as the keyboard map does).
+			g_controller->Axis(HOST_INPUT_CONTROLLER_ID,
+			                   bit == PAD_BUTTON_L2 ? Axis::TriggerLeft : Axis::TriggerRight,
+			                   down ? 255 : 0);
+		} else {
+			g_controller->Button(HOST_INPUT_CONTROLLER_ID, bit, down);
+		}
+	}
+}
+
+static void PadScriptThread(std::string path) {
+	std::streamoff offset = 0;
+	uint64_t       done   = 0;
+	std::string    pending;
+	for (;;) {
+		std::this_thread::sleep_for(std::chrono::milliseconds(50));
+		if (g_controller == nullptr) return;
+		std::ifstream file(path, std::ios::binary);
+		if (!file) continue;
+		file.seekg(0, std::ios::end);
+		const auto size = static_cast<std::streamoff>(file.tellg());
+		if (size < offset) offset = 0; // file was truncated: start over
+		if (size == offset) continue;
+		file.seekg(offset);
+		std::string chunk(static_cast<size_t>(size - offset), '\0');
+		file.read(chunk.data(), static_cast<std::streamsize>(chunk.size()));
+		offset = size;
+		pending += chunk;
+		size_t eol = 0;
+		while ((eol = pending.find('\n')) != std::string::npos) {
+			std::stringstream line(pending.substr(0, eol));
+			pending.erase(0, eol + 1);
+			std::string cmd;
+			std::string arg;
+			int         ms = 150;
+			line >> cmd >> arg >> ms;
+			if (cmd == "press") {
+				const auto buttons = PadScriptButtons(arg);
+				PadScriptSet(buttons, true);
+				std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+				PadScriptSet(buttons, false);
+			} else if (cmd == "down" || cmd == "up") {
+				PadScriptSet(PadScriptButtons(arg), cmd == "down");
+			} else if (cmd == "wait") {
+				std::this_thread::sleep_for(std::chrono::milliseconds(std::atoi(arg.c_str())));
+			} else {
+				continue;
+			}
+			std::ofstream(path + ".ack", std::ios::trunc) << ++done << "\n";
+		}
+	}
+}
+
 void Initialize() {
 	EXIT_IF(g_controller != nullptr);
 
 	g_controller = new GameController;
 	g_controller->Connect(HOST_INPUT_CONTROLLER_ID);
+
+	if (const char* pad_file = std::getenv("KYTY_PAD_FILE"); pad_file != nullptr && *pad_file != 0) {
+		std::thread(PadScriptThread, std::string(pad_file)).detach();
+	}
 }
 
 void Shutdown() {
