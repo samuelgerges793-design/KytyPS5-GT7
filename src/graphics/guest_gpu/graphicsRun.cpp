@@ -791,6 +791,36 @@ void NoteIndirectBufferOrigin(const uint32_t* base, uint32_t num_dw, const uint3
 	g_ib_origins[g_ib_origin_next++ % g_ib_origins.size()] = {base, num_dw, control};
 }
 
+// The packet the GPU thread is executing, for the report when a handler hits a fatal error
+// (garbage commands): its neighbourhood, where the buffer came from and the emulator's recent
+// writes into it (KYTY_BACKING_LOG=1).
+static thread_local const uint32_t* g_pm4_base   = nullptr;
+static thread_local uint32_t        g_pm4_total  = 0;
+static thread_local uint32_t        g_pm4_offset = 0;
+
+static void Pm4FatalReport() {
+	if (g_pm4_base == nullptr) return;
+	const auto* base   = g_pm4_base;
+	const auto  offset = g_pm4_offset;
+	std::string text   = fmt::format("fatal while executing PM4 packet {:08x} at 0x{:x} (offset 0x{:05x} of buffer 0x{:x}, {} dwords):",
+	                                 base[offset], reinterpret_cast<uint64_t>(base + offset), offset,
+	                                 reinterpret_cast<uint64_t>(base), g_pm4_total);
+	for (uint32_t i = (offset > 8 ? offset - 8 : 0); i < std::min<uint32_t>(g_pm4_total, offset + 16); i++) {
+		text += fmt::format("{}{:05x}{} {:08x}", i % 4 == 0 ? "\n  " : "  ", i, i == offset ? "*" : " ", base[i]);
+	}
+	for (const auto& origin: g_ib_origins) {
+		if (origin.base == base && origin.control != nullptr) {
+			text += fmt::format("\n  size {} dwords came from the IB packet control at 0x{:x}, now 0x{:08x}", origin.num_dw,
+			                    reinterpret_cast<uint64_t>(origin.control), *origin.control);
+		}
+	}
+	text += fmt::format("\n  emulator writes into the buffer:{}", BackingWritesOverlapping(reinterpret_cast<uint64_t>(base),
+	                                                                                      uint64_t {g_pm4_total} * 4u + 64u));
+	Log::WriteToConsoleAndLog(text + "\n");
+}
+
+static const bool g_pm4_fatal_hook = (Common::SetFatalHook(&Pm4FatalReport), true);
+
 void CommandProcessor::ProcessIndirectBuffer(std::span<const uint32_t> commands, bool chain) {
 	EXIT_IF(g_current_execution == nullptr);
 	EXIT_IF(!g_current_execution->m_next_buffer.empty());
@@ -943,6 +973,9 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			     total_dw - remaining_dw, packet_header);
 		}
 
+		g_pm4_base   = packet - (total_dw - remaining_dw);
+		g_pm4_total  = total_dw;
+		g_pm4_offset = total_dw - remaining_dw;
 		const auto packet_dw =
 		    handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
 		if (packet_dw > remaining_dw) {

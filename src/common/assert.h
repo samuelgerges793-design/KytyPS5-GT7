@@ -27,6 +27,9 @@ int  DbgNotImplementedHandler(char const* expr, char const* file, int line);
 void DbgExit(int status);
 #endif
 
+// Called once before a fatal report is written (e.g. to describe what the thread was doing).
+void SetFatalHook(void (*hook)());
+
 } // namespace Common
 
 #define EXIT_HALT() (Common::DbgExit(321), 1)
