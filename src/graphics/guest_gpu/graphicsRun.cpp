@@ -744,7 +744,14 @@ Pm4ProcessResult CommandProcessor::Process(Pm4Execution&             execution,
 	EXIT_IF(g_current_execution != nullptr);
 	EXIT_IF(commands.size() > UINT32_MAX);
 	if (execution.m_buffer_stack.empty() && !commands.empty()) {
-		SyncCommandMemory(commands);
+		// The guest CPU wrote and submitted these commands, so its copy is the newest. Syncing them
+		// from the GPU copy (KYTY_CP_SYNC_TOPLEVEL=1) put older lists from the same memory over
+		// GT7's new ones (backing-write log, Oct 14). Indirect buffers, which the GPU can
+		// generate, are still synced.
+		static LiveSetting sync_toplevel("KYTY_CP_SYNC_TOPLEVEL", 0);
+		if (sync_toplevel.Get() != 0) {
+			SyncCommandMemory(commands);
+		}
 		execution.m_buffer_stack.push_back({commands});
 	}
 	execution.m_suspended     = false;
