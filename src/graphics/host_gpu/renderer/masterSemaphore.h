@@ -189,6 +189,11 @@ uint64_t    GpuProfileLastShader(uint32_t stage);
 std::string GpuProfileTake(double seconds);
 bool HwWatchOverlaps(uint64_t vaddr, uint64_t size) noexcept;
 void HwWatchNoteBackingWrite(uint64_t vaddr, const void* data, uint64_t size) noexcept;
+// Diagnostics (KYTY_BACKING_LOG=1): every emulator write into guest memory (downloads, command
+// syncs, store replays) goes into a ring with its caller; BackingWritesOverlapping lists the
+// recent ones that touched a range.
+void        BackingWriteNote(uint64_t vaddr, const void* data, uint64_t size) noexcept;
+std::string BackingWritesOverlapping(uint64_t vaddr, uint64_t size);
 // The GPU queue whose submission the GPU thread is processing (watch logs name it).
 void SetCurrentGpuQueue(int queue);
 void PerfReport(double fps);

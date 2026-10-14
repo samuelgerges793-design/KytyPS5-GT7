@@ -974,6 +974,9 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 				    "bad PM4 packet: GPU copy of the size differs in {} bytes, size now 0x{:08x}; commands:{}\n",
 				    size_diff, *origin.control, cache.DescribePages(reinterpret_cast<uint64_t>(base), uint64_t {total_dw} * 4u)));
 			}
+			Log::WriteToConsoleAndLog(fmt::format("bad PM4 packet: emulator writes into these commands:{}\n",
+			                                      BackingWritesOverlapping(reinterpret_cast<uint64_t>(base),
+			                                                               uint64_t {total_dw} * 4u + 64u)));
 			const auto cmd_diff = cache.SyncGpuWrittenRange(reinterpret_cast<uint64_t>(base), uint64_t {total_dw} * 4u + 64u, true);
 			Log::WriteToConsoleAndLog(fmt::format("bad PM4 packet: GPU copy of the commands differs in {} bytes; header now 0x{:08x}\n",
 			                                      cmd_diff, *packet));

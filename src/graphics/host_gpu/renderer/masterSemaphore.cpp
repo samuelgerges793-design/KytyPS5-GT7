@@ -423,6 +423,69 @@ void HwWatchPrint() {
 }
 } // namespace
 
+namespace {
+struct BackingWrite {
+	uint64_t vaddr = 0;
+	uint64_t size  = 0;
+	uint64_t first = 0;
+	double   time  = 0.0;
+	uint32_t thread = 0;
+	std::array<uint32_t, 5> callers {};
+};
+std::mutex                       g_backing_mutex;
+std::array<BackingWrite, 8192>   g_backing_writes;
+uint64_t                         g_backing_count = 0;
+bool BackingLogEnabled() {
+	static const bool enabled = [] {
+		const char* env = std::getenv("KYTY_BACKING_LOG");
+		return env != nullptr && *env != 0 && *env != '0';
+	}();
+	return enabled;
+}
+double BackingNow() {
+	return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+} // namespace
+
+void BackingWriteNote(uint64_t vaddr, const void* data, uint64_t size) noexcept {
+	if (!BackingLogEnabled()) return;
+	BackingWrite entry;
+	entry.vaddr  = vaddr;
+	entry.size   = size;
+	std::memcpy(&entry.first, data, std::min<uint64_t>(size, 8));
+	entry.time   = BackingNow();
+	entry.thread = GetCurrentThreadId();
+	void*      frames[7] {};
+	const auto count = CaptureStackBackTrace(2, 7, frames, nullptr);
+	const auto base  = reinterpret_cast<uint64_t>(GetModuleHandleW(nullptr));
+	for (USHORT i = 0, n = 0; i < count && n < entry.callers.size(); i++) {
+		const auto address = reinterpret_cast<uint64_t>(frames[i]);
+		entry.callers[n++] = address > base && address - base < 0x10000000u ? static_cast<uint32_t>(address - base) : 0u;
+	}
+	std::lock_guard lock(g_backing_mutex);
+	g_backing_writes[g_backing_count++ % g_backing_writes.size()] = entry;
+}
+
+std::string BackingWritesOverlapping(uint64_t vaddr, uint64_t size) {
+	if (!BackingLogEnabled()) return " (KYTY_BACKING_LOG off)";
+	std::lock_guard lock(g_backing_mutex);
+	const double now   = BackingNow();
+	std::string  text;
+	uint32_t     shown = 0;
+	const auto   total = std::min<uint64_t>(g_backing_count, g_backing_writes.size());
+	for (uint64_t i = 0; i < total && shown < 24; i++) {
+		const auto& e = g_backing_writes[(g_backing_count - 1 - i) % g_backing_writes.size()];
+		if (e.vaddr >= vaddr + size || vaddr >= e.vaddr + e.size) continue;
+		shown++;
+		text += fmt::format("\n  {:.3f}s ago thread {} wrote 0x{:x}+0x{:x} (first {:016x}) from", now - e.time, e.thread,
+		                    e.vaddr, e.size, e.first);
+		for (const auto caller: e.callers) {
+			if (caller != 0) text += fmt::format(" 0x{:x}", caller);
+		}
+	}
+	return fmt::format(" {} of the last {} backing writes overlap:{}", shown, total, text);
+}
+
 bool HwWatchOverlaps(uint64_t vaddr, uint64_t size) noexcept {
 	for (const auto address: g_hw_watch) {
 		if (address < vaddr + size && vaddr < address + 8) return true;
