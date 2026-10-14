@@ -1,4 +1,5 @@
 #include "libs/agc.h"
+#include "graphics/host_gpu/renderer/masterSemaphore.h"
 
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
@@ -4225,6 +4226,9 @@ static TessellationDriverState g_tessellation_driver_state {};
 
 static void submit_dcb(uint32_t* dcb, uint32_t size_in_dwords) {
 	GraphicsDbgDumpDcb("d", size_in_dwords, dcb);
+	// The CPU just wrote these commands: image downloads must not put old pixels over them
+	// (GT7 reuses image memory for command lists).
+	NoteCommandPages(reinterpret_cast<uint64_t>(dcb), uint64_t {size_in_dwords} * 4u);
 	EXIT_IF(g_renderer == nullptr);
 	g_renderer->GetGpu().Submit(std::span {dcb, size_in_dwords}, {});
 }
@@ -4283,6 +4287,7 @@ static void submit_acb(uint32_t queue, uint32_t* acb, uint32_t size_in_dwords) {
 	}
 
 	GraphicsDbgDumpDcb("a", size_in_dwords, acb);
+	NoteCommandPages(reinterpret_cast<uint64_t>(acb), uint64_t {size_in_dwords} * 4u);
 
 	EXIT_IF(g_renderer == nullptr);
 	g_renderer->GetGpu().SubmitCompute(queue, std::span {acb, size_in_dwords});
