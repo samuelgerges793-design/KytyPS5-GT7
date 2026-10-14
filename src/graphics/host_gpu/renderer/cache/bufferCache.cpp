@@ -1427,6 +1427,23 @@ uint64_t BufferCache::SyncGpuWrittenRange(uint64_t vaddr, uint64_t size, bool fo
 				PerfAdd(PerfCounter::ZeroBufferGaveUp, 0);
 				continue;
 			}
+			// Only pages the GPU wrote (or may have written) hold GPU bytes newer than the guest's.
+			// GT7's compute command lists are written by the CPU through untracked pages; the GPU
+			// copy there is an older list from the same slot, and writing it back cut new lists
+			// short (garbage PM4 at race loads, backing-write log Oct 14). KYTY_CP_SYNC_GPU_ONLY=0
+			// restores the old behaviour.
+			static LiveSetting gpu_only("KYTY_CP_SYNC_GPU_ONLY", 1);
+			if (gpu_only.Get() != 0 && !m_gpu_modified_ranges.Intersects(page, 0x1000) &&
+			    !m_memory_tracker.IsRegionGpuModified(page, 0x1000)) {
+				static std::atomic<uint32_t> kept_logged {0};
+				if (kept_logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+					Log::WriteToConsoleAndLog(fmt::format(
+					    "CP sync: kept guest commands at 0x{:x}+0x{:x} over a GPU copy of a page the GPU did not write ({} bytes differ);{}\n",
+					    begin, end - begin, count, DescribePages(begin, end - begin)));
+				}
+				PerfAdd(PerfCounter::CpSyncKeptGuest, 0);
+				continue;
+			}
 			Libs::LibKernel::Memory::WriteBacking(begin, a, end - begin);
 		}
 	}

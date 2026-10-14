@@ -149,6 +149,8 @@ enum class PerfCounter {
 	PrefetchPages,
 	// GPU thread idle with signals (labels, interrupts) waiting on unsubmitted work: submitted.
 	IdleFlush,
+	// Command-memory syncs that kept guest bytes over a GPU copy of a page the GPU did not write.
+	CpSyncKeptGuest,
 	Count
 };
 void PerfAdd(PerfCounter counter, uint64_t nanoseconds);
