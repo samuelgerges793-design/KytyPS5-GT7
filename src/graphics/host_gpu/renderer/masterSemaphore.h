@@ -147,6 +147,8 @@ enum class PerfCounter {
 	PrefetchHit,
 	PrefetchStale,
 	PrefetchPages,
+	// GPU thread idle with signals (labels, interrupts) waiting on unsubmitted work: submitted.
+	IdleFlush,
 	Count
 };
 void PerfAdd(PerfCounter counter, uint64_t nanoseconds);

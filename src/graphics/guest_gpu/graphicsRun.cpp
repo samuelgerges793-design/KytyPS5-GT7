@@ -555,12 +555,18 @@ void GuestGpu::ThreadRun(void* data) {
 				if (selected_queue < 0) {
 					gpu->m_processing = false;
 					{
-						// Every queue is suspended on a wait packet; this polls for its condition.
-						// Deferred labels only appear once recorded work runs: submit it first and
-						// poll often.
+						// Every queue is suspended on a wait packet (or empty); this polls for its
+						// condition. Deferred labels and EOP interrupts only appear once recorded
+						// work runs: submit it first, or the guest can wait for them forever
+						// (KYTY_IDLE_FLUSH=0 turns that off outside deferred-label mode).
 						static LiveSetting deferred("KYTY_DEFERRED_LABELS", 0);
+						static LiveSetting idle_flush("KYTY_IDLE_FLUSH", 1);
+						auto& scheduler = gpu->m_renderer.GetCommandScheduler();
 						if (deferred.Get() != 0) {
-							gpu->m_renderer.GetCommandScheduler().Flush();
+							scheduler.Flush();
+						} else if (idle_flush.Get() != 0 && scheduler.HasUnsubmittedPriorityOperations()) {
+							PerfAdd(PerfCounter::IdleFlush, 0);
+							scheduler.Flush();
 						}
 						PerfScope blocked(PerfCounter::GpuThreadBlocked);
 						gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, deferred.Get() != 0 ? 1 : 100);
@@ -771,6 +777,20 @@ void CommandProcessor::SyncCommandMemory(std::span<const uint32_t> commands) {
 	                                               commands.size_bytes());
 }
 
+// Where recent indirect buffers came from (GPU thread only): the packet dword holding their
+// size, for the bad-packet report.
+struct IndirectBufferOrigin {
+	const uint32_t* base    = nullptr;
+	uint32_t        num_dw  = 0;
+	const uint32_t* control = nullptr;
+};
+static std::array<IndirectBufferOrigin, 64> g_ib_origins;
+static uint32_t                             g_ib_origin_next = 0;
+
+void NoteIndirectBufferOrigin(const uint32_t* base, uint32_t num_dw, const uint32_t* control) {
+	g_ib_origins[g_ib_origin_next++ % g_ib_origins.size()] = {base, num_dw, control};
+}
+
 void CommandProcessor::ProcessIndirectBuffer(std::span<const uint32_t> commands, bool chain) {
 	EXIT_IF(g_current_execution == nullptr);
 	EXIT_IF(!g_current_execution->m_next_buffer.empty());
@@ -939,6 +959,24 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 				                    base[i]);
 			}
 			Log::WriteToConsoleAndLog(text + "\n");
+			// Where the size came from, whether it changed since it was read, and whether the GPU
+			// copies of the size and of the commands differ from the guest's.
+			auto& cache = m_renderer.GetBufferCache();
+			for (const auto& origin: g_ib_origins) {
+				if (origin.base != base || origin.control == nullptr) continue;
+				const auto control_addr = reinterpret_cast<uint64_t>(origin.control);
+				const uint32_t now      = *origin.control;
+				Log::WriteToConsoleAndLog(fmt::format(
+				    "bad PM4 packet: size {} dwords came from the IB packet control at 0x{:x}, which now holds 0x{:08x} ({} dwords);{}\n",
+				    origin.num_dw, control_addr, now, now & 0xfffffu, cache.DescribePages(control_addr, 4)));
+				const auto size_diff = cache.SyncGpuWrittenRange(control_addr & ~uint64_t {63}, 64, true);
+				Log::WriteToConsoleAndLog(fmt::format(
+				    "bad PM4 packet: GPU copy of the size differs in {} bytes, size now 0x{:08x}; commands:{}\n",
+				    size_diff, *origin.control, cache.DescribePages(reinterpret_cast<uint64_t>(base), uint64_t {total_dw} * 4u)));
+			}
+			const auto cmd_diff = cache.SyncGpuWrittenRange(reinterpret_cast<uint64_t>(base), uint64_t {total_dw} * 4u + 64u, true);
+			Log::WriteToConsoleAndLog(fmt::format("bad PM4 packet: GPU copy of the commands differs in {} bytes; header now 0x{:08x}\n",
+			                                      cmd_diff, *packet));
 		}
 		EXIT_IF(packet_dw > remaining_dw);
 		if (execution.m_suspended) {

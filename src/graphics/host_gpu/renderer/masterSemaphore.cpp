@@ -651,7 +651,7 @@ void PerfReport(double fps) {
 	                                        "verify-match", "verify-MISMATCH",
 	                                        "readback-window-MB", "submit-queue-wait",
 	                                        "submit-queue-timeout", "zero-ib-wait", "zero-ib-gave-up",
-	                                        "deferred-labels", "rb-no-writer", "rb-writer-submitted", "rb-writer-recording", "rb-side-queue", "draw-write-barriers", "prefetch-hit", "prefetch-stale", "prefetch-pieces"};
+	                                        "deferred-labels", "rb-no-writer", "rb-writer-submitted", "rb-writer-recording", "rb-side-queue", "draw-write-barriers", "prefetch-hit", "prefetch-stale", "prefetch-pieces", "idle-flush"};
 	std::string text = fmt::format("perf: {:.1f} fps | longest-gpu-wait {:.0f} ms |", fps,
 	                               static_cast<double>(g_longest_wait_ns.exchange(0)) / 1e6);
 	for (size_t i = 0; i < g_perf.size(); i++) {

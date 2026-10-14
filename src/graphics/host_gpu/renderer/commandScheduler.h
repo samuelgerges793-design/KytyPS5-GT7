@@ -45,6 +45,8 @@ public:
 	void                      DeferOperation(Common::UniqueFunction<void>&& operation);
 	void                      DeferPriorityOperation(Common::UniqueFunction<void>&& operation);
 	[[nodiscard]] bool        HasPendingPriorityOperations();
+	// A label or interrupt is queued behind work that is still being recorded (not submitted).
+	[[nodiscard]] bool        HasUnsubmittedPriorityOperations();
 	[[nodiscard]] static bool InDeferredOperation() noexcept;
 
 	[[nodiscard]] bool Active() const noexcept { return m_command.m_registers != nullptr; }

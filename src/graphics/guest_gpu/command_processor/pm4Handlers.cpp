@@ -53,6 +53,8 @@
 
 namespace Libs::Graphics {
 
+void NoteIndirectBufferOrigin(const uint32_t* base, uint32_t num_dw, const uint32_t* control);
+
 namespace {
 
 constexpr uint32_t GcrGl2MetadataInvalidate = 1u << 1u;
@@ -1486,9 +1488,11 @@ KYTY_CP_OP_PARSER(CpOpBranch) {
 	     reinterpret_cast<uint64_t>(else_buffer), else_num_dw);
 
 	if (take_then) {
+		NoteIndirectBufferOrigin(then_buffer, then_num_dw, buffer + 9);
 		cp.ProcessIndirectBuffer({then_buffer, then_num_dw}, true);
 	} else if (mode == 2 && else_num_dw != 0) {
 		EXIT_NOT_IMPLEMENTED(else_buffer == nullptr);
+		NoteIndirectBufferOrigin(else_buffer, else_num_dw, buffer + 12);
 		cp.ProcessIndirectBuffer({else_buffer, else_num_dw}, true);
 	}
 
@@ -1951,6 +1955,7 @@ KYTY_CP_OP_PARSER(CpOpIndirectBuffer) {
 	}
 
 	GraphicsDbgDumpDcb("ci", indirect_num_dw, indirect_buffer);
+	NoteIndirectBufferOrigin(indirect_buffer, indirect_num_dw, buffer + 2);
 
 	cp.ProcessIndirectBuffer({indirect_buffer, indirect_num_dw}, (control & (1u << 20u)) != 0);
 

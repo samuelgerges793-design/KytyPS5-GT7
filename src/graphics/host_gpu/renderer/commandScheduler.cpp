@@ -260,6 +260,11 @@ bool CommandScheduler::HasPendingPriorityOperations() {
 	return !m_priority_operations.empty() || m_priority_active;
 }
 
+bool CommandScheduler::HasUnsubmittedPriorityOperations() {
+	std::lock_guard lock(m_operation_mutex);
+	return !m_priority_operations.empty() && m_priority_operations.back().tick >= CurrentTick();
+}
+
 void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
 	while (!stop.stop_requested()) {
 		PendingOperation operation;
