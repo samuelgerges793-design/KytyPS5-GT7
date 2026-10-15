@@ -202,6 +202,17 @@ TextureCache::BindingType TextureCache::UploadBinding(const Image& image) {
 
 ImageId TextureCache::InsertImage(const ImageInfo& info) {
 	const auto id = m_slot_images.insert(m_graphics, m_scheduler, info);
+	// The sizes of the large images a title creates show the resolution it renders at.
+	if (info.extent.width >= 1024 && info.extent.height >= 512) {
+		static std::mutex                     sizes_mutex;
+		static std::vector<std::pair<uint32_t, uint32_t>> sizes;
+		std::scoped_lock                      lock(sizes_mutex);
+		const std::pair<uint32_t, uint32_t> size {info.extent.width, info.extent.height};
+		if (sizes.size() < 48 && std::find(sizes.begin(), sizes.end(), size) == sizes.end()) {
+			sizes.push_back(size);
+			Log::WriteToConsoleAndLog(fmt::format("image size: {}x{} (first seen)\n", size.first, size.second));
+		}
+	}
 	if (!info.data.Empty()) {
 		RegisterImage(id);
 	}
