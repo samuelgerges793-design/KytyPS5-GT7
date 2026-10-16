@@ -95,12 +95,10 @@ public:
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	void               ProcessFaultBuffer();
-	// Tracking regions (base addresses, TRACKER_REGION_SIZE each) the CPU touched since the
-	// last call; BDA preparation uploads the CPU's changes in their mapped parts.
-	[[nodiscard]] std::vector<uint64_t> TakeCpuDirtyRegions() {
-		return m_memory_tracker.TakeCpuDirtyRegions();
+	void               SynchronizeBda(const RangeSet& mapped);
+	void               QueueBdaSync(uint64_t vaddr, uint64_t size) {
+		m_memory_tracker.QueueBdaSync(vaddr, size);
 	}
-	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
 	void               RunGarbageCollector();
 	// Any thread: performs a CPU store into a GPU-written buffer page through the backing view
 	// and queues its upload; the GPU thread uploads the queue in one batch before the next
@@ -252,6 +250,7 @@ private:
 	};
 	std::array<RecentStore, 65536> m_recent_stores {};
 	uint64_t                      m_recent_store_count = 0;
+	void SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
 	                                      uint64_t total_size);
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);

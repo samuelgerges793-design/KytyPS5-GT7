@@ -659,7 +659,7 @@ void PrepareCallTarget(ShaderSource& source, const CompileOptions& options) {
 	}
 	RewriteToSsa(query.blocks);
 	ConstantPropagationPass(query.blocks, query.wave_size);
-	RemoveIdentities(query.blocks);
+	RemoveIdentities(query);
 	EliminateDeadCode(query.blocks);
 	for (auto& c: source.calls)
 		for (auto& value: c.target)
@@ -990,15 +990,14 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 	IR::RewriteToSsa(ir.blocks);
 	const auto simplify = [&ir] {
 		IR::ConstantPropagationPass(ir.blocks, ir.wave_size);
-		IR::ResolveControlFlowIdentities(ir);
-		IR::RemoveIdentities(ir.blocks);
+		IR::RemoveIdentities(ir);
 		IR::EliminateDeadCode(ir.blocks);
 	};
 	simplify();
 	const auto read_lane_stats = IR::EliminateReadLane(ir, ir.wave_size);
-	if (read_lane_stats.rewritten_reads != 0) {
-		LOGF("%s read-lane elimination: reads=%" PRIu32 "\n", GetDumpLabel(options),
-		     read_lane_stats.rewritten_reads);
+	if (read_lane_stats.rewritten_reads != 0 || read_lane_stats.rewritten_reductions != 0) {
+		LOGF("%s read-lane elimination: reads=%" PRIu32 " reductions=%" PRIu32 "\n",
+		     GetDumpLabel(options), read_lane_stats.rewritten_reads, read_lane_stats.rewritten_reductions);
 	}
 	// Cleanup also exposes profitable folds by removing dead predicate consumers.
 	simplify();
@@ -1075,7 +1074,7 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 		}
 	}
 	ir.value_storage.clear();
-	IR::RemoveIdentities(ir.blocks);
+	IR::RemoveIdentities(ir);
 	IR::EliminateDeadCode(ir.blocks);
 
 	IR::CollectShaderInfo(ir, options.input_info);
@@ -1090,7 +1089,7 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " SPIR-V EmitProgram\n",
 	     GetDumpLabel(options), StageName(ir.stage), ir.shader_hash);
 	auto spirv = Spirv::EmitProgram(ir, options.input_info, push_data_start_dword,
-	                                options.maintenance8_enabled);
+	                                options.maintenance8_enabled, options.emit_debug_info);
 	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " SPIR-V EmitProgram words=%" PRIu64
 	     " elapsed_ms=%" PRIu64 "\n",
 	     GetDumpLabel(options), StageName(ir.stage), ir.shader_hash,
