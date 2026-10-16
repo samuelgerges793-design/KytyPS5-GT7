@@ -1416,9 +1416,9 @@ void PipelineCache::InitializeCaches(const std::filesystem::path& directory,
 	m_program_cache->Load(directory / (title_id + ".shaders.bin"),
 	                      // Development builds keep their recipes: each one is only compile
 	                      // input, and lookups still check the key and specialization. Bump the
-	                      // tag when the recompiler changes how resources are counted (upstream
-	                      // 5dec523: recipes from older builds failed the specialization check).
-	                      CacheSignature("KytySC1", "gt7-dev-2",
+	                      // tag when the recipe format or specialization changes (upstream 5dec523
+	                      // added samplers and scalar_empty: older recipes failed the check).
+	                      CacheSignature("KytySC1", "gt7-dev-3",
 	                                     m_graphics.GetPhysicalDeviceProperties()));
 	InitializeDriverCache(directory / (title_id + ".bin"));
 }
