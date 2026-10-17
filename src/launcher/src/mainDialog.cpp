@@ -246,6 +246,7 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	}
 	args << "--controller-volume" << QString::number(info.controller.speaker_volume);
 	args << "--controller-vibration" << QString::number(info.controller.vibration_intensity);
+	args << "--keyboard-player" << QString::number(info.controller.keyboard_player);
 	args << "--present-mode" << EnumToText(info.present_mode);
 	if (info.gpu_index >= 0) {
 		args << "--gpu" << QString::number(info.gpu_index);
@@ -261,8 +262,10 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	}
 	args << "--readback-linear-images" << BoolArg(info.readback_linear_images);
 	args << "--sync-raw-image-buffers" << BoolArg(info.sync_raw_image_buffers);
+	args << "--support-zmask" << BoolArg(info.support_zmask);
 	args << "--trophy-notifications" << BoolArg(info.trophy_enabled);
 	args << "--trophy-duration" << QString::number(info.trophy_duration_seconds);
+	args << "--perf-overlay" << BoolArg(info.perf_overlay_enabled);
 	args << "--skip-notice-screen" << BoolArg(info.skip_notice_screen);
 	args << "--network-connected" << BoolArg(info.network_connected);
 	if (info.tessellation_enabled) {

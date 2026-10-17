@@ -1523,7 +1523,8 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 		}
 		if (op != ValueOpcode::LogicalAnd && op != ValueOpcode::LogicalOr &&
 		    op != ValueOpcode::LogicalNot && op != ValueOpcode::IEqual32 &&
-		    op != ValueOpcode::INotEqual32 && op != ValueOpcode::ULessThanEqual32 &&
+		    op != ValueOpcode::INotEqual32 && op != ValueOpcode::ULessThan32 &&
+		    op != ValueOpcode::ULessThanEqual32 &&
 		    op != ValueOpcode::SelectU1 && op != ValueOpcode::SelectU32) return finish(opaque());
 		auto& node = plan.value_storage.emplace_back(op);
 		for (size_t index = 0; index < inst->NumArgs(); ++index)
@@ -1538,10 +1539,11 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 		for (auto it = first; it != plan.value_storage.end(); ++it) it->Invalidate();
 		plan.value_storage.erase(first, plan.value_storage.end());
 	}
-	plan.uniform_fill = AnalyzeUniformFill(program);
-	for (uint32_t i = 0; i < plan.uniform_fill.fill.words; ++i) {
-		plan.uniform_fill.values[i] = Clone(plan.uniform_fill.values[i]);
-	}
+	plan.uniform_fill = program.uniform_fill.fill.kind != UniformFillKind::None
+	    ? program.uniform_fill : AnalyzeUniformFill(program);
+	for (auto& value: plan.uniform_fill.values) value = Clone(value);
+	plan.uniform_fill.pattern_size = Clone(plan.uniform_fill.pattern_size);
+	plan.uniform_fill.element_count = Clone(plan.uniform_fill.element_count);
 	plan.capture_specialization_reads |=
 	    capture_indirect_reads || capture_control_reads || !plan.source_reads.empty();
 	if (plan.capture_specialization_reads) {
@@ -1628,15 +1630,21 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	}
 	snapshot.uniform_fill = {};
 	const auto& fill = program.uniform_fill;
-	const auto words = fill.fill.words;
+	auto words = fill.fill.words;
 	std::array<uint32_t, 4> stored {};
 	bool uniform_fill = words != 0;
+	if (uniform_fill && !fill.pattern_size.IsEmpty())
+		uniform_fill = clean.Evaluate(fill.pattern_size, words) && words >= 1 && words <= 4;
+	uint32_t elements = 0;
+	if (uniform_fill && !fill.element_count.IsEmpty())
+		uniform_fill = clean.Evaluate(fill.element_count, elements) && elements != 0;
 	for (uint32_t i = 0; i < words && uniform_fill; ++i) {
 		uniform_fill = clean.Evaluate(fill.values[i], stored[i]) && stored[i] == stored[0];
 	}
 	if (uniform_fill) {
 		snapshot.uniform_fill = fill.fill;
 		snapshot.uniform_fill.value = stored[0];
+		snapshot.uniform_fill.bounded_elements = elements;
 	}
 	const auto evaluate = [&](uint32_t source, DescriptorValue& value, bool written = false) {
 		if (source >= program.descriptor_sources.size()) {

@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 
 #include "common/assert.h"
+#include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
@@ -651,6 +652,9 @@ struct PipelineCache::ProgramCache {
 	                               ShaderRecompiler::IR::ResourceSpecialization specialization,
 	                               uint32_t                  push_data_start_dword,
 	                               std::span<const uint32_t> function_code) const {
+		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::ShadersCompiled,
+		                                         Common::DebugCounters::Counter::ShaderCompileNs,
+		                                         Common::DebugCounters::Peak::ShaderCompileNs);
 		const auto loop_cap = ShaderRecompiler::LoopCapFor(options.shader_hash);
 		ShaderRecompiler::SetLoopCapOverride(loop_cap);
 		if (loop_cap != 0) {
@@ -2047,6 +2051,9 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(
 	}
 	LogPipelineTrace("CreatePipelineInternal begin", vs_id, ps_id);
 	PerfScope pipeline_time(PerfCounter::PipelineCreate);
+	Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::PipelinesCreated,
+	                                         Common::DebugCounters::Counter::PipelineCreateNs,
+	                                         Common::DebugCounters::Peak::PipelineCreateNs);
 	CreatePipelineInternal(m_graphics, *cached, rendering, key.vertex_input, vertex_info,
 	                       ps_input_info, programs, static_params, m_driver_cache);
 	LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
@@ -2136,6 +2143,9 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 
 	auto cached = std::make_unique<Pipeline>();
 	PerfScope pipeline_time(PerfCounter::PipelineCreate);
+	Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::PipelinesCreated,
+	                                         Common::DebugCounters::Counter::PipelineCreateNs,
+	                                         Common::DebugCounters::Peak::PipelineCreateNs);
 	CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module, m_driver_cache,
 	                       compute_program.spirv_hash);
 

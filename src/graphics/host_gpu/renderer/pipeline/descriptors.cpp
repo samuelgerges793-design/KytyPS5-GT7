@@ -132,14 +132,18 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	if (size > graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange) {
 		EXIT("storage buffer range is unsupported\n");
 	}
-	uint32_t track_base   = ShaderRecompiler::IR::WriteTrackUntracked;
+	const bool metadata_read = resource.read && Config::SupportZmaskEnabled() &&
+	                           (address & 0x7fffu) == 0 &&
+	                           context.GetTextureCache().IsMeta(address);
+	uint32_t track_base = ShaderRecompiler::IR::WriteTrackUntracked;
 	if (resource.written && write_track_info == nullptr) {
 		PerfAdd(PerfCounter::MarkUntrackedBindingBytes, size);
 	}
-	auto [buffer, offset] = context.GetBufferCache().ObtainBuffer(
-	    address, size, resource.written,
+	auto [buffer, offset]    = context.GetBufferCache().ObtainBuffer(
+	    address, size, resource.written || metadata_read,
 	    resource.formatted || (resource.read && Config::SyncRawImageBuffersEnabled()), id,
 	    resource.written && write_track_info != nullptr ? &track_base : nullptr);
+	if (metadata_read) buffer->Fill(offset, size, 0xf); // HTILE ZMask::kUncompressed.
 	const auto aligned_offset = Common::AlignDown(offset, alignment);
 	const auto adjustment     = offset - aligned_offset;
 	const auto max_range      = graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange;

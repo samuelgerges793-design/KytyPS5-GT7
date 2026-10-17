@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/debugCounters.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "kernel/memory.h"
@@ -940,6 +941,8 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	wait_info.pSemaphores    = &m_semaphore;
 	wait_info.pValues        = &tick;
 
+	Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::GpuWaits,
+	                                         Common::DebugCounters::Counter::GpuWaitNs);
 	const auto result     = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
 	PerfAdd(PerfCounter::GpuWait, PerfNow() - wait_start);
 	NoteWaitSite(PerfNow() - wait_start);

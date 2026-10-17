@@ -413,7 +413,9 @@ void TestAddContent(const std::filesystem::path& root) {
   Check(mount(0, nullptr, &point) == static_cast<int>(0x80d90002u) &&
             list(0, nullptr, 0, nullptr) == static_cast<int>(0x817d0002u),
         "null add-on parameters return parameter errors");
-  Check(mount(0, &info[3].label, &point) == OK, "mount owned add-on");
+  Check(mount(0, &info[3].label, &point) == OK &&
+            !std::string_view(point.data).ends_with('/'),
+        "mount owned add-on without trailing slash");
   const std::string mounted_file = std::string(point.data) + "/payload.txt";
   const int fd = FileSystem::KernelOpen(mounted_file.c_str(), 0, 0);
   std::array<char, 11> payload {};
@@ -422,8 +424,9 @@ void TestAddContent(const std::filesystem::path& root) {
             FileSystem::KernelClose(fd) == OK,
         "guest reads files from the selected title's add-on");
   MountPoint repeated {};
-  Check(mount(0, &info[3].label, &repeated) == static_cast<int>(0x80d90003u),
-        "duplicate mount returns BUSY");
+  Check(mount(0, &info[3].label, &repeated) == OK &&
+            std::strcmp(repeated.data, point.data) == 0,
+        "duplicate mount returns the same mount point");
   Check(unmount(&point) == OK && FileSystem::GetRealFilename(mounted_file).empty() &&
             unmount(&point) == static_cast<int>(0x80d90004u),
         "unmount removes mapping and repeated unmount reports NOT_MOUNTED");
@@ -1902,6 +1905,11 @@ void CheckSocketWakeup() {
   namespace Net = Libs::Network::Net;
   Loader::SymbolDatabase symbols;
   Libs::LibNet::InitNet_1_Net(&symbols);
+  Libs::InitLibKernel_1(&symbols);
+  const auto *shutdown_symbol = symbols.Find(
+      {"TUuiYS2kE8s", "Posix", 1, "libkernel", 1, 1, Loader::SymbolType::Func});
+  Check(shutdown_symbol != nullptr, "POSIX shutdown export resolves");
+  const auto shutdown = reinterpret_cast<int (KYTY_SYSV_ABI *)(int, int)>(shutdown_symbol->vaddr);
   const auto *connect_symbol = symbols.Find(
       {"OXXX4mUk3uk", "Net", 1, "Net", 1, 1, Loader::SymbolType::Func});
   const auto *getsockopt_symbol = symbols.Find(
@@ -2142,6 +2150,76 @@ void CheckSocketWakeup() {
   CheckSocketReceiveBuffer(reader, writer);
   CheckSocketReceiveConcurrency();
 #endif
+  const auto [shutdown_reader, shutdown_writer] = CreateTcpPair();
+  const auto ready_to_read = [](int fd) {
+    std::array<uint64_t, 16> readable {};
+    readable[fd / 64] = uint64_t {1} << (fd % 64);
+    const std::array<int64_t, 2> timeout {2, 0};
+    return Net::Select(fd + 1, readable.data(), nullptr, nullptr, timeout.data()) == 1;
+  };
+  Check(shutdown(-1, 1) == -1 &&
+            *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EBADF &&
+            shutdown(shutdown_writer, 3) == -1 &&
+            *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EINVAL,
+        "shutdown rejects invalid descriptors and directions");
+  Check(Net::Send(shutdown_writer, "x", 1, 0) == 1 && shutdown(shutdown_writer, 1) == 0 &&
+            ready_to_read(shutdown_reader) &&
+            Net::Recv(shutdown_reader, received.data(), 1, 0) == 1 && received[0] == 'x' &&
+            ready_to_read(shutdown_reader) &&
+            Net::Recv(shutdown_reader, received.data(), 1, 0) == 0 &&
+            Net::Send(shutdown_reader, "y", 1, 0) == 1 &&
+            ready_to_read(shutdown_writer) &&
+            Net::Recv(shutdown_writer, received.data(), 1, 0) == 1 && received[0] == 'y',
+        "write shutdown drains queued bytes, signals EOF, and preserves reverse traffic");
+  Check(Net::SocketClose(shutdown_reader) == 0 && Net::SocketClose(shutdown_writer) == 0,
+        "close half-shutdown sockets");
+  const int encrypted = Net::Socket(2, 6, 0);
+  int crypto = -1;
+  uint32_t crypto_size = sizeof(crypto);
+  Check(encrypted >= 0 &&
+            Net::Getsockopt(encrypted, 0xffff, 0x20000, &crypto, &crypto_size) == 0 &&
+            crypto == 0,
+        "UDPP2P encryption defaults to disabled");
+  for (const int setting : {7, 0}) {
+    Check(Net::Setsockopt(encrypted, 0xffff, 0x20000, &setting, sizeof(setting)) == 0 &&
+              Net::Getsockopt(encrypted, 0xffff, 0x20000, &crypto, &crypto_size) == 0 &&
+              crypto == (setting != 0),
+          "UDPP2P encryption configuration retains normalized enable and disable values");
+    Check(Net::Send(encrypted, "x", 1, 0) == -1 &&
+              *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EOPNOTSUPP,
+          "UDPP2P configuration never exposes unframed plaintext transport");
+  }
+  std::array<uint8_t, 16> p2p_address {16, 2, 0x0e, 0x4a, 127, 0, 0, 1, 0x1e, 0x61};
+  Check(Net::Bind(encrypted, p2p_address.data(), p2p_address.size()) == 0,
+        "bind UDPP2P physical and virtual ports");
+  char untouched = '!';
+  auto source = p2p_address;
+  uint32_t source_size = source.size();
+  Check(Net::Recvfrom(encrypted, &untouched, 1, 0x80, source.data(), &source_size) == -1 &&
+            *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EWOULDBLOCK,
+        "per-call nonblocking UDPP2P receive reports an actually empty queue");
+  Check(Net::Setsockopt(encrypted, 0xffff, 0x1200, &enabled, sizeof(enabled)) == 0 &&
+            Net::Setsockopt(encrypted, 0xffff, 0x20000, &enabled, sizeof(enabled)) == 0 &&
+            Net::Recvfrom(encrypted, &untouched, 1, 0, source.data(), &source_size) == -1 &&
+            *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EWOULDBLOCK &&
+            untouched == '!' && source == p2p_address && source_size == source.size(),
+        "empty encrypted nonblocking receive preserves all caller outputs");
+  const int raw_sender = Net::Socket(2, 2, 0);
+  Check(raw_sender >= 0 &&
+            Net::Sendto(raw_sender, "pending", 7, 0, p2p_address.data(), p2p_address.size()) == 7,
+        "queue a datagram requiring unsupported UDPP2P processing");
+  const auto pending_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (Net::Recv(encrypted, &untouched, 1, 0) == -1 &&
+         *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EWOULDBLOCK &&
+         std::chrono::steady_clock::now() < pending_deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  Check(*Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EOPNOTSUPP &&
+            Net::Recv(encrypted, &untouched, 1, 0) == -1 &&
+            *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EOPNOTSUPP && untouched == '!',
+        "queued packets remain queued and unsupported instead of masquerading as empty");
+  Check(Net::SocketClose(encrypted) == 0 && Net::SocketClose(raw_sender) == 0,
+        "close UDPP2P readiness fixtures");
   Check(Net::SocketClose(writer) == 0, "close wake writer");
   *net_errno = Libs::Posix::POSIX_EINVAL;
   Check(net_recv(reader, received.data(), received.size(), 0) == 0 &&
