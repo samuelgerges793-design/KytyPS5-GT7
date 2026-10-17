@@ -46,6 +46,7 @@ constexpr FormatInfo kFormatInfo[] = {
 	{BufferFormat::k11_11_10UInt, 4, 0, 4, true, true},
 	{BufferFormat::k11_11_10Float, 4, 0, 4, true, false},
 	{BufferFormat::k10_11_11Float, 4, 0, 4, true, false},
+	{BufferFormat::k2_10_10_10UNorm, 4, 0, 4, true, false},
 	{BufferFormat::k10_10_10_2UNorm, 4, 0, 4, true, false},
 	{BufferFormat::k10_10_10_2UInt, 4, 0, 4, true, true},
 	{BufferFormat::k8_8_8_8UNorm, 4, 0, 4, true, false},
@@ -240,7 +241,9 @@ BufferFormat RemapTextureFormat(BufferFormat format) {
 		case BufferFormat::k8UScaled: return BufferFormat::k8UNorm;
 		case BufferFormat::k8_8UScaled: return BufferFormat::k8_8UNorm;
 		case BufferFormat::k11_11_10UNorm:
-		case BufferFormat::k11_11_10UInt: return BufferFormat::k32UInt;
+		case BufferFormat::k11_11_10UInt:
+		// No host format puts the 2-bit field lowest: stored raw, packed and decoded in shaders.
+		case BufferFormat::k2_10_10_10UNorm: return BufferFormat::k32UInt;
 		default: return format;
 	}
 }

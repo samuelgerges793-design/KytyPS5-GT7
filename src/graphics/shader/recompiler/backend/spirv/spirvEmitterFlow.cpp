@@ -571,12 +571,16 @@ void EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 				value = mapped;
 			}
 			if ((state.input_info.pixel->target_packed_unorm_mask & (1u << exp.index)) != 0u) {
+				const auto info = Format::GetFormatInfo(
+				    (state.input_info.pixel->target_packed_unorm_10_mask & (1u << exp.index)) != 0u
+				        ? Prospero::BufferFormat::k2_10_10_10UNorm
+				        : Prospero::BufferFormat::k11_11_10UNorm);
+				const uint32_t all = (1u << info.component_count) - 1u;
 				if (exp.compr || MrtOutputMode(state, exp) != 9u ||
-				    (mapping.ApplyMask(exp.en) & 7u) != 7u) {
+				    (mapping.ApplyMask(exp.en) & all) != all) {
 					EXIT("unsupported packed UNorm EXP: export=%u mode=%u en=0x%x compr=%u\n",
 					     exp.index, MrtOutputMode(state, exp), exp.en, static_cast<uint32_t>(exp.compr));
 				}
-				const auto info = Format::GetFormatInfo(Prospero::BufferFormat::k11_11_10UNorm);
 				const auto rounding = (state.input_info.pixel->target_round_mode & (1u << exp.index)) != 0
 				                          ? UnormRounding::Truncate : UnormRounding::HalfUp;
 				const auto raw = Unary(state, spv::OpBitcast, TypeU32Vector(state, 4), value);

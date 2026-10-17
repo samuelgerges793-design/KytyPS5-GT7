@@ -46,6 +46,10 @@ uint32_t                   RenderTargetBytesPerElement(BufferFormat format);
 bool                       IsFmaskTextureFormat(BufferFormat format);
 TextureNumericClass        SampledTextureNumericClass(BufferFormat format);
 BufferFormat               RemapTextureFormat(BufferFormat format);
+// UNorm render-target formats stored as raw 32-bit words, packed by the pixel shader.
+[[nodiscard]] constexpr bool IsPackedUnormTargetFormat(BufferFormat format) {
+	return format == BufferFormat::k11_11_10UNorm || format == BufferFormat::k2_10_10_10UNorm;
+}
 
 } // namespace Libs::Graphics::Prospero
 

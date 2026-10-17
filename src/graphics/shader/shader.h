@@ -188,6 +188,8 @@ struct ShaderPixelInputInfo {
 	uint32_t                                       target_shader_mask           = UINT32_MAX;
 	std::array<Prospero::ColorComponentMapping, 8> target_export_mapping        = {};
 	uint8_t                                        target_packed_unorm_mask      = 0;
+	// Packed exports whose target is 2_10_10_10 UNorm (the others are 11_11_10 UNorm).
+	uint8_t                                        target_packed_unorm_10_mask   = 0;
 	// CB round mode per converted export: zero adds half an LSB, one truncates.
 	uint8_t                                        target_round_mode            = 0;
 	uint32_t                                       scratch_size_dwords          = 0;

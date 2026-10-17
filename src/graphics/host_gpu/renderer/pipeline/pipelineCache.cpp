@@ -1422,7 +1422,7 @@ void PipelineCache::InitializeCaches(const std::filesystem::path& directory,
 	                      // input, and lookups still check the key and specialization. Bump the
 	                      // tag when the recipe format or specialization changes (upstream 5dec523
 	                      // added samplers and scalar_empty: older recipes failed the check).
-	                      CacheSignature("KytySC1", "gt7-dev-3",
+	                      CacheSignature("KytySC1", "gt7-dev-4",
 	                                     m_graphics.GetPhysicalDeviceProperties()));
 	InitializeDriverCache(directory / (title_id + ".bin"));
 }
@@ -1663,12 +1663,13 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 			const auto target_mask = render_target_mask_slot(context.GetRenderTargetMask(), slot);
 			if (rt.base.addr == 0 || target_mask == 0u) continue;
 			const auto format = Prospero::ResolveRenderTargetFormat(rt.info.format, rt.info.channel_type);
-			if (format.buffer_format != Prospero::BufferFormat::k11_11_10UNorm) continue;
+			if (!Prospero::IsPackedUnormTargetFormat(format.buffer_format)) continue;
 			const auto mapping = pixel_info.target_export_mapping[export_index];
 			const auto shader_mask = render_target_mask_slot(pixel_info.target_shader_mask, slot);
 			const bool blend = context.GetBlendControl(slot).enable && !rt.info.blend_bypass;
-			if (blend || (mapping.ApplyMask(target_mask) & 7u) != 7u ||
-			    (mapping.ApplyMask(shader_mask) & 7u) != 7u ||
+			const uint32_t all = (1u << format.components) - 1u;
+			if (blend || (mapping.ApplyMask(target_mask) & all) != all ||
+			    (mapping.ApplyMask(shader_mask) & all) != all ||
 			    pixel_info.target_output_mode[export_index] != 9u) {
 				EXIT("unsupported packed UNorm render-target export: slot=%u export=%u mode=%u "
 				     "target_mask=0x%x shader_mask=0x%x mapping=0x%02x blend=%u\n",
@@ -1676,6 +1677,9 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 				     shader_mask, mapping.packed, static_cast<uint32_t>(blend));
 			}
 			pixel_info.target_packed_unorm_mask |= 1u << export_index;
+			if (format.buffer_format == Prospero::BufferFormat::k2_10_10_10UNorm) {
+				pixel_info.target_packed_unorm_10_mask |= 1u << export_index;
+			}
 			pixel_info.target_round_mode |= static_cast<uint8_t>(rt.info.round_mode) << export_index;
 		}
 		if (!mesh_active && !tess_active && Prospero::IsRectList(user_config.GetPrimType())) {
@@ -1800,7 +1804,7 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(
 		EXIT_IF(!colors[i].image_id || colors[i].desc.view_info.format == vk::Format::eUndefined);
 		static_params.color_mask[slot] = colors[i].export_mapping.ApplyMask(
 		    render_target_mask_slot(ctx.GetRenderTargetMask(), colors[i].target_slot));
-		if (colors[i].desc.info.guest_format == Prospero::BufferFormat::k11_11_10UNorm) {
+		if (Prospero::IsPackedUnormTargetFormat(colors[i].desc.info.guest_format)) {
 			static_params.color_mask[slot] = 1u;
 		}
 		rendering.color_formats[slot] = colors[i].desc.view_info.format;
