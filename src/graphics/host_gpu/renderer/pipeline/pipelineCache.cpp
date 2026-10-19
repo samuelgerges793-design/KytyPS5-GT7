@@ -1878,8 +1878,22 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(
 		if (attachment_samples == 0) {
 			attachment_samples = depth.desc.info.samples;
 		} else if (attachment_samples != depth.desc.info.samples) {
-			EXIT("mixed color/depth sample counts are unsupported: %u and %u\n", attachment_samples,
-			     depth.desc.info.samples);
+			// EQAA passes (fewer colour fragments than depth samples) need mixed-sample attachments
+			// (VK_NV_framebuffer_mixed_samples), not supported yet. Stopgap: skip such draws
+			// (KYTY_SKIP_MIXED_SAMPLE_DRAWS=0 restores the fatal error). GT7 draws one since upstream
+			// 5dec523, into its 2_10_10_10 target.
+			static LiveSetting skip_mixed("KYTY_SKIP_MIXED_SAMPLE_DRAWS", 1);
+			if (skip_mixed.Get() == 0) {
+				EXIT("mixed color/depth sample counts are unsupported: %u and %u\n", attachment_samples,
+				     depth.desc.info.samples);
+			}
+			static std::atomic<uint32_t> skipped {0};
+			if (skipped.fetch_add(1, std::memory_order_relaxed) < 8) {
+				Log::WriteToConsoleAndLog(fmt::format(
+				    "Warning: skipping a draw with mixed color/depth sample counts ({} and {})\n",
+				    attachment_samples, depth.desc.info.samples));
+			}
+			return nullptr;
 		}
 	}
 	if (color_count == 0 && !with_depth) {
