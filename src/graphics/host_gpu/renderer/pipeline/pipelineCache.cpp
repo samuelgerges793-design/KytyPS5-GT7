@@ -1042,8 +1042,9 @@ struct PipelineCache::ProgramCache {
 		const auto stage_name = GetStageNames(recipe.stage).name;
 		DumpShaderOriginal(stage_name, recipe.hash, recipe.code);
 		const auto source = ShaderRecompiler::PrepareShaderSource(recipe.code, options);
-		// A SWAPPC program links guest functions that the record does not hold.
-		if (!source.calls.empty()) {
+		// A SWAPPC program links guest functions that the record does not hold; one with an
+		// unsupported (GPU-selected) callable is skipped at dispatch and never compiled.
+		if (!source.calls.empty() || source.unsupported_call_pc != UINT32_MAX || source.decoded.has_swap_pc) {
 			return std::nullopt;
 		}
 		auto translated = ShaderRecompiler::TranslateProgram(source.decoded, options);
