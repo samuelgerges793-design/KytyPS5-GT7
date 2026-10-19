@@ -8,6 +8,7 @@
 #include "graphics/shader/shader.h"
 
 #include <array>
+#include <bitset>
 #include <optional>
 #include <span>
 #include <vector>
@@ -47,25 +48,27 @@ struct ShaderSource {
 	struct Call {
 		uint32_t instruction;
 		std::array<IR::Value, 2> target;
+		std::bitset<128> preserved_registers;
+		uint64_t address = 0;
 	};
 	struct Linked {
+		struct Function { uint32_t offset; uint32_t size; };
 		std::vector<uint32_t> code;
 		Decoder::Program decoded;
+		std::vector<Function> functions;
 		std::vector<uint32_t> observed_function;
 	};
 	std::vector<uint32_t> code;
 	Decoder::Program decoded;
 	IR::ResourcePlan call_targets;
 	std::vector<Call> calls;
+	uint32_t unsupported_call_pc = UINT32_MAX;
 	std::optional<Linked> linked;
 	uint64_t revision = 0;
 	std::vector<std::pair<uint64_t, uint64_t>> reads;
 };
 
-[[nodiscard]] const ShaderSource::Call* FindCall(const ShaderSource& source, uint32_t instruction);
-
-// Experimental: shaders whose calls pick their callee at runtime. Their dispatches are skipped
-// unless KYTY_RUN_RUNTIME_CALL_SHADERS is set.
+// GT7 fork: dispatches of shaders listed in KYTY_SKIP_SHADERS (or marked here) are skipped.
 void               MarkRuntimeCallShader(uint64_t shader_hash);
 [[nodiscard]] bool SkipRuntimeCallShader(uint64_t shader_hash);
 // Waterfall loop guards emitted by this thread's last SPIR-V emission (diagnostics).

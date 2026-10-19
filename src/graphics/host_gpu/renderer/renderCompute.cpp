@@ -54,8 +54,8 @@ static bool FillSourcesDisjoint(std::span<const ShaderRecompiler::IR::Descriptor
 	return true;
 }
 
-void RenderExecutor::UpdateComputeMetaClears(const ShaderComputeInputInfo& input,
-                                            const CommandBuffer&          buffer) {
+bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& input,
+                                                const CommandBuffer&          buffer) {
 	const auto& program   = *input.stage.program;
 	const auto& resources = *input.stage.resources;
 	if (resources.buffers.size() != program.info.buffers.size()) {
@@ -65,9 +65,10 @@ void RenderExecutor::UpdateComputeMetaClears(const ShaderComputeInputInfo& input
 	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
 		const auto& resource   = program.info.buffers[i];
 		const auto  descriptor = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
-		// Reads and transforms of metadata do not establish a clear state.
+		// A metadata resource that is also read is not proven to be a full overwrite. Execute it
+		// conservatively instead of replacing the dispatch with a coarse full-surface clear.
 		if ((!resource.written || resource.read) && cache.IsMeta(descriptor.Base48())) {
-			return;
+			return false;
 		}
 	}
 
@@ -77,10 +78,13 @@ void RenderExecutor::UpdateComputeMetaClears(const ShaderComputeInputInfo& input
 			if (resource.written) {
 				const auto descriptor =
 				    DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
-				(void)cache.ClearMeta(descriptor.Base48());
+				if (cache.ClearMeta(descriptor.Base48())) {
+					return true;
+				}
 			}
 		}
 	}
+	return false;
 }
 
 bool ResolveComputeBufferFill(const ShaderComputeInputInfo& input, uint32_t group_x,
@@ -312,6 +316,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	const auto compute_program =
 	    m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info);
+	if (!compute_program) return;
 	if (use_thread_dimensions) {
 		input_info.dispatch_threads_num[0]    = thread_group_x;
 		input_info.dispatch_threads_num[1]    = thread_group_y;
@@ -320,14 +325,12 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 
 	const auto& program   = *input_info.stage.program;
 	const auto& resources = *input_info.stage.resources;
-	if (resources.specialization_reads.empty()) {
-		// Cached metadata addresses can be reused as ordinary buffers; preserve their guest writes.
-		UpdateComputeMetaClears(input_info, buffer);
-		if (TryConsumeComputeFill(input_info, buffer, thread_group_x, thread_group_y,
-		                          thread_group_z, mode)) {
-			ResetBindings();
-			return;
-		}
+	if (resources.specialization_reads.empty() &&
+	    (TryConsumeComputeMetaClear(input_info, buffer) ||
+	     TryConsumeComputeFill(input_info, buffer, thread_group_x, thread_group_y,
+	                           thread_group_z, mode))) {
+		ResetBindings();
+		return;
 	}
 
 	if (use_thread_dimensions) {
@@ -475,7 +478,27 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		m_context.GetCommandScheduler().ProfileMark('?', 0);
 		vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 		DebugNoteDispatch(thread_group_x, thread_group_y, thread_group_z, false, 0);
-		vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
+		constexpr uint32_t DISPATCH_INITIATOR_ORDERED_APPEND_ENABLE = 1u << 3u;
+		const uint64_t     group_threads = uint64_t {std::max(input_info.threads_num[0], 1u)} *
+		                                   std::max(input_info.threads_num[1], 1u) *
+		                                   std::max(input_info.threads_num[2], 1u);
+		if ((mode & DISPATCH_INITIATOR_ORDERED_APPEND_ENABLE) != 0 && program.info.uses_gds &&
+		    group_threads <= input_info.wave_size && !input_info.lds_storage) {
+			// A single guest wave per group can run in launch order without a device-wide
+			// spinlock. Keep the guest workgroup IDs when splitting the dispatch.
+			for (uint32_t z = 0; z < thread_group_z; ++z) {
+				for (uint32_t y = 0; y < thread_group_y; ++y) {
+					for (uint32_t x = 0; x < thread_group_x; ++x) {
+						if ((x | y | z) != 0u) {
+							ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+						}
+						vk_buffer.dispatchBase(x, y, z, 1, 1, 1);
+					}
+				}
+			}
+		} else {
+			vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
+		}
 		Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
 		m_context.GetCommandScheduler().ProfileMark('C', program.shader_hash);
 	}
@@ -525,6 +548,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	input_info.indirect_args_address = args_addr;
 	const auto compute_program = m_context.GetPipelineCache().GetComputeProgram(
 	    cs_regs, buffer.GetRegisters().GetShaderRegisters(), input_info);
+	if (!compute_program) return;
 	buffer.EndRendering();
 	auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
 	auto& bindings = m_compute_bindings;

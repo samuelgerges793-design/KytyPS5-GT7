@@ -1587,14 +1587,49 @@ private:
 		return read;
 	}
 
+	const Inst* IndexedMaterialRead(const Inst* read, Value active,
+	                               DescriptorSource::IndirectDescriptor::SelectorRead& selector) const {
+		uint32_t lane = 0;
+		if (read != nullptr && read->GetOpcode() == ValueOpcode::CompositeExtractU32x2) {
+			if (!ImmediateU32(read->Arg(1), lane) || lane >= 2u) return nullptr;
+			read = read->Arg(0).Resolve().TryInstruction();
+			if (read == nullptr || read->GetOpcode() != ValueOpcode::LoadBufferU32x2) return nullptr;
+		} else if (read == nullptr || read->GetOpcode() != ValueOpcode::LoadBufferU32) {
+			return nullptr;
+		}
+		const auto& memory = m_program.memory_info[read->Flags<MemoryFlags>().index];
+		if (memory.kind != ResourceKind::Buffer || memory.typed || memory.formatted ||
+		    !memory.idxen || memory.offen || memory.offset > UINT32_MAX - lane * 4u ||
+		    read->Arg(2).Resolve() != Value(0u) || read->Arg(3).Resolve() != Value(0u) ||
+		    !EquivalentValue(m_program, active, read->Arg(4))) return nullptr;
+		selector.offset = memory.offset + lane * 4u;
+		return read;
+	}
+
 	bool MatchUniformizedMaterialKey(Value key, const Inst& image,
 	                                DescriptorSource::IndirectDescriptor& indirect,
-	                                DescriptorSource& material_source) {
+	                                DescriptorSource& material_source, bool indexed) {
 		const auto* selected = UniformizedMaterialValue(key, image);
 		if (selected == nullptr) return false;
 		const auto active = selected->Arg(0).Resolve();
 		DescriptorSource::IndirectDescriptor::SelectorRead selector;
 		const auto* read = SelectorReadValue(selected->Arg(1), active, selector);
+		if (indexed) {
+			read = IndexedMaterialRead(read, active, selector);
+			// This optional domain is checked against the dispatch's writable buffers.
+			// Other stages and unbounded/image writes need the original heap domain.
+			if (read == nullptr || m_program.stage != ShaderType::Compute ||
+			    std::ranges::any_of(m_program.blocks, [](const Block* block) {
+				    return std::ranges::any_of(*block, [](const Inst& inst) {
+					    const auto op = inst.GetOpcode();
+					    return ImageOpcodeInfoOf(op).resource_class == ImageResourceClass::Storage ||
+					           AddressOpcodeInfoOf(op).access == AddressAccess::Write;
+				    });
+			    }) || !MakeRuntimeTableSource(*read, material_source)) return false;
+			selector.source = InternSource(material_source);
+			indirect.selector = std::move(selector);
+			return true;
+		}
 		if (read == nullptr || read->GetOpcode() != ValueOpcode::LoadAddressU32 ||
 		    read->NumArgs() != 4u || !Implies(active, read->Arg(3)))
 			return false;
@@ -2844,7 +2879,7 @@ private:
 				} else result.maximum = std::max(result.maximum, SelectorMaximum(key, {}, 0u, active));
 			}
 		}
-		if (lane != nullptr) result = SelectedFiniteDomain(*lane, handle != nullptr ? lane->Arg(1) : Value {});
+		if (lane != nullptr) result = SelectedSelectorDomain(*lane, handle != nullptr ? lane->Arg(1) : Value {});
 		else if (handle == nullptr) result.maximum = SelectorMaximum(key);
 		if (result.maximum > UINT32_MAX / 4u ||
 		    uint64_t {result.maximum} * indirect.table_stride + indirect.table_offset > UINT32_MAX)
@@ -3000,6 +3035,13 @@ private:
 			// Keep live descriptor payloads, but project descriptor-only SMEM onto
 			// the GPU key using the same plan as other indirect image reads.
 			plan.retain_reads |= table_source.dword_count == 4u;
+		} else if (!sampler && !plan.table_indexed && table_source.dword_count == 4u &&
+		           MatchUniformizedMaterialKey(key, handle, indirect, material_source, true)) {
+			// Preserve the heap's byte-offset key so runtime geometry can choose the
+			// tighter selector domain without changing the GPU's descriptor reads.
+			indirect.table_scalar = true;
+			plan.table_read = plan.reads[0];
+			plan.retain_reads = true;
 		} else if (sampler && table_source.dword_count == 4u && !plan.table_indexed &&
 		           SetExactTableMaximum(key, indirect, &handle)) {
 			indirect.table_scalar = true;
@@ -3049,7 +3091,7 @@ private:
 				}
 			}
 			if (indirect.key_count.IsEmpty() &&
-			    !MatchUniformizedMaterialKey(key, handle, indirect, material_source) &&
+			    !MatchUniformizedMaterialKey(key, handle, indirect, material_source, false) &&
 			    !MatchReversedImageRange(key, indirect)) {
 				const auto maximum = SelectorMaximum(key);
 				if (maximum >= MaxIndirectDescriptorProbes) return false;
@@ -3093,6 +3135,10 @@ private:
 					indirect.selector_mask = selected.selector_mask;
 					indirect.signed_count = selected.signed_count;
 					indirect.workgroup_axis = selected.workgroup_axis;
+					if (selected.table_scalar) {
+						indirect.table_scalar = true;
+						plan.table_read = plan.reads[0];
+					}
 					material_source = m_sources[selected.selector->source];
 					shared_selector = true;
 					break;
@@ -3293,26 +3339,13 @@ private:
 			if (value == nullptr || (selected != nullptr && selected != value)) return false;
 			selected = value;
 		}
-		const auto* read = selected->Arg(1).Resolve().TryInstruction();
-		uint32_t lane = 0;
-		if (read != nullptr && read->GetOpcode() == ValueOpcode::CompositeExtractU32x2) {
-			if (!ImmediateU32(read->Arg(1), lane) || lane >= 2u) return false;
-			read = read->Arg(0).Resolve().TryInstruction();
-			if (read == nullptr || read->GetOpcode() != ValueOpcode::LoadBufferU32x2) return false;
-		} else if (read == nullptr || read->GetOpcode() != ValueOpcode::LoadBufferU32) {
-			return false;
-		}
-		const auto& memory = m_program.memory_info[read->Flags<MemoryFlags>().index];
-		uint32_t offset = 1u, scalar = 1u;
-		if (memory.kind != ResourceKind::Buffer || memory.typed || memory.formatted ||
-		    !memory.idxen || memory.offen || memory.offset > UINT32_MAX - lane * 4u ||
-		    !ImmediateU32(read->Arg(2), offset) || offset != 0u ||
-		    !ImmediateU32(read->Arg(3), scalar) || scalar != 0u ||
-		    !EquivalentValue(m_program, selected->Arg(0), read->Arg(4))) return false;
-		if (!MakeRuntimeTableSource(*read, material_source) ||
+		DescriptorSource::IndirectDescriptor::SelectorRead selector;
+		const auto* read = IndexedMaterialRead(selected->Arg(1).Resolve().TryInstruction(),
+		                                       selected->Arg(0), selector);
+		if (read == nullptr || !MakeRuntimeTableSource(*read, material_source) ||
 		    !BoundedSelectedIndex(read->Arg(1), read->Arg(4), indirect)) return false;
-		indirect.selector.emplace(DescriptorSource::IndirectDescriptor::SelectorRead{.source = InternSource(material_source),
-		                              .offset = memory.offset + lane * 4u});
+		selector.source = InternSource(material_source);
+		indirect.selector = std::move(selector);
 		return finish();
 	}
 
@@ -3401,10 +3434,12 @@ private:
 		return found ? SelectorDomain {maximum, counted ? count : Value {}} : SelectorDomain {};
 	}
 
-	SelectorDomain SelectedFiniteDomain(const Inst& lane, Value guard) const {
+	SelectorDomain SelectedSelectorDomain(const Inst& lane, Value guard) const {
 		if (guard.IsEmpty() ? !HasActiveLane(lane.Arg(1), lane.Parent())
 		                    : !Implies(guard, lane.Arg(1))) return {};
-		return FiniteSelectorDomain(lane.Arg(0), lane.Arg(1));
+		auto result = FiniteSelectorDomain(lane.Arg(0), lane.Arg(1));
+		if (result.maximum == UINT32_MAX) result.maximum = PossibleU32Bits(lane.Arg(0));
+		return result;
 	}
 
 	uint32_t SelectorMaximum(Value value, SelectorBounds bounds = {}, uint32_t depth = 0,
@@ -3421,7 +3456,7 @@ private:
 		};
 		switch (inst->GetOpcode()) {
 			case ValueOpcode::ReadFirstLane:
-				return SelectedFiniteDomain(*inst, guard).maximum;
+				return SelectedSelectorDomain(*inst, guard).maximum;
 			case ValueOpcode::ReadLane:
 				// ReadLane ignores EXEC; only context-free bounds on every source lane apply.
 				return PossibleU32Bits(inst->Arg(0));

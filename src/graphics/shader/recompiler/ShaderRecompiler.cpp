@@ -1,8 +1,8 @@
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
+#include "graphics/shader/recompiler/Tessellation.h"
 
 #include "common/assert.h"
 #include "common/logging/log.h"
-#include "graphics/shader/recompiler/Tessellation.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
@@ -17,20 +17,19 @@
 #include "graphics/shader/recompiler/ir/passes/ShaderInfoCollection.h"
 #include "graphics/shader/recompiler/ir/passes/SsaRewrite.h"
 
-#include <algorithm>
-#include <array>
-#include <cstdlib>
+#include <vector>
+#include <string>
 #include <unordered_set>
 #include <mutex>
-#include <atomic>
+#include <cstdlib>
+#include <algorithm>
+#include <array>
 #include <chrono>
 #include <fmt/format.h>
 #include <functional>
 #include <map>
 #include <span>
-#include <string>
 #include <utility>
-#include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler {
 
@@ -63,8 +62,7 @@ const char* StageName(ShaderType stage) {
 	}
 }
 
-void LogDispatcherFallback(const CompileOptions& options, const CFG::Graph& cfg,
-                           const char* phase) {
+void LogDispatcherFallback(const CompileOptions& options, const CFG::Graph& cfg, const char* phase) {
 	const auto* block        = cfg.FindBlock(cfg.failure_block);
 	const auto  start        = block != nullptr ? block->start_pc : UINT32_MAX;
 	const auto  end          = block != nullptr ? block->end_pc : UINT32_MAX;
@@ -81,7 +79,14 @@ void LogDispatcherFallback(const CompileOptions& options, const CFG::Graph& cfg,
 	     static_cast<uint64_t>(cfg.back_edges.size()), cfg.unsupported_reason.c_str());
 }
 
-enum class EmbeddedFetchValueType { Unknown, Constant, AttribTable, Attrib, BufferTable, Buffer };
+enum class EmbeddedFetchValueType {
+	Unknown,
+	Constant,
+	AttribTable,
+	Attrib,
+	BufferTable,
+	Buffer
+};
 
 struct EmbeddedFetchSgprInfo {
 	EmbeddedFetchValueType type      = EmbeddedFetchValueType::Unknown;
@@ -208,11 +213,11 @@ int BufferTableAttribFromOffset(uint32_t raw_offset, int dword) {
 	return static_cast<int>((raw_offset + static_cast<uint32_t>(dword) * 4u) / 16u);
 }
 
-Frontend::EmbeddedFetchPlan
-DetectEmbeddedVertexFetch(const Decoder::Program& decoded, const ShaderVertexInputInfo* input_info,
-                          uint32_t user_data_base, uint32_t user_data_count, uint32_t wave_size) {
-	const uint32_t vertex_index_reg   = input_info->logical_stage == ShaderType::Local ? 2u : 5u;
-	const uint32_t instance_index_reg = input_info->logical_stage == ShaderType::Local ? 5u : 8u;
+Frontend::EmbeddedFetchPlan DetectEmbeddedVertexFetch(
+    const Decoder::Program& decoded, const ShaderVertexInputInfo* input_info,
+    uint32_t user_data_base, uint32_t user_data_count, uint32_t wave_size) {
+	const uint32_t    vertex_index_reg   = input_info->logical_stage == ShaderType::Local ? 2u : 5u;
+	const uint32_t    instance_index_reg = input_info->logical_stage == ShaderType::Local ? 5u : 8u;
 	Frontend::EmbeddedFetchPlan data;
 	data.loads.reserve(input_info->resources_num);
 	int32_t vertex_offset_candidate   = -1;
@@ -225,13 +230,14 @@ DetectEmbeddedVertexFetch(const Decoder::Program& decoded, const ShaderVertexInp
 	const int buffer_reg = input_info->fetch_buffer_reg + shift_regs;
 
 	std::array<EmbeddedFetchSgprInfo, 108> sgprs {};
-	std::array<bool, 256>                  vgpr_is_index {};
+	std::array<bool, 256>                 vgpr_is_index {};
 	EmbeddedFetchVectorLanes               vector_lanes;
-	const bool                             track_vector_lanes = std::none_of(
-	    decoded.instructions.begin(), decoded.instructions.end(), [](const auto& inst) {
-		    return Decoder::IsDirectBranch(inst.opcode) ||
-			       inst.opcode == Decoder::Opcode::S_SETPC_B64;
-	    });
+	const bool                             track_vector_lanes =
+	    std::none_of(decoded.instructions.begin(), decoded.instructions.end(),
+	                 [](const auto& inst) {
+		                 return Decoder::IsDirectBranch(inst.opcode) ||
+		                        inst.opcode == Decoder::Opcode::S_SETPC_B64;
+	                 });
 
 	if (attrib_reg >= 0 && attrib_reg < static_cast<int>(sgprs.size())) {
 		sgprs[attrib_reg].type = EmbeddedFetchValueType::AttribTable;
@@ -260,19 +266,19 @@ DetectEmbeddedVertexFetch(const Decoder::Program& decoded, const ShaderVertexInp
 		const bool index_offset_add =
 		    (vertex_index_accumulator || instance_index_accumulator) && IsDecodedSgpr(inst.src0) &&
 		    ((inst.opcode == Decoder::Opcode::V_ADD_I32 && IsDecodedVgpr(inst.src1) &&
-			  inst.src1.reg == inst.dst.reg) ||
-			 (user_data_base == 8 &&
-			  (inst.dst.reg == vertex_index_reg || inst.dst.reg == instance_index_reg) &&
-			  inst.opcode == Decoder::Opcode::V_SAD_U32 && IsDecodedVgpr(inst.src2) &&
-			  inst.src2.reg == inst.dst.reg &&
-			  TryDecodedOperandConstant(sgprs, inst.src1, sad_zero) && sad_zero == 0));
+		      inst.src1.reg == inst.dst.reg) ||
+		     (user_data_base == 8 &&
+		      (inst.dst.reg == vertex_index_reg || inst.dst.reg == instance_index_reg) &&
+		      inst.opcode == Decoder::Opcode::V_SAD_U32 && IsDecodedVgpr(inst.src2) &&
+		      inst.src2.reg == inst.dst.reg &&
+		      TryDecodedOperandConstant(sgprs, inst.src1, sad_zero) && sad_zero == 0));
 		if (data.loads.empty() && index_offset_add) {
 			const auto reg = DecodedSgprReg(inst.src0);
 			if (reg >= user_data_base && reg - user_data_base < user_data_count) {
-				auto& candidate =
-				    vertex_index_accumulator ? vertex_offset_candidate : instance_offset_candidate;
-				auto& conflict =
-				    vertex_index_accumulator ? vertex_offset_conflict : instance_offset_conflict;
+				auto& candidate = vertex_index_accumulator ? vertex_offset_candidate
+				                                           : instance_offset_candidate;
+				auto& conflict  = vertex_index_accumulator ? vertex_offset_conflict
+				                                           : instance_offset_conflict;
 				if (candidate >= 0 && candidate != static_cast<int32_t>(reg)) {
 					conflict = true;
 				} else {
@@ -344,9 +350,9 @@ DetectEmbeddedVertexFetch(const Decoder::Program& decoded, const ShaderVertexInp
 							const int  index       = static_cast<int>(raw_offset / 4u);
 							for (uint32_t i = 0;
 							     i < DecodedDstSize(inst) && register_id + i < sgprs.size(); i++) {
-								auto& dst     = sgprs[register_id + i];
-								dst.type      = EmbeddedFetchValueType::Attrib;
-								dst.attrib_id = index + static_cast<int>(i);
+								auto& dst        = sgprs[register_id + i];
+								dst.type         = EmbeddedFetchValueType::Attrib;
+								dst.attrib_id    = index + static_cast<int>(i);
 							}
 						} else {
 							ClearEmbeddedFetchSgprs(sgprs, inst.dst, DecodedDstSize(inst));
@@ -372,9 +378,9 @@ DetectEmbeddedVertexFetch(const Decoder::Program& decoded, const ShaderVertexInp
 						           (inst.offset & 0x3u) == 0) {
 							for (uint32_t i = 0;
 							     i < DecodedDstSize(inst) && register_id + i < sgprs.size(); i++) {
-								auto& dst     = sgprs[register_id + i];
-								dst.type      = EmbeddedFetchValueType::Buffer;
-								dst.attrib_id = sgprs[DecodedSgprReg(inst.src1)].attrib_id;
+								auto& dst        = sgprs[register_id + i];
+								dst.type         = EmbeddedFetchValueType::Buffer;
+								dst.attrib_id    = sgprs[DecodedSgprReg(inst.src1)].attrib_id;
 							}
 						} else {
 							ClearEmbeddedFetchSgprs(sgprs, inst.dst, DecodedDstSize(inst));
@@ -419,8 +425,8 @@ DetectEmbeddedVertexFetch(const Decoder::Program& decoded, const ShaderVertexInp
 					}
 				} else if (IsEmbeddedFetchBufferLoad(inst)) {
 					if (IsDecodedVgpr(inst.src0) && inst.src0.reg < vgpr_is_index.size() &&
-					    vgpr_is_index[inst.src0.reg] && IsDecodedSgpr(inst.src1) &&
-					    DecodedSgprReg(inst.src1) < sgprs.size() &&
+					    vgpr_is_index[inst.src0.reg] &&
+					    IsDecodedSgpr(inst.src1) && DecodedSgprReg(inst.src1) < sgprs.size() &&
 					    sgprs[DecodedSgprReg(inst.src1)].type == EmbeddedFetchValueType::Buffer) {
 						const auto& buffer = sgprs[DecodedSgprReg(inst.src1)];
 						if (data.loads.empty()) {
@@ -431,10 +437,10 @@ DetectEmbeddedVertexFetch(const Decoder::Program& decoded, const ShaderVertexInp
 								data.instance_offset_sgpr = instance_offset_candidate;
 							}
 						}
-						auto& load      = data.loads.emplace_back();
-						load.pc         = inst.pc;
-						load.attrib_id  = buffer.attrib_id;
-						load.components = DecodedDstSize(inst);
+						auto& load        = data.loads.emplace_back();
+						load.pc           = inst.pc;
+						load.attrib_id    = buffer.attrib_id;
+						load.components   = DecodedDstSize(inst);
 					}
 				}
 				break;
@@ -443,7 +449,8 @@ DetectEmbeddedVertexFetch(const Decoder::Program& decoded, const ShaderVertexInp
 			vector_lanes.clear();
 		} else if (inst.opcode != Decoder::Opcode::V_WRITELANE_B32 && IsDecodedVgpr(inst.dst)) {
 			for (uint32_t i = 0;
-			     i < EmbeddedFetchDstSize(inst) && inst.dst.reg + i < vgpr_is_index.size(); i++) {
+			     i < EmbeddedFetchDstSize(inst) && inst.dst.reg + i < vgpr_is_index.size();
+			     i++) {
 				ClearEmbeddedFetchVectorLanes(&vector_lanes, inst.dst.reg + i);
 			}
 		}
@@ -479,68 +486,32 @@ Decoder::Program DecodeFusedProgram(std::span<const uint32_t> front, std::span<c
 	return result;
 }
 
-const ShaderSource::Call* FindCall(const ShaderSource& s, uint32_t instruction) {
-	for (const auto& c: s.calls)
-		if (c.instruction == instruction) return &c;
-	return nullptr;
-}
-
-// Thrown when a call target depends on values only known while the shader runs.
-struct DynamicCallTarget {};
-
-void PrepareCallTarget(ShaderSource& source, const CompileOptions& options) {
+void PrepareCallTargets(ShaderSource& source, const CompileOptions& options) {
 	using namespace IR;
-	source.calls.clear();
+	EXIT_NOT_IMPLEMENTED(options.stage != ShaderType::Compute);
 	for (uint32_t i = 0; i < source.decoded.instructions.size(); ++i) {
 		if (source.decoded.instructions[i].opcode != Decoder::Opcode::S_SWAPPC_B64) continue;
-		EXIT_NOT_IMPLEMENTED(options.stage != ShaderType::Compute);
-		source.calls.push_back(ShaderSource::Call {.instruction = i});
-		printf("S_SWAPPC_B64 @%u (stage=%d, total so far=%zu)\n", i, (int)options.stage,
-		       source.calls.size());
+		source.calls.push_back({.instruction = i});
 	}
-	if (source.calls.empty()) return;
 	EXIT_IF(options.input_info.compute == nullptr);
 	const auto graph = CFG::BuildGraph(source.decoded);
-
-	// --- DIAGNOSTICA: dump dei blocchi del CFG ---
-	printf("CFG: %zu blocks, entry=%u\n", graph.blocks.size(), (unsigned)graph.entry_block);
-	for (const auto& b: graph.blocks) {
-		printf("  block id=%u [%u,%u) preds=", (unsigned)b.id, b.inst_begin, b.inst_end);
-		for (auto p: b.predecessors) printf(" %u", (unsigned)p);
-		printf("\n");
-	}
-	auto DumpInst = [&](uint32_t k) {
-		const auto& x = source.decoded.instructions[k];
-		printf("   %5u: opcode=%d dst=(kind=%d,reg=%u) src0=(kind=%d,reg=%u) src1=(kind=%d,reg=%u)\n",
-		       k, (int)x.opcode, (int)x.dst.kind, (unsigned)x.dst.reg, (int)x.src0.kind,
-		       (unsigned)x.src0.reg, (int)x.src1.kind, (unsigned)x.src1.reg);
-	};
-	// --- fine diagnostica ---
-
 	Program query;
-	query.stage           = options.stage;
-	query.user_data_base  = options.user_data_base;
+	query.stage = options.stage;
+	query.user_data_base = options.user_data_base;
 	query.user_data_count = static_cast<uint32_t>(options.user_data.size());
-	query.wave_size       = options.wave_size;
-	auto& block           = *query.block_storage.emplace_back(std::make_unique<Block>());
+	query.wave_size = options.wave_size;
+	auto& block = *query.block_storage.emplace_back(std::make_unique<Block>());
 	query.blocks.push_back(&block);
-
-	struct Producer {
-		bool                      ready = false;
-		std::map<uint32_t, Value> values;
-	};
-	std::map<uint32_t, Producer>             producers;
+	struct Producer { bool ready = false; std::map<uint32_t, Value> values; };
+	std::map<uint32_t, Producer> producers;
 	std::function<Value(uint32_t, uint32_t)> Register;
-	std::function<Producer&(uint32_t)>       EnsureProducer;
-	std::function<Value(uint32_t, Value)>    Resolve = [&](uint32_t before, Value value) -> Value {
-		value      = value.Resolve();
+	std::function<Value(uint32_t, Value)> Resolve = [&](uint32_t before, Value value) -> Value {
+		value = value.Resolve();
 		auto* inst = value.TryInstruction();
 		if (inst == nullptr) return value;
 		uint32_t code = UINT32_MAX;
 		switch (inst->GetOpcode()) {
-			case ValueOpcode::GetScalarRegister:
-				code = static_cast<uint32_t>(inst->Arg(0).ScalarRegister());
-				break;
+			case ValueOpcode::GetScalarRegister: code = static_cast<uint32_t>(inst->Arg(0).ScalarRegister()); break;
 			case ValueOpcode::GetVccLo: code = 106u; break;
 			case ValueOpcode::GetVccHi: code = 107u; break;
 			default: break;
@@ -550,125 +521,75 @@ void PrepareCallTarget(ShaderSource& source, const CompileOptions& options) {
 			inst->ReplaceUsesWith(result);
 			return result;
 		}
-		for (size_t i = 0; i < inst->NumArgs(); ++i)
-			inst->SetArg(i, Resolve(before, inst->Arg(i)));
+		for (size_t i = 0; i < inst->NumArgs(); ++i) inst->SetArg(i, Resolve(before, inst->Arg(i)));
 		return value;
 	};
-
-	EnsureProducer = [&](uint32_t index) -> Producer& {
+	Register = [&](uint32_t before, uint32_t code) -> Value {
+		std::vector<uint32_t> crossed_calls;
+		const auto index = CFG::FindScalarDefinition(source.decoded, graph, before, code, crossed_calls);
+		for (const auto crossed: crossed_calls) {
+			std::ranges::find(source.calls, crossed, &ShaderSource::Call::instruction)->preserved_registers.set(code);
+		}
+		if (index == UINT32_MAX) {
+			EXIT_IF(code < query.user_data_base || code - query.user_data_base >= query.user_data_count);
+			return IREmitter(&block).GetUserData(static_cast<ScalarReg>(code));
+		}
 		auto [entry, inserted] = producers.try_emplace(index);
-		auto& producer         = entry->second;
+		auto& producer = entry->second;
 		if (inserted) {
-			EXIT_NOT_IMPLEMENTED(source.decoded.instructions[index].opcode ==
-			                     Decoder::Opcode::S_SWAPPC_B64);
-			Block                translated;
+			Block translated;
 			Frontend::Translator translator(query, &translated, 1u,
-			                                (options.input_info.compute->float_mode & 0x10u) == 0u,
-			                                !options.input_info.compute->async_compute);
+			    (options.input_info.compute->float_mode & 0x10u) == 0u,
+			    !options.input_info.compute->async_compute);
 			translator.TranslateInstruction(source.decoded.instructions[index]);
 			for (const auto& inst: translated) {
 				uint32_t destination = UINT32_MAX;
-				Value    value;
+				Value value;
 				switch (inst.GetOpcode()) {
 					case ValueOpcode::SetScalarRegister:
-						destination = static_cast<uint32_t>(inst.Arg(0).ScalarRegister());
-						value       = inst.Arg(1);
-						break;
-					case ValueOpcode::SetVccLo:
-						destination = 106u;
-						value       = inst.Arg(0);
-						break;
-					case ValueOpcode::SetVccHi:
-						destination = 107u;
-						value       = inst.Arg(0);
-						break;
+						destination = static_cast<uint32_t>(inst.Arg(0).ScalarRegister()); value = inst.Arg(1); break;
+					case ValueOpcode::SetVccLo: destination = 106u; value = inst.Arg(0); break;
+					case ValueOpcode::SetVccHi: destination = 107u; value = inst.Arg(0); break;
 					default: break;
 				}
 				if (destination != UINT32_MAX) producer.values.insert_or_assign(destination, value);
 			}
-			for (auto& [destination, value]: producer.values)
-				value = Resolve(index, value);
-			for (auto& inst: translated)
-				inst.SetParent(&block);
+			for (auto& [destination, value]: producer.values) value = Resolve(index, value);
+			for (auto& inst: translated) inst.SetParent(&block);
 			block.Instructions().splice(block.end(), translated.Instructions());
 			producer.ready = true;
 		}
-		return producer;
-	};
-
-	Register = [&](uint32_t before, uint32_t code) -> Value {
-		const auto index = CFG::FindScalarDefinition(
-		    source.decoded, graph, before, code, [&](uint32_t i) {
-			    const auto& p = EnsureProducer(i);
-			    if (!p.ready) throw DynamicCallTarget {};  // circular dependency
-			    return p.values.contains(code);
-		    });
-		if (index == CFG::AmbiguousScalarDefinition) throw DynamicCallTarget {};
-		if (index == UINT32_MAX) {
-			if (code < query.user_data_base || code - query.user_data_base >= query.user_data_count)
-				throw DynamicCallTarget {};
-			return IREmitter(&block).GetUserData(static_cast<ScalarReg>(code));
-		}
-		auto& producer = EnsureProducer(index);
-		if (!producer.ready || !producer.values.contains(code)) throw DynamicCallTarget {};
+		EXIT_IF(!producer.ready || !producer.values.contains(code));
 		return producer.values.at(code).Resolve();
 	};
-	for (auto& c: source.calls) {
-		const auto& call = source.decoded.instructions[c.instruction];
-
-		// --- DIAGNOSTICA: contesto della call ---
-		printf("=== CALL @%u: dst=(kind=%d,reg=%u) src0=(kind=%d,reg=%u) wave_size=%u\n",
-		       c.instruction, (int)call.dst.kind, (unsigned)call.dst.reg, (int)call.src0.kind,
-		       (unsigned)call.src0.reg, (unsigned)options.wave_size);
-		for (uint32_t k = (c.instruction >= 12 ? c.instruction - 12 : 0); k <= c.instruction; ++k)
-			DumpInst(k);
-		// --- fine diagnostica ---
-
+	for (auto& site: source.calls) {
+		const auto& call = source.decoded.instructions[site.instruction];
 		EXIT_NOT_IMPLEMENTED(call.src0.kind != Decoder::OperandKind::Sgpr ||
-		                     call.dst.kind != Decoder::OperandKind::Sgpr || call.src0.reg >= 105u ||
-		                     call.dst.reg >= 105u);
-
-		std::function<void(Value, int)> DumpValue = [&](Value v, int depth) {
-			v = v.Resolve();
-			auto* inst = v.TryInstruction();
-			if (inst == nullptr) {
-				printf("%*s(const/other)\n", depth * 2, "");
+		                     call.dst.kind != Decoder::OperandKind::Sgpr ||
+		                     call.src0.reg != call.dst.reg || call.dst.reg >= 105u);
+		for (uint32_t i = 0; i < 2u; ++i) {
+			const auto value = Register(site.instruction, call.src0.reg + i);
+			if (!ValidateRuntimeValue(query, value, RuntimeValueType::Integer)) {
+				EXIT_IF(value.Instruction()->GetOpcode() != ValueOpcode::ReadConstBuffer);
+				source.unsupported_call_pc = call.pc;
+				source.calls.clear();
 				return;
 			}
-			printf("%*sop=%s(%d) nargs=%zu\n", depth * 2, "",
-			       IR::ValueOpcodeName(inst->GetOpcode()).data(), (int)inst->GetOpcode(),
-			       inst->NumArgs());
-			if (depth < 8) {
-				for (size_t i = 0; i < inst->NumArgs(); ++i) {
-					DumpValue(inst->Arg(i), depth + 1);
-				}
-			}
-		};
-
-		for (uint32_t i = 0; i < 2u; ++i) {
-			const auto value = Register(c.instruction, call.src0.reg + i);
-			if (!ValidateRuntimeValue(query, value, RuntimeValueType::Integer)) {
-				printf("TARGET NOT VALID: call@%u reg=s%u\n", c.instruction, call.src0.reg + i);
-				DumpValue(value, 0);
-			}
-			if (!ValidateRuntimeValue(query, value, RuntimeValueType::Integer)) throw DynamicCallTarget {};
 			auto& root = query.value_storage.emplace_back(ValueOpcode::ReferenceU32);
 			root.SetArg(0, value);
-			c.target[i] = Value(&root);
+			site.target[i] = Value(&root);
 		}
 	}
 	RewriteToSsa(query.blocks);
 	ConstantPropagationPass(query.blocks, query.wave_size);
 	RemoveIdentities(query);
 	EliminateDeadCode(query.blocks);
-	for (auto& c: source.calls)
-		for (auto& value: c.target)
-			value = value.Instruction()->Arg(0).Resolve();
+	for (auto& site: source.calls)
+		for (auto& value: site.target) value = value.Instruction()->Arg(0).Resolve();
 	query.value_storage.clear();
 	for (auto& inst: block) {
 		inst.SetParent(nullptr);
-		if (inst.GetOpcode() == ValueOpcode::LoadAddressU32 ||
-		    inst.GetOpcode() == ValueOpcode::ReadConstBuffer)
+		if (inst.GetOpcode() == ValueOpcode::LoadAddressU32 || inst.GetOpcode() == ValueOpcode::ReadConstBuffer)
 			inst.SetFlags(SrtReadFlags {.index = inst.Flags<MemoryFlags>().index});
 	}
 	query.value_storage.splice(query.value_storage.end(), block.Instructions());
@@ -688,7 +609,7 @@ void MarkRuntimeCallShader(uint64_t shader_hash) {
 }
 
 bool SkipRuntimeCallShader(uint64_t shader_hash) {
-	// Experimental: KYTY_SKIP_SHADERS=hash1,hash2 also skips the listed compute dispatches.
+	// KYTY_SKIP_SHADERS=hash1,hash2 skips the listed draws' pixel shaders and compute dispatches.
 	static const std::vector<uint64_t> skipped = [] {
 		std::vector<uint64_t> list;
 		if (const char* env = std::getenv("KYTY_SKIP_SHADERS"); env != nullptr) {
@@ -703,8 +624,6 @@ bool SkipRuntimeCallShader(uint64_t shader_hash) {
 		return list;
 	}();
 	if (std::ranges::find(skipped, shader_hash) != skipped.end()) return true;
-	static const bool run = std::getenv("KYTY_RUN_RUNTIME_CALL_SHADERS") != nullptr;
-	if (run) return false;
 	std::scoped_lock lock(g_runtime_call_mutex);
 	return g_runtime_call_shaders.contains(shader_hash);
 }
@@ -715,40 +634,15 @@ ShaderSource PrepareShaderSource(std::span<const uint32_t> code, const CompileOp
 	if (!options.back_code.empty()) {
 		source.decoded = DecodeFusedProgram(code, options.back_code, source.code);
 	} else if (options.stage == ShaderType::Local) {
-		source.decoded    = Decoder::DecodeFrontProgram(code);
-		auto& handoff     = source.decoded.instructions.back();
-		handoff.opcode    = Decoder::Opcode::S_ENDPGM;
+		source.decoded = Decoder::DecodeFrontProgram(code);
+		auto& handoff = source.decoded.instructions.back();
+		handoff.opcode = Decoder::Opcode::S_ENDPGM;
 		handoff.src_count = 0;
 	} else {
 		Decoder::DecodeProgram(code, source.decoded);
 	}
 	if (source.decoded.has_swap_pc) {
-		try {
-			PrepareCallTarget(source, options);
-		} catch (const DynamicCallTarget&) {
-			// Experimental stopgap: the callee is chosen while the shader runs, which is not
-			// supported yet. Turn each call into a no-op as if the callee returned immediately.
-			static std::atomic_int reports = 0;
-			if (reports++ < 16) {
-				Log::WriteToConsoleAndLog(fmt::format(
-				    "warning: {} shader 0x{:016x} calls a runtime-selected function; skipping its "
-				    "calls\n",
-				    StageName(options.stage), options.shader_hash));
-			}
-			for (auto& inst: source.decoded.instructions) {
-				if (inst.opcode == Decoder::Opcode::S_SWAPPC_B64) {
-					inst.opcode    = Decoder::Opcode::S_NOP;
-					inst.src_count = 0;
-				}
-			}
-			MarkRuntimeCallShader(options.shader_hash);
-			source.decoded.has_swap_pc = false;
-			source.calls.clear();
-			source.call_targets = {};
-			source.linked.reset();
-			source.reads.clear();
-			return source;
-		}
+		PrepareCallTargets(source, options);
 		source.code.assign(code.begin(), code.end());
 		source.decoded.code = source.code;
 	}
@@ -756,133 +650,122 @@ ShaderSource PrepareShaderSource(std::span<const uint32_t> code, const CompileOp
 }
 
 const Decoder::Program& RefreshShaderSource(ShaderSource& source, const IR::SrtRuntime& runtime) {
-	if (source.calls.empty()) return source.decoded;
+	EXIT_IF(source.unsupported_call_pc != UINT32_MAX);
 	auto& reads = source.reads;
 	reads.clear();
-	IR::SrtReadCapture    capture(runtime, reads);
-	const auto            clean = IR::CleanRuntime(capture.ObservedRuntime());
-	IR::SrtWalker         walker(source.call_targets, clean);
-	std::vector<uint64_t> addresses;
-	addresses.reserve(source.calls.size());
-	for (const auto& c: source.calls) {
-		uint32_t    low = 0, high = 0;
-		const auto& call = source.decoded.instructions[c.instruction];
-		if (!walker.Evaluate(c.target[0], low) || !walker.Evaluate(c.target[1], high))
-			EXIT("shader call at pc 0x%08x has an unavailable scalar target", call.pc);
+	IR::SrtReadCapture capture(runtime, reads);
+	const auto clean = IR::CleanRuntime(capture.ObservedRuntime());
+	IR::SrtWalker walker(source.call_targets, clean);
+	for (auto& site: source.calls) {
+		uint32_t low = 0, high = 0;
+		if (!walker.Evaluate(site.target[0], low) || !walker.Evaluate(site.target[1], high))
+			EXIT("shader call at pc 0x%08x has an unavailable scalar target",
+			     source.decoded.instructions[site.instruction].pc);
 		// SWAPPC reads the old aliased pair and ignores the target's low two bits.
 		const auto address = ((uint64_t {high} << 32u) | low) & ~uint64_t {3};
 		EXIT_IF(address == 0u);
-		addresses.push_back(address);
+		site.address = address;
 	}
 	const auto query_reads = reads.size();
 	if (source.linked) {
-		auto&      linked   = *source.linked;
-		const auto function = std::span(linked.code).subspan(source.code.size());
-		if (source.calls.size() == 1u) {
-			if (clean.read_memory(clean.userdata, addresses[0], linked.observed_function) &&
-			    std::ranges::equal(function, linked.observed_function)) {
-				return linked.decoded;
+		auto& linked = *source.linked;
+		bool unchanged = true;
+		for (size_t i = 0; i < source.calls.size(); ++i) {
+			const auto& function = linked.functions[i];
+			const auto expected = std::span(linked.code).subspan(function.offset, function.size);
+			const auto preceding = std::span(source.calls).first(i);
+			const auto previous = std::ranges::find(preceding, source.calls[i].address, &ShaderSource::Call::address);
+			if (previous != preceding.end()) {
+				const auto& observed = linked.functions[previous - preceding.begin()];
+				if (std::ranges::equal(expected, std::span(linked.code).subspan(observed.offset, observed.size))) continue;
+				unchanged = false;
+				break;
 			}
-		} else {
-			if (source.reads.size() == query_reads + source.calls.size()) {
-				bool   all_match    = true;
-				size_t offset_words = 0;
-				for (size_t call_idx = 0; call_idx < source.calls.size(); ++call_idx) {
-					const auto leaf_bytes = source.reads[query_reads + call_idx].second;
-					const auto leaf_words = leaf_bytes / sizeof(uint32_t);
-					if (offset_words + leaf_words > linked.observed_function.size()) {
-						all_match = false;
-						break;
-					}
-					auto observed_slice =
-					    std::span(linked.observed_function).subspan(offset_words, leaf_words);
-					auto code_slice = function.subspan(offset_words, leaf_words);
-					if (!clean.read_memory(clean.userdata, addresses[call_idx], observed_slice) ||
-					    !std::ranges::equal(code_slice, observed_slice)) {
-						all_match = false;
-						break;
-					}
-					offset_words += leaf_words;
-				}
-				if (all_match && offset_words == function.size()) {
-					return linked.decoded;
-				}
+			linked.observed_function.resize(function.size);
+			if (!clean.read_memory(clean.userdata, source.calls[i].address, linked.observed_function) ||
+			    !std::ranges::equal(expected, linked.observed_function)) {
+				unchanged = false;
+				break;
 			}
 		}
+		if (unchanged) return linked.decoded;
 		reads.resize(query_reads);
 	}
 	ShaderSource::Linked linked {.code = source.code, .decoded = source.decoded};
-	const auto&          last = source.decoded.instructions.back();
+	const auto& last = source.decoded.instructions.back();
 	EXIT_NOT_IMPLEMENTED(last.opcode != Decoder::Opcode::S_ENDPGM);
-	// Keep the caller's data/footer bytes at their native offsets. The leaf's virtual CFG
-	// PCs follow decoded instructions; its physical code is independently read and owned.
-	for (size_t call_idx = 0; call_idx < source.calls.size(); ++call_idx) {
-		const auto& c               = source.calls[call_idx];
-		const auto& call            = source.decoded.instructions[c.instruction];
-		const auto  address         = addresses[call_idx];
-		const auto& prev_last       = linked.decoded.instructions.back();
-		const auto  function_pc     = prev_last.pc + prev_last.word_count * sizeof(uint32_t);
-		const auto  leaf_inst_start = linked.decoded.instructions.size();
-		const auto  leaf_code_start = linked.code.size();
-		for (uint32_t index = 0;;) {
-			// The observed queue helper is a scalar leaf. Scalar encodings need at most one
-			// literal.
-			EXIT_IF(index >= 64u ||
-			        address > UINT64_MAX - (uint64_t {index} + 2u) * sizeof(uint32_t));
-			std::array<uint32_t, 2> words {};
-			if (!clean.read_memory(clean.userdata, address + uint64_t {index} * sizeof(uint32_t),
-			                       std::span(words).first(1)))
-				EXIT("shader call at pc 0x%08x cannot read leaf code", call.pc);
-			const auto family = Decoder::GetInstructionFamily(words[0]);
-			EXIT_NOT_IMPLEMENTED(
-			    family != Decoder::Family::SOP1 && family != Decoder::Family::SOP2 &&
-			    family != Decoder::Family::SOPC && family != Decoder::Family::SOPK &&
-			    family != Decoder::Family::SOPP);
-			Decoder::Instruction inst;
-			Decoder::DecodeInstruction(words, 0u, inst);
-			if (inst.word_count == 2u) {
-				if (!clean.read_memory(clean.userdata,
-				                       address + uint64_t {index + 1u} * sizeof(uint32_t),
-				                       std::span(words).last(1)))
-					EXIT("shader call at pc 0x%08x cannot read leaf literal", call.pc);
-				inst = {};
-				Decoder::DecodeInstruction(words, 0u, inst);
+	// Keep the caller's data/footer at native offsets. Expand leaf CFGs per call site
+	// before SSA, so return edges neither require a dispatcher nor merge resource roots.
+	uint32_t function_pc = last.pc + last.word_count * sizeof(uint32_t);
+	std::map<uint64_t, std::vector<Decoder::Instruction>> functions;
+	for (size_t i = 0; i < source.calls.size(); ++i) {
+		const auto& site = source.calls[i];
+		const auto& call = source.decoded.instructions[site.instruction];
+		const auto address = source.calls[i].address;
+		auto [entry, inserted] = functions.try_emplace(address);
+		auto& function = entry->second;
+		if (inserted) {
+			for (uint32_t index = 0;;) {
+				std::array<uint32_t, Decoder::MaxInstructionRawWords> words {};
+				EXIT_IF(index > UINT32_MAX / sizeof(uint32_t) - words.size() ||
+				        address > UINT64_MAX - (uint64_t {index} + words.size()) * sizeof(uint32_t));
+				uint32_t count = 1;
+				Decoder::Instruction inst;
+				for (;;) {
+					if (!clean.read_memory(clean.userdata, address + uint64_t {index} * sizeof(uint32_t),
+					                       std::span(words).first(count)))
+						EXIT("shader call at pc 0x%08x cannot read leaf code", call.pc);
+					inst = {};
+					Decoder::DecodeInstruction(words, 0u, inst);
+					if (inst.word_count <= count) break;
+					count = inst.word_count;
+				}
+				inst.pc = index * sizeof(uint32_t);
+				if (Decoder::IsDirectBranch(inst.opcode)) inst.branch_target += inst.pc;
+				index += inst.word_count;
+				EXIT_NOT_IMPLEMENTED(inst.opcode == Decoder::Opcode::S_SWAPPC_B64 ||
+				                     inst.opcode == Decoder::Opcode::S_GETPC_B64 ||
+				                     inst.opcode == Decoder::Opcode::S_ENDPGM);
+				function.push_back(inst);
+				if (inst.opcode == Decoder::Opcode::S_SETPC_B64) break;
 			}
-			inst.pc = index * sizeof(uint32_t);
-			if (Decoder::IsDirectBranch(inst.opcode)) inst.branch_target += inst.pc;
-			linked.code.insert(linked.code.end(), inst.raw, inst.raw + inst.word_count);
-			index += inst.word_count;
-			EXIT_NOT_IMPLEMENTED(inst.opcode == Decoder::Opcode::S_SWAPPC_B64 ||
-			                     inst.opcode == Decoder::Opcode::S_GETPC_B64 ||
-			                     inst.opcode == Decoder::Opcode::S_ENDPGM);
+		}
+		const uint32_t function_size = function.back().pc + function.back().word_count * sizeof(uint32_t);
+		EXIT_IF(function_pc > UINT32_MAX - function_size);
+		const auto function_offset = static_cast<uint32_t>(linked.code.size());
+		for (auto inst: function) {
 			EXIT_IF(CFG::MayWriteScalarRegister(inst, call.dst.reg) ||
 			        CFG::MayWriteScalarRegister(inst, call.dst.reg + 1u));
-			const bool returns = inst.opcode == Decoder::Opcode::S_SETPC_B64;
-			if (returns) {
-				EXIT_NOT_IMPLEMENTED(inst.src0.kind != Decoder::OperandKind::Sgpr ||
-				                     inst.src0.reg != call.dst.reg);
-				inst.opcode        = Decoder::Opcode::S_BRANCH;
+			for (uint32_t code = 0; code < site.preserved_registers.size(); ++code) {
+				if (site.preserved_registers[code] && CFG::MayWriteScalarRegister(inst, code))
+					EXIT("shader call at pc 0x%08x clobbers scalar target dependency s%u", call.pc, code);
+			}
+			linked.code.insert(linked.code.end(), inst.raw, inst.raw + inst.word_count);
+			if (inst.opcode == Decoder::Opcode::S_SETPC_B64) {
+				EXIT_NOT_IMPLEMENTED(inst.src0.kind != Decoder::OperandKind::Sgpr || inst.src0.reg != call.dst.reg);
+				inst.opcode = Decoder::Opcode::S_BRANCH;
 				inst.branch_target = call.pc + call.word_count * sizeof(uint32_t);
 			} else if (Decoder::IsDirectBranch(inst.opcode)) {
-				EXIT_IF(inst.branch_target > UINT32_MAX - function_pc);
+				EXIT_IF(inst.branch_target >= function_size);
 				inst.branch_target += function_pc;
 			}
 			inst.pc += function_pc;
 			linked.decoded.instructions.push_back(std::move(inst));
-			if (returns) break;
 		}
-		const auto function_end = linked.decoded.instructions.back().pc +
-		                          linked.decoded.instructions.back().word_count * sizeof(uint32_t);
-		for (size_t i = leaf_inst_start; i + 1u < linked.decoded.instructions.size(); ++i) {
-			const auto& inst = linked.decoded.instructions[i];
-			if (Decoder::IsDirectBranch(inst.opcode))
-				EXIT_IF(inst.branch_target < function_pc || inst.branch_target >= function_end);
-		}
-		reads.emplace_back(address, (linked.code.size() - leaf_code_start) * sizeof(uint32_t));
-		linked.decoded.instructions[c.instruction].branch_target = function_pc;
+		linked.functions.push_back({function_offset, function_size / 4u});
+		linked.decoded.instructions[site.instruction].branch_target = function_pc;
+		function_pc += function_size;
+	}
+	reads.resize(query_reads);
+	for (size_t i = 0; i < source.calls.size(); ++i) {
+		const auto preceding = std::span(source.calls).first(i);
+		if (std::ranges::find(preceding, source.calls[i].address, &ShaderSource::Call::address) == preceding.end())
+			reads.emplace_back(source.calls[i].address, linked.functions[i].size * sizeof(uint32_t));
 	}
 	linked.decoded.code = linked.code;
-	linked.observed_function.resize(linked.code.size() - source.code.size());
+	linked.observed_function.resize(std::ranges::max_element(linked.functions, {},
+	    &ShaderSource::Linked::Function::size)->size);
+
 	source.linked = std::move(linked);
 	++source.revision;
 	return source.linked->decoded;
@@ -910,10 +793,9 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 	}
 
 	const auto compile_begin = std::chrono::steady_clock::now();
-	const auto phase_ms      = [&compile_begin]() {
+	const auto phase_ms = [&compile_begin]() {
 		return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
-		                                 std::chrono::steady_clock::now() - compile_begin)
-		                                 .count());
+		    std::chrono::steady_clock::now() - compile_begin).count());
 	};
 
 	std::string decoded_dump;
@@ -926,9 +808,9 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 
 	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " CFG BuildGraph\n", GetDumpLabel(options),
 	     StageName(options.stage), options.shader_hash);
-	auto       native_cfg = CFG::BuildGraph(decoded);
+	auto native_cfg = CFG::BuildGraph(decoded);
 	CFG::Graph structured_cfg;
-	auto*      selected_cfg = &native_cfg;
+	auto* selected_cfg = &native_cfg;
 	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " CFG BuildGraph blocks=%" PRIu64
 	     " loops=%" PRIu64 " back_edges=%" PRIu64 " elapsed_ms=%" PRIu64 "\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
@@ -942,9 +824,9 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 		     GetDumpLabel(options), StageName(options.stage), options.shader_hash);
 		structured_cfg = CFG::Structurize(native_cfg);
 		if (structured_cfg.unsupported) {
-			native_cfg.unsupported        = true;
-			native_cfg.failure_kind       = structured_cfg.failure_kind;
-			native_cfg.failure_block      = structured_cfg.failure_block;
+			native_cfg.unsupported = true;
+			native_cfg.failure_kind = structured_cfg.failure_kind;
+			native_cfg.failure_block = structured_cfg.failure_block;
 			native_cfg.unsupported_reason = structured_cfg.unsupported_reason;
 			LogDispatcherFallback(options, native_cfg, "structurize");
 		} else {
@@ -959,7 +841,7 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 		     static_cast<uint64_t>(selected_cfg->natural_loops.size()), phase_ms());
 	}
 
-	const auto&                 cfg = *selected_cfg;
+	const auto& cfg = *selected_cfg;
 	Frontend::EmbeddedFetchPlan embedded_fetch;
 	if ((options.stage == ShaderType::Vertex || options.stage == ShaderType::Local) &&
 	    options.input_info.vertex != nullptr && options.input_info.vertex->fetch_embedded) {
@@ -972,13 +854,13 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 		}
 	}
 	Frontend::TranslateOptions translate_options {
-	    .stage           = options.stage,
-	    .wave_size       = options.wave_size,
-	    .shader_hash     = options.shader_hash,
-	    .user_data_base  = options.user_data_base,
-	    .user_data_count = static_cast<uint32_t>(options.user_data.size()),
-	    .input_info      = options.input_info,
-	    .embedded_fetch  = embedded_fetch.loads.empty() ? nullptr : &embedded_fetch,
+	    .stage            = options.stage,
+	    .wave_size        = options.wave_size,
+	    .shader_hash      = options.shader_hash,
+	    .user_data_base   = options.user_data_base,
+	    .user_data_count  = static_cast<uint32_t>(options.user_data.size()),
+	    .input_info       = options.input_info,
+	    .embedded_fetch   = embedded_fetch.loads.empty() ? nullptr : &embedded_fetch,
 	};
 	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " IR TranslateProgram\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash);
@@ -1028,9 +910,9 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 
 CompileResult CompileProgram(TranslateResult translated, const CompileOptions& options,
                              const IR::ResourceSpecialization& specialization,
-                             uint32_t                          push_data_start_dword) {
+                             uint32_t push_data_start_dword) {
 	const auto emit_begin = std::chrono::steady_clock::now();
-	auto&      ir         = translated.program;
+	auto& ir = translated.program;
 	IR::ApplyResourceSpecialization(ir, specialization);
 	// The resource plan owns host descriptor evaluation now. Keep only dependencies consumed
 	// by GPU memory operations; bound descriptor dwords must not retain shader instructions.
@@ -1039,13 +921,13 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	}
 	for (auto* block: ir.blocks) {
 		for (auto& inst: *block) {
-			const auto op    = inst.GetOpcode();
-			uint32_t   first = 0;
+			const auto op = inst.GetOpcode();
+			uint32_t first = 0;
 			if (op == IR::ValueOpcode::GetBufferResource) {
 				if (std::ranges::any_of(inst.Uses(), [&](const IR::Use& use) {
-					    return ir.memory_info[use.user->Flags<IR::MemoryFlags>().index].kind ==
-						       IR::ResourceKind::IndirectBuffer;
-				    })) {
+					return ir.memory_info[use.user->Flags<IR::MemoryFlags>().index].kind ==
+					       IR::ResourceKind::IndirectBuffer;
+				})) {
 					continue;
 				}
 				const auto resource = inst.Flags<uint32_t>();
@@ -1055,16 +937,12 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 				                          : 0u;
 			} else if (op == IR::ValueOpcode::GetImageResource) {
 				const auto resource = inst.Flags<uint32_t>();
-				first               = resource < ir.info.images.size() &&
-				                              ir.info.images[resource].indirect_root == resource
-				                          ? 1u
-				                          : 0u;
+				first = resource < ir.info.images.size() &&
+				                ir.info.images[resource].indirect_root == resource ? 1u : 0u;
 			} else if (op == IR::ValueOpcode::GetSamplerResource) {
 				const auto resource = inst.Flags<uint32_t>();
-				first               = resource < ir.info.samplers.size() &&
-				                              !ir.info.samplers[resource].indirect_resources.empty()
-				                          ? 1u
-				                          : 0u;
+				first = resource < ir.info.samplers.size() &&
+				                !ir.info.samplers[resource].indirect_resources.empty() ? 1u : 0u;
 			} else {
 				continue;
 			}
