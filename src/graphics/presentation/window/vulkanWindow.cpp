@@ -593,6 +593,9 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	    feedback_extensions && feedback_layout.attachmentFeedbackLoopLayout &&
 	    feedback_dynamic.attachmentFeedbackLoopDynamicState;
 	graphics.maintenance8_enabled = maintenance8_extension && maintenance8.maintenance8;
+	graphics.mixed_attachment_samples_enabled =
+	    HasExtension(device_extensions, VK_NV_FRAMEBUFFER_MIXED_SAMPLES_EXTENSION_NAME) ||
+	    HasExtension(device_extensions, VK_AMD_MIXED_ATTACHMENT_SAMPLES_EXTENSION_NAME);
 	LOGF("Vulkan maintenance8 support: %s\n",
 	     graphics.maintenance8_enabled ? "true" : "false");
 	LOGF("Vulkan depth feedback support: %s\n",
@@ -1064,7 +1067,10 @@ void WindowContext::CreateVulkan() {
 		                             VK_EXT_MESH_SHADER_EXTENSION_NAME,
 		                             VK_KHR_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_EXTENSION_NAME,
 		                             VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME,
-		                             VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME}) {
+		                             VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME,
+		                             // EQAA-style passes: fewer colour samples than depth samples.
+		                             VK_NV_FRAMEBUFFER_MIXED_SAMPLES_EXTENSION_NAME,
+		                             VK_AMD_MIXED_ATTACHMENT_SAMPLES_EXTENSION_NAME}) {
 			if (HasExtension(available_extensions, extension)) {
 				device_extensions.push_back(extension);
 			}

@@ -35,6 +35,9 @@ struct GraphicContext {
 	bool                               attachment_feedback_loop_enabled      = false;
 	bool                               provoking_vertex_last_enabled         = false;
 	bool                               maintenance8_enabled                  = false;
+	// VK_NV_framebuffer_mixed_samples or VK_AMD_mixed_attachment_samples: colour attachments may
+	// have fewer samples than the depth attachment (rasterization uses the depth count).
+	bool                               mixed_attachment_samples_enabled      = false;
 	bool                               supports_block_texel_view              = false;
 	bool                                      mesh_shader_enabled                   = false;
 	vk::PhysicalDeviceMeshShaderPropertiesEXT mesh_shader_properties                = {};

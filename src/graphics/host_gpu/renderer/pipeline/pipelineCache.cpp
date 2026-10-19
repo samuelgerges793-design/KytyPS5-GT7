@@ -1877,11 +1877,15 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(
 		                               : vk::Format::eUndefined;
 		if (attachment_samples == 0) {
 			attachment_samples = depth.desc.info.samples;
+		} else if (attachment_samples < depth.desc.info.samples &&
+		           m_graphics.mixed_attachment_samples_enabled) {
+			// EQAA passes (GT7 since upstream 5dec523): fewer colour fragments than depth samples.
+			// Rasterize at the depth sample count; colour attachments keep theirs (mixed samples).
+			static_params.color_samples = static_cast<uint8_t>(attachment_samples);
+			attachment_samples          = depth.desc.info.samples;
 		} else if (attachment_samples != depth.desc.info.samples) {
-			// EQAA passes (fewer colour fragments than depth samples) need mixed-sample attachments
-			// (VK_NV_framebuffer_mixed_samples), not supported yet. Stopgap: skip such draws
-			// (KYTY_SKIP_MIXED_SAMPLE_DRAWS=0 restores the fatal error). GT7 draws one since upstream
-			// 5dec523, into its 2_10_10_10 target.
+			// Without mixed-sample support, skip such draws (KYTY_SKIP_MIXED_SAMPLE_DRAWS=0 restores
+			// the fatal error).
 			static LiveSetting skip_mixed("KYTY_SKIP_MIXED_SAMPLE_DRAWS", 1);
 			if (skip_mixed.Get() == 0) {
 				EXIT("mixed color/depth sample counts are unsupported: %u and %u\n", attachment_samples,

@@ -634,6 +634,22 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	rendering_info.depthAttachmentFormat   = rendering.depth_format;
 	rendering_info.stencilAttachmentFormat = rendering.stencil_format;
 	pipeline_info.pNext                    = &rendering_info;
+	// Mixed-sample (EQAA) pass: colour attachments have fewer samples than the depth attachment,
+	// which sets the rasterization count (VK_NV_framebuffer_mixed_samples /
+	// VK_AMD_mixed_attachment_samples).
+	std::array<vk::SampleCountFlagBits, RENDER_COLOR_ATTACHMENTS_MAX> color_attachment_samples {};
+	vk::AttachmentSampleCountInfoAMD                                  attachment_samples {};
+	if (static_params.color_samples != 0) {
+		EXIT_IF(!graphics.mixed_attachment_samples_enabled);
+		for (uint32_t i = 0; i < rendering.color_count; i++) {
+			color_attachment_samples[i] = vulkan_sample_count(static_params.color_samples);
+		}
+		attachment_samples.colorAttachmentCount          = rendering.color_count;
+		attachment_samples.pColorAttachmentSamples       = color_attachment_samples.data();
+		attachment_samples.depthStencilAttachmentSamples = vulkan_sample_count(static_params.samples);
+		attachment_samples.pNext                         = rendering_info.pNext;
+		rendering_info.pNext                             = &attachment_samples;
+	}
 	pipeline_info.stageCount               = shader_stage_count;
 	pipeline_info.pStages                  = shader_stages;
 	pipeline_info.pVertexInputState        = mesh ? nullptr : &vertex_input_info;

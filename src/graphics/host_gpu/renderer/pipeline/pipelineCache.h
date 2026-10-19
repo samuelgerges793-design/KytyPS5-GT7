@@ -47,6 +47,8 @@ struct PipelineStaticParameters {
 	vk::PrimitiveTopology      topology                 = vk::PrimitiveTopology::ePointList;
 	bool                       primitive_restart_enable = false;
 	uint32_t                   samples                  = 1;
+	// Colour attachment samples when fewer than `samples` (mixed-sample EQAA passes), else 0.
+	uint8_t                    color_samples            = 0;
 	bool                       sample_shading_enable    = false;
 	uint32_t                   color_mask[RENDER_COLOR_ATTACHMENTS_MAX]           = {};
 	bool                       cull_front                                         = false;
@@ -71,7 +73,7 @@ struct PipelineStaticParameters {
 static_assert(std::is_trivially_copyable_v<PipelineStaticParameters>);
 static_assert(std::is_standard_layout_v<PipelineStaticParameters>);
 static_assert(alignof(PipelineStaticParameters) == 1);
-static_assert(sizeof(PipelineStaticParameters) == 116);
+static_assert(sizeof(PipelineStaticParameters) == 117);
 
 struct PipelineRenderingState {
 	std::array<vk::Format, RENDER_COLOR_ATTACHMENTS_MAX> color_formats {};
