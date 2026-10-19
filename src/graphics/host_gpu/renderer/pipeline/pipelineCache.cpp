@@ -1887,8 +1887,10 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(
 		                               : vk::Format::eUndefined;
 		if (attachment_samples == 0) {
 			attachment_samples = depth.desc.info.samples;
-		} else if (attachment_samples < depth.desc.info.samples &&
-		           m_graphics.mixed_attachment_samples_enabled) {
+		} else if (static LiveSetting mixed_samples("KYTY_MIXED_SAMPLES", 0);
+		           attachment_samples < depth.desc.info.samples &&
+		           m_graphics.mixed_attachment_samples_enabled && mixed_samples.Get() != 0) {
+			// Opt-in (KYTY_MIXED_SAMPLES=1): on NVIDIA this lost the device in GT7 (Oct 19).
 			// EQAA passes (GT7 since upstream 5dec523): fewer colour fragments than depth samples.
 			// Rasterize at the depth sample count; colour attachments keep theirs (mixed samples).
 			static_params.color_samples = static_cast<uint8_t>(attachment_samples);
