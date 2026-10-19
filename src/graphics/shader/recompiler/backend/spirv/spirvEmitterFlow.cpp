@@ -576,8 +576,11 @@ void EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 				        ? Prospero::BufferFormat::k2_10_10_10UNorm
 				        : Prospero::BufferFormat::k11_11_10UNorm);
 				const uint32_t all = (1u << info.component_count) - 1u;
-				if (exp.compr || MrtOutputMode(state, exp) != 9u ||
-				    (mapping.ApplyMask(exp.en) & all) != all) {
+				// ExportVector already turned FP16/UNorm16/SNorm16 (compressed) exports into floats, so
+				// those pack like 32-bit float (mode 9) exports.
+				const auto mode       = MrtOutputMode(state, exp);
+				const bool float_mode = mode == 9u || (exp.compr && (mode == 4u || mode == 5u || mode == 6u));
+				if (!float_mode || (mapping.ApplyMask(exp.en) & all) != all) {
 					EXIT("unsupported packed UNorm EXP: export=%u mode=%u en=0x%x compr=%u\n",
 					     exp.index, MrtOutputMode(state, exp), exp.en, static_cast<uint32_t>(exp.compr));
 				}

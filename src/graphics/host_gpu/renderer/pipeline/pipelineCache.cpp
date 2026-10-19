@@ -1669,9 +1669,11 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 			const auto shader_mask = render_target_mask_slot(pixel_info.target_shader_mask, slot);
 			const bool blend = context.GetBlendControl(slot).enable && !rt.info.blend_bypass;
 			const uint32_t all = (1u << format.components) - 1u;
+			const auto mode = pixel_info.target_output_mode[export_index];
+			// Float exports: 32-bit (9), or FP16/UNorm16/SNorm16 (4/5/6), unpacked to floats first.
 			if (blend || (mapping.ApplyMask(target_mask) & all) != all ||
 			    (mapping.ApplyMask(shader_mask) & all) != all ||
-			    pixel_info.target_output_mode[export_index] != 9u) {
+			    (mode != 9u && mode != 4u && mode != 5u && mode != 6u)) {
 				EXIT("unsupported packed UNorm render-target export: slot=%u export=%u mode=%u "
 				     "target_mask=0x%x shader_mask=0x%x mapping=0x%02x blend=%u\n",
 				     slot, export_index, pixel_info.target_output_mode[export_index], target_mask,
