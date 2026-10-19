@@ -486,6 +486,9 @@ Decoder::Program DecodeFusedProgram(std::span<const uint32_t> front, std::span<c
 	return result;
 }
 
+// Thrown while resolving a call target whose register is defined differently per path.
+struct AmbiguousCallTarget {};
+
 void PrepareCallTargets(ShaderSource& source, const CompileOptions& options) {
 	using namespace IR;
 	EXIT_NOT_IMPLEMENTED(options.stage != ShaderType::Compute);
@@ -527,6 +530,7 @@ void PrepareCallTargets(ShaderSource& source, const CompileOptions& options) {
 	Register = [&](uint32_t before, uint32_t code) -> Value {
 		std::vector<uint32_t> crossed_calls;
 		const auto index = CFG::FindScalarDefinition(source.decoded, graph, before, code, crossed_calls);
+		if (index == CFG::AmbiguousScalarDefinition) throw AmbiguousCallTarget {};
 		for (const auto crossed: crossed_calls) {
 			std::ranges::find(source.calls, crossed, &ShaderSource::Call::instruction)->preserved_registers.set(code);
 		}
@@ -568,7 +572,16 @@ void PrepareCallTargets(ShaderSource& source, const CompileOptions& options) {
 		                     call.dst.kind != Decoder::OperandKind::Sgpr ||
 		                     call.src0.reg != call.dst.reg || call.dst.reg >= 105u);
 		for (uint32_t i = 0; i < 2u; ++i) {
-			const auto value = Register(site.instruction, call.src0.reg + i);
+			Value value;
+			try {
+				value = Register(site.instruction, call.src0.reg + i);
+			} catch (const AmbiguousCallTarget&) {
+				// The target register is set differently on different paths: unsupported, so the
+				// dispatch is skipped like other GPU-selected callables.
+				source.unsupported_call_pc = call.pc;
+				source.calls.clear();
+				return;
+			}
 			if (!ValidateRuntimeValue(query, value, RuntimeValueType::Integer)) {
 				EXIT_IF(value.Instruction()->GetOpcode() != ValueOpcode::ReadConstBuffer);
 				source.unsupported_call_pc = call.pc;
@@ -627,6 +640,7 @@ bool SkipRuntimeCallShader(uint64_t shader_hash) {
 	std::scoped_lock lock(g_runtime_call_mutex);
 	return g_runtime_call_shaders.contains(shader_hash);
 }
+
 
 ShaderSource PrepareShaderSource(std::span<const uint32_t> code, const CompileOptions& options) {
 	EXIT_IF(code.empty());

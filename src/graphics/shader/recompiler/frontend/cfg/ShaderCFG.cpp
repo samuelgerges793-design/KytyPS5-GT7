@@ -1748,7 +1748,9 @@ uint32_t FindScalarDefinition(const Decoder::Program& program, const Graph& grap
 			if (MayWriteScalarRegister(inst, code)) { index = i; break; }
 		}
 		if (index != UINT32_MAX || block->id == graph.entry_block) {
-			EXIT_IF(definition && *definition != index);
+			// Different paths define the register: the caller decides (GT7: call targets picked
+			// per path are treated as unsupported, and the dispatch is skipped).
+			if (definition && *definition != index) return AmbiguousScalarDefinition;
 			definition = index;
 			continue;
 		}
