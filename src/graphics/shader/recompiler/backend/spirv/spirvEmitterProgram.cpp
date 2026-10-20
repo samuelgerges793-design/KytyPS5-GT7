@@ -245,20 +245,24 @@ void Invoke(Return (*emit)(Context&, Args...), ValueEmitContext& ctx, const IR::
 }
 
 void EmitDirectInstruction(ValueEmitContext& ctx, const IR::Inst& inst) {
-	if (ctx.half != 0 && (inst.GetOpcode() == IR::ValueOpcode::Ballot ||
-	                     inst.GetOpcode() == IR::ValueOpcode::ReadFirstLane)) {
-		// Both operations already combine both emulated halves into one whole-wave result.
+	using Op = IR::ValueOpcode;
+	const auto op = inst.GetOpcode();
+	if (ctx.half != 0 &&
+	    (op == Op::Ballot || op == Op::ReadFirstLane || op == Op::ReadConstBuffer ||
+	     (op == Op::LoadAddressU32 && ctx.Memory(inst).kind == IR::ResourceKind::ScalarAddress))) {
+		// Whole-wave results, and SMEM loads (SGPR operands, no EXEC), are the same in both
+		// emulated halves (SMEM: upstream 8cc5f536).
 		ctx.Define(inst, ctx.other_half->Result(inst));
 		return;
 	}
 	// Write bitmap: storage-buffer element pointers made for this instruction mark their pages.
-	const auto access = IR::BufferAccessOf(inst.GetOpcode());
+	const auto access = IR::BufferAccessOf(op);
 	struct WriteScope {
 		EmitterState& state;
 		~WriteScope() { state.emitting_write = false; }
 	} write_scope {ctx.state};
 	ctx.state.emitting_write = access == IR::BufferAccess::Write || access == IR::BufferAccess::Atomic;
-	switch (inst.GetOpcode()) {
+	switch (op) {
 #define VALUE_OPCODE(name, ...)                                                                    \
 	case IR::ValueOpcode::name: return Invoke(Emit##name, ctx, inst);
 #include "graphics/shader/recompiler/ir/opcodes/ValueOpcodes.inc"
