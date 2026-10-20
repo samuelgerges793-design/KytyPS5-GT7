@@ -725,6 +725,12 @@ void EmitProgram(EmitterState& state) {
 	}
 	if (state.program.dispatcher_fallback) {
 		auto& dispatch = dispatcher.emplace();
+		// Allocate both halves in program order so the SPIR-V is identical across runs.
+		const auto add_spill = [&](const IR::Inst* inst) {
+			for (uint32_t half = 0; half < state.lane_count; half++) {
+				dispatch.spills[half].emplace(inst, state.builder.AllocateId());
+			}
+		};
 		for (const auto* block: program.blocks) {
 			for (const auto& inst: *block) {
 				if (inst.GetOpcode() != IR::ValueOpcode::Phi) {
@@ -734,7 +740,7 @@ void EmitProgram(EmitterState& state) {
 					ctx.Fail(inst, "cannot be stored by the dispatcher");
 					break;
 				}
-				dispatch.spills[0].emplace(&inst, state.builder.AllocateId());
+				add_spill(&inst);
 			}
 		}
 		const auto mark_cross_block = [&](IR::Value value, const IR::Block* consumer) {
@@ -749,7 +755,7 @@ void EmitProgram(EmitterState& state) {
 				return;
 			}
 			if (!dispatch.spills[0].contains(definition)) {
-				dispatch.spills[0].emplace(definition, state.builder.AllocateId());
+				add_spill(definition);
 			}
 		};
 		for (const auto* block: program.blocks) {
@@ -771,18 +777,7 @@ void EmitProgram(EmitterState& state) {
 		dispatch.continue_label     = state.builder.AllocateId();
 		dispatch.merge_label        = state.builder.AllocateId();
 		ctx.dispatcher_spills       = &dispatch.spills[0];
-		if (state.lane_count == 2) {
-			// Allocate in the low half's id order: map order follows addresses, which change
-			// between runs, and the SPIR-V must not (the driver's pipeline cache keys on it).
-			std::vector<std::pair<uint32_t, const IR::Inst*>> ordered;
-			ordered.reserve(dispatch.spills[0].size());
-			for (const auto& [inst, id]: dispatch.spills[0]) ordered.emplace_back(id, inst);
-			std::ranges::sort(ordered);
-			for (const auto& [id, inst]: ordered) {
-				dispatch.spills[1].emplace(inst, state.builder.AllocateId());
-			}
-			high.dispatcher_spills = &dispatch.spills[1];
-		}
+		high.dispatcher_spills      = &dispatch.spills[1];
 	}
 	DefineGetBdaPointer(state);
 	DefineIndirectBufferLoads(ctx);

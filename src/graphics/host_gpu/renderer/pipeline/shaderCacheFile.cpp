@@ -178,6 +178,10 @@ void VisitInput(Info& info, F& field) {
 		field(info.tess.domain);
 		field(info.tess.partitioning);
 		field(info.tess.output_topology);
+		field(info.tess.patch_base);
+		field(info.tess.patch_size);
+		field(info.lds_size_dwords);
+		field(info.user_clip_planes);
 		field(info.fetch_external);
 		field(info.fetch_embedded);
 	} else if constexpr (std::is_same_v<T, ShaderPixelInputInfo>) {
@@ -197,6 +201,7 @@ void VisitInput(Info& info, F& field) {
 		field(info.target_packed_unorm_mask);
 		field(info.target_packed_unorm_10_mask);
 		field(info.target_round_mode);
+		field(info.lds_size_dwords);
 		field(info.scratch_size_dwords);
 		field(info.ps_pos_x);
 		field(info.ps_pos_y);

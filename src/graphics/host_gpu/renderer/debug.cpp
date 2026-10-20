@@ -373,18 +373,9 @@ static void ClipPrint(const char* func, const HW::ClipControl& c) {
 static void ClipCheck(const HW::ClipControl& c) {
 	// dx_linear_attr_clip_enable preserves linear (noperspective) attributes at clip-generated
 	// vertices, which Vulkan provides as part of clipping and interpolation.
-	// User clip planes are drawn unclipped for now (extra geometry instead of a stop).
-	if (c.user_clip_planes != 0) {
-		static std::atomic_bool logged {false};
-		if (!logged.exchange(true)) {
-			Log::WriteToConsoleAndLog(fmt::format(
-			    "Draw: user clip planes enabled (mask 0x{:02x}, mode {}); drawing without them\n",
-			    c.user_clip_planes, c.user_clip_plane_mode));
-		}
-	}
-	EXIT_NOT_IMPLEMENTED(c.vertex_kill_any || c.user_clip_plane_negate_y ||
-	                     c.user_clip_plane_cull_only || c.cull_on_clipping_error_disable ||
-	                     c.force_viewport_index_from_vs_enable);
+	EXIT_NOT_IMPLEMENTED(c.user_clip_plane_mode != 0 || c.vertex_kill_any ||
+	                     c.user_clip_plane_negate_y || c.user_clip_plane_cull_only ||
+	                     c.cull_on_clipping_error_disable || c.force_viewport_index_from_vs_enable);
 }
 
 static void RcPrint(const char* func, const HW::RenderControl& c) {

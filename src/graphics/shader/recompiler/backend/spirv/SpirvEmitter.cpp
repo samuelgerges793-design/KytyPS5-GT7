@@ -239,8 +239,8 @@ std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo inp
 	        ? 2u
 	        : 1u;
 	DefineModule(state);
-	ValidateNativeProgram(program, program.stage == ShaderType::Compute &&
-	                                   input_info.compute != nullptr && input_info.compute->lds_storage);
+	ValidateNativeProgram(program,
+	                      program.stage == ShaderType::Compute && input_info.compute->lds_storage);
 	EmitProgram(state);
 	// A written descriptor whose stores took no marking path stays conservatively whole-marked.
 	program.bindings.tracked_writes &= state.emitted_write_marks;
