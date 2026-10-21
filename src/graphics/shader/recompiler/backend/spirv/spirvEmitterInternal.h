@@ -5,6 +5,7 @@
 #include "common/stringUtils.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvBuilder.h"
+#include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 
@@ -77,9 +78,9 @@ struct ImageDefinition {
 constexpr uint32_t WriteTrackMaxBuffers = 64;
 
 struct EmitterState {
-	EmitterState(IR::Program& program_, ShaderStageInputInfo input_info_, bool maintenance8_enabled_)
+	EmitterState(IR::Program& program_, ShaderStageInputInfo input_info_, const Profile& profile_)
 	    : builder(program_.stage == ShaderType::Mesh ? 0x00010400u : 0x00010300u),
-	      program(program_), input_info(input_info_), maintenance8_enabled(maintenance8_enabled_) {
+	      program(program_), input_info(input_info_), profile(profile_) {
 		if (ShaderWorkgroupInput(program.stage, input_info) != nullptr) {
 			lds_storage_class = spv::StorageClassWorkgroup;
 		}
@@ -92,7 +93,7 @@ struct EmitterState {
 	Builder                                          builder;
 	IR::Program&                                     program;
 	ShaderStageInputInfo                             input_info;
-	bool                                            maintenance8_enabled;
+	const Profile&                                      profile;
 	uint32_t                                        debug_source = 0;
 	uint32_t                                        void_type = 0;
 	uint32_t                                        bool_type = 0;
@@ -305,7 +306,6 @@ struct ImageSampleLayout {
 };
 
 struct F32Class {
-	uint32_t bits = 0;
 	uint32_t nan  = 0;
 	uint32_t zero = 0;
 };
@@ -534,8 +534,6 @@ inline constexpr auto EmitLogicalOrBool =
 inline constexpr auto EmitLogicalNotBool = EmitNative<spv::OpLogicalNot, IR::Type::U1, uint32_t>;
 
 F32Class EmitClassifyF32Bits(EmitterState& state, uint32_t bits);
-
-F32Class EmitClassifyF32(EmitterState& state, uint32_t value);
 
 uint32_t EmitClassMaskBitMatch(EmitterState& state, uint32_t mask, uint32_t bit,
                                uint32_t class_match);

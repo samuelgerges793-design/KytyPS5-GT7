@@ -50,6 +50,7 @@ struct PipelineStaticParameters {
 	// Colour attachment samples when fewer than `samples` (mixed-sample EQAA passes), else 0.
 	uint8_t                    color_samples            = 0;
 	bool                       sample_shading_enable    = false;
+	bool                       alpha_to_coverage_enable = false;
 	uint32_t                   color_mask[RENDER_COLOR_ATTACHMENTS_MAX]           = {};
 	bool                       cull_front                                         = false;
 	bool                       cull_back                                          = false;

@@ -1313,6 +1313,9 @@ struct BdaMapping {
   u32 backing_offset = 0;
 };
 
+using ShaderProfile = ShaderRecompiler::Spirv::Profile;
+constexpr ShaderProfile Maintenance8Profile{.maintenance8 = true};
+
 struct TestCase {
   const char *name = "";
   std::vector<u32> code;
@@ -1340,6 +1343,7 @@ struct TestCase {
   std::vector<u32> expected_storage_image_r32ui;
   std::vector<std::string> required_spirv;
   std::vector<std::string> forbidden_spirv;
+  const ShaderProfile *profile = &Maintenance8Profile;
   ShaderComputeInputInfo compute_info = [] {
     ShaderComputeInputInfo info{};
     info.lds_size_dwords = 1024;
@@ -1672,7 +1676,7 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
   }
   ShaderRecompiler::CompileOptions options;
   options.stage = ShaderType::Compute;
-  options.maintenance8_enabled = true;
+  options.profile = test.profile;
   options.dump_ir = true;
   auto compute_info = test.compute_info;
   compute_info.host_subgroup_size = host_subgroup_size;
@@ -1745,7 +1749,7 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
     result.program.shader_info_complete = false;
     ShaderRecompiler::IR::CollectShaderInfo(result.program, options.input_info);
     result.spirv = ShaderRecompiler::Spirv::EmitProgram(
-        result.program, options.input_info, 0u, options.maintenance8_enabled);
+        result.program, options.input_info, 0u, *options.profile);
     const auto shader_data = result.program.bindings.descriptor_counts[
         static_cast<size_t>(ShaderRecompiler::IR::DescriptorBindingKind::ShaderData)];
     Require(test.name, "binding layout",
@@ -1862,7 +1866,7 @@ CompiledShader CompileFragmentCase(const GraphicsCase &test) {
 
   ShaderRecompiler::CompileOptions options;
   options.stage = ShaderType::Pixel;
-  options.maintenance8_enabled = true;
+  options.profile = &Maintenance8Profile;
   options.dump_ir = false;
   options.input_info.pixel = &pixel_info;
   options.user_data = user_data;
@@ -2001,6 +2005,12 @@ class VulkanHarness {
 public:
   VulkanHarness() { Init(); }
   ~VulkanHarness() { Destroy(); }
+  // Host float min/max is used on AMD GPUs, as in Kyty.
+  [[nodiscard]] bool SupportsNativeFloatMinMax() const {
+    vk::PhysicalDeviceProperties properties;
+    m_physical_device.getProperties(&properties);
+    return properties.vendorID == 0x1002u;
+  }
 
   VulkanHarness(const VulkanHarness &) = delete;
   VulkanHarness &operator=(const VulkanHarness &) = delete;
@@ -10799,7 +10809,7 @@ public:
               ShaderRecompiler::CompileOptions options;
               options.wave_size = wave_size;
               options.dump_ir = false;
-              options.maintenance8_enabled = true;
+              options.profile = &Maintenance8Profile;
               input.host_subgroup_size = SubgroupSize();
               options.input_info.compute = &input;
               options.user_data = user_data;
@@ -27863,6 +27873,66 @@ TestCase VectorMinMaxF32NanAndSignedZeroEdges() {
            O::V_MAX3_F32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
+// MIN/MAX/MIN3/MAX3 on runtime inputs, so no compiler can fold them. The expected bits follow
+// the emulated rules: a NaN operand yields the other operand and signed zeros are ordered.
+// Denormal operands are left out; their expected results are not pinned down here.
+TestCase VectorMinMaxF32RuntimeEdges(u32 wave) {
+  using O = ShaderOpcode;
+  const auto nan = [](u32 v) { return (v & 0x7fffffffu) > 0x7f800000u; };
+  const auto zero = [](u32 v) { return (v & 0x7fffffffu) == 0u; };
+  const auto value = [](u32 v) { return std::bit_cast<float>(v); };
+  const auto min2 = [&](u32 a, u32 b) {
+    if (nan(a)) return b;
+    if (nan(b)) return a;
+    if (zero(a) && zero(b)) return a | b;
+    return value(a) < value(b) ? a : b;
+  };
+  const auto max2 = [&](u32 a, u32 b) {
+    if (nan(a)) return b;
+    if (nan(b)) return a;
+    if (zero(a) && zero(b)) return a & b;
+    return value(a) >= value(b) ? a : b;
+  };
+  constexpr u32 cases[][3] = {
+      {0x40000000u, 0x40400000u, 0x3f800000u}, {0x7fc00000u, 0x40000000u, 0xbf800000u},
+      {0x40000000u, 0x7fc00000u, 0x3f800000u}, {0x7fa00001u, 0x40000000u, 0x40400000u},
+      {0x40000000u, 0x7fa00001u, 0xc0000000u}, {0x80000000u, 0x00000000u, 0x80000000u},
+      {0x00000000u, 0x80000000u, 0x00000000u}, {0x80000000u, 0x80000000u, 0x00000000u},
+      {0xff800000u, 0x7f800000u, 0x00000000u}, {0x7fc00000u, 0x00000000u, 0x80000000u},
+      {0xffc05678u, 0x3f800000u, 0x7fa00001u}, {0xbf800000u, 0xc0000000u, 0x7fc01234u}};
+  TestCase test;
+  test.name = "VectorMinMaxF32RuntimeEdges";
+  test.has_compute_info = true;
+  test.compute_info.wave_size = wave;
+  test.compute_info.float_mode = 0xf0; // Preserve FP32 input/output denormals.
+  test.compute_info.threads_num[0] = test.compute_info.threads_num[1] =
+      test.compute_info.threads_num[2] = 1u;
+  for (const auto &values : cases)
+    test.initial.insert(test.initial.end(), values, values + 3);
+  test.expected = test.initial;
+  auto &code = test.code;
+  for (u32 index = 0; index < std::size(cases); ++index) {
+    for (u32 operand = 0; operand < 3; ++operand) {
+      AppendVMovU32(&code, 30, (index * 3u + operand) * 4u);
+      AppendBufferLoadDword(&code, operand, 30);
+    }
+    const auto [a, b, c] = cases[index];
+    code.push_back(EncodeVop2(0x0f, 10, Vgpr(0), 1));
+    code.push_back(EncodeVop2(0x10, 11, Vgpr(0), 1));
+    AppendVop3(&code, 0x151, 12, Vgpr(0), Vgpr(1), Vgpr(2));
+    AppendVop3(&code, 0x154, 13, Vgpr(0), Vgpr(1), Vgpr(2));
+    for (u32 result = 0; result < 4; ++result)
+      AppendStoreVgpr(&code, 10 + result, static_cast<u32>(test.expected.size() + result));
+    test.expected.insert(test.expected.end(),
+                         {min2(a, b), max2(a, b), min2(min2(a, b), c), max2(max2(a, b), c)});
+  }
+  AppendEnd(&code);
+  test.initial.resize(test.expected.size());
+  test.opcodes = {O::V_MOV_B32,  O::BUFFER_LOAD_DWORD, O::V_MIN_F32,         O::V_MAX_F32,
+                  O::V_MIN3_F32, O::V_MAX3_F32,        O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
+}
+
 TestCase VectorMed3F32NanUsesMin3Path(u32 wave) {
   using O = ShaderOpcode;
   // Runtime inputs keep every MED3 in the emitted module; compare raw result bits.
@@ -27914,8 +27984,8 @@ TestCase VectorMed3F32NanUsesMin3Path(u32 wave) {
   test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_MED3_F32,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.ir_counts = {{"FPMedTri32", std::size(cases)}};
-  // Measured 17,593/36,607 words; keep classification growth below a single MED3.
-  test.max_spirv_words = wave == 32u ? 17600u : 36620u;
+  // Measured 16,140/33,705 words; keep min/max expansion growth below a single MED3.
+  test.max_spirv_words = wave == 32u ? 16150u : 33720u;
   return test;
 }
 
@@ -38144,7 +38214,8 @@ void CheckDynamicSampleOffsets(VulkanHarness &vulkan, u32 wave_size) {
           "dynamic offsets expanded samples or lost signed six-bit components");
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
   if (wave_size == 32u) {
-    Require(test.name, "default feature gate", !ShaderRecompiler::CompileOptions{}.maintenance8_enabled,
+    Require(test.name, "default feature gate",
+            !ShaderRecompiler::CompileOptions{}.profile->maintenance8,
             "maintenance8 must reflect the enabled device feature");
     ExpectFatal("DynamicSampleOffsetsRequireMaintenance8", [&] {
       ShaderRecompiler::Spirv::EmitProgram(compiled.program, {.compute = &test.compute_info});
@@ -42983,6 +43054,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorMinMaxF32NanAndSignedZeroEdges);
   cases.push_back(VectorMed3F32NanUsesMin3Path(32));
   cases.push_back(VectorMed3F32NanUsesMin3Path(64));
+  cases.push_back(VectorMinMaxF32RuntimeEdges(32));
+  cases.push_back(VectorMinMaxF32RuntimeEdges(64));
   AddCase(VectorFloatConversionOps);
   AddCase(VectorFrexpF32Edges);
   AddCase(CvtF32ToIntSaturatesNaNAndOutOfRange);
@@ -43885,7 +43958,8 @@ void CheckTessellationProgram(const char *name, u32 ls_stride, u32 hs_stride) {
 
 // PPSA25468: CP0 writes patch constants below the 32 KiB offchip ring end
 // through mul24 addresses that reuse data VGPRs under nested EXEC masks, and
-// the TES reads them back.
+// the TES reads them back. As in God of War Ragnarok, the HS reads its next LS
+// record, loops on a v_cmpx header and CP0 reads back another CP's outputs.
 void CheckTessellationPatchConstants() {
   using namespace ShaderRecompiler;
   using Attribute = IR::TessellationAttribute;
@@ -43899,7 +43973,7 @@ void CheckTessellationPatchConstants() {
   local.push_back(EncodeDs1(0, 2, 20));
   local.push_back(EncodeSop1(0x20, 0, 6));
 
-  const auto make_control = [&](bool divergent) {
+  const auto make_control = [&](bool divergent, bool carried) {
     std::vector<u32> control;
     AppendVop3(&control, 0x365, 0, 193u, InlineU32(0));
     AppendVop3(&control, 0x366, 0, 193u, Vgpr(0));
@@ -43912,7 +43986,10 @@ void CheckTessellationPatchConstants() {
     control.push_back(0xffu);
     control.push_back(EncodeVop2(0x0b, 0, 255u, 16)); // v_mul_u32_u24 v0, hs_stride, v16
     control.push_back(hs_stride);
-    AppendVop3(&control, 0x169, 1, Vgpr(16), 255u); // v_mul_lo_u32 v1, v16, ls_stride
+    control.push_back(EncodeVopc(0xc4, InlineU32(2), 16));    // v_cmp_gt_u32 vcc, 2, v16
+    control.push_back(EncodeVop2(0x25, 1, InlineU32(1), 16)); // v_add_nc_u32 v1, 1, v16
+    control.push_back(EncodeVop2(0x01, 1, InlineU32(0), 1));  // v_cndmask_b32 v1, 0, v1, vcc
+    AppendVop3(&control, 0x169, 1, Vgpr(1), 255u); // v_mul_lo_u32 v1, v1, ls_stride
     control.push_back(ls_stride);
     AppendVop3(&control, 0x143, 17, 255u, Vgpr(50), Vgpr(0));
     control.push_back(3 * hs_stride);
@@ -43932,12 +44009,33 @@ void CheckTessellationPatchConstants() {
       control.push_back(EncodeVop2(0x25, 17, InlineU32(4), 17)); // v_add_nc_u32 v17, 4, v17
     }
     control[skip_scale] = EncodeSopp(0x06, control.size() - skip_scale - 1u);
+    control.push_back(EncodeSop1(0x04, 6, 126));       // s_mov_b64 s[6:7], exec
+    control.push_back(EncodeSMovB32(5, InlineU32(0))); // s_mov_b32 s5, 0
+    const auto loop = control.size();
+    control.push_back(EncodeVopc(0xd1, 5, 16)); // v_cmpx_lt_u32 s5, v16
+    const auto exit_loop = control.size();
+    control.push_back(0u); // s_cbranch_execz
     control.push_back(EncodeMubuf0(0x1c, 24));
     control.push_back(EncodeMubuf1(12, 2, 17, 2));
+    // Only the back edge shows a loop-carried v17 at the store above.
+    if (carried) {
+      control.push_back(EncodeVop2(0x25, 17, InlineU32(4), 17)); // v_add_nc_u32 v17, 4, v17
+    }
+    control.push_back(EncodeVop2(0x25, 13, InlineU32(1), 13)); // v_add_nc_u32 v13, 1, v13
+    control.push_back(EncodeSop2(0x00, 5, 5, InlineU32(1)));   // s_add_u32 s5, s5, 1
+    control.push_back(EncodeSopp(0x02, loop - control.size() - 1u)); // s_branch
+    control[exit_loop] = EncodeSopp(0x08, control.size() - exit_loop - 1u);
+    control.push_back(EncodeSop1(0x04, 126, 6)); // s_mov_b64 exec, s[6:7]
+    control.push_back(EncodeSopp(0x0a));         // s_barrier
     // CP0 reuses data VGPR v10 for the ring address 0x8000 - (patch + 1) * 0xf0.
     control.push_back(EncodeVopc(0xd4, InlineU32(1), 16)); // v_cmpx_gt_u32 1, v16
     const auto skip_patch = control.size();
     control.push_back(0u); // s_cbranch_execz
+    control.push_back(EncodeVop2(0x0b, 11, 255u, 50)); // v_mul_u32_u24 v11, 3 * hs_stride, v50
+    control.push_back(3 * hs_stride);
+    // buffer_load_dwordx2 v[11:12], v11, s[8:11], s2 offen offset:hs_stride + 16 (CP1)
+    control.push_back(EncodeMubuf0(0x0d, hs_stride + 16));
+    control.push_back(EncodeMubuf1(11, 2, 11, 2));
     control.push_back(EncodeVop2(0x25, 10, InlineU32(1), 50)); // v_add_nc_u32 v10, 1, v50
     control.push_back(EncodeVop2(0x0b, 10, 255u, 10));         // v_mul_u32_u24 v10, 0xf0, v10
     control.push_back(patch_stride);
@@ -43959,7 +44057,7 @@ void CheckTessellationPatchConstants() {
     AppendEnd(&control);
     return control;
   };
-  const auto control = make_control(false);
+  const auto control = make_control(false, false);
 
   std::vector<u32> evaluation;
   AppendVop3(&evaluation, 0x169, 24, 255u, Vgpr(7));
@@ -43982,13 +44080,14 @@ void CheckTessellationPatchConstants() {
   ShaderTessellationInputInfo tess{.input_control_points = 3,
                                   .output_control_points = 3,
                                   .domain = 1,
-                                  .partitioning = 2,
+                                  .partitioning = 0,
                                   .output_topology = 2};
   AnalyzeTessellationPrograms(local, control, tess);
   Require(name, "reflected interface",
           tess.ls_stride == ls_stride && tess.hs_stride == hs_stride &&
               tess.patch_base == 0x7f10u && tess.patch_size == 28u,
-          "b128 LS records, joined HS paths and CP0 patch stores must reflect the layout");
+          "b128 LS records, selected LS reads, joined and looping HS paths and CP0 patch "
+          "stores must reflect the layout");
 
   auto ls = CompileTessellationStage(name, local, ShaderType::Local, tess);
   auto hs = CompileTessellationStage(name, control, ShaderType::TessellationControl, tess);
@@ -43999,6 +44098,10 @@ void CheckTessellationPatchConstants() {
   Require(name, "predicated patch outputs",
           hs.addresses[Attribute::PatchOutput] == std::set<u32>{0x7f10, 0x7f20, 0x7f24, 0x7f28},
           "CP0 mul24 addresses under nested EXEC masks must reach patch constants");
+  Require(name, "control point read-back",
+          hs.addresses[Attribute::ControlOutput] == std::set<u32>{hs_stride + 16, hs_stride + 20} &&
+              hs.assembly.find("OpUDiv %uint %uint_96 %uint_80") != std::string::npos,
+          "CP0 must read CP1's outputs by address instead of its own invocation's");
   Require(name, "patch inputs",
           ds.addresses[Attribute::PatchInput] == std::set<u32>{0x7f20, 0x7f24} &&
               ds.addresses[Attribute::EvaluationInput] ==
@@ -44008,12 +44111,16 @@ void CheckTessellationPatchConstants() {
           HasPatchInterface(hs.assembly, "Output", 2, 5) &&
               HasPatchInterface(ds.assembly, "Input", 2, 5),
           "HS and TES patch variables must share their Location and type");
+  Require(name, "integer partitioning", ds.assembly.find("SpacingEqual") != std::string::npos,
+          "integer partitioning must map to equal spacing");
   std::printf("[host]    %-32s ok\n", name);
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
-  ExpectFatal("TessellationDivergentJoin", [&] {
-    ShaderTessellationInputInfo info{.input_control_points = 3, .output_control_points = 3};
-    AnalyzeTessellationPrograms(local, make_control(true), info);
-  });
+  for (const bool carried : {false, true}) {
+    ExpectFatal(carried ? "TessellationLoopCarriedAddress" : "TessellationDivergentJoin", [&] {
+      ShaderTessellationInputInfo info{.input_control_points = 3, .output_control_points = 3};
+      AnalyzeTessellationPrograms(local, make_control(!carried, carried), info);
+    });
+  }
 #endif
 }
 
@@ -48904,6 +49011,26 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, CvtPkrtzF16F32SubnormalRoundsTowardZero());
     RunCase(&vulkan, CvtPkrtzF16F32RuntimeEdges());
     RunCase(&vulkan, CvtPkrtzF16F32SdwaAndOutputModifiers());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--float-min-max-only") == 0) {
+    // Host min/max must keep the emulated results on AMD GPUs; other GPUs only
+    // compile it.
+    static constexpr ShaderProfile native_profile{.maintenance8 = true,
+                                                  .native_float_min_max = true};
+    VulkanHarness vulkan;
+    const bool supported = vulkan.SupportsNativeFloatMinMax();
+    for (bool native : {false, true}) {
+      for (auto test :
+           {VectorMinMaxF32NanAndSignedZeroEdges(),
+            VectorMinMaxF32RuntimeEdges(32), VectorMinMaxF32RuntimeEdges(64)}) {
+        auto &spirv = native ? test.required_spirv : test.forbidden_spirv;
+        spirv = {" NMin ", " NMax "};
+        test.profile = native ? &native_profile : &Maintenance8Profile;
+        test.compile_only = native && !supported;
+        RunCase(&vulkan, test);
+      }
+    }
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--thread-dimensions-only") == 0) {

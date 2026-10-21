@@ -635,7 +635,7 @@ struct PipelineCache::ProgramCache {
 			options.wave_size          = input_info.wave_size;
 		}
 		options.stage       = stage;
-		options.maintenance8_enabled = graphics.maintenance8_enabled;
+		options.profile     = &profile;
 		options.shader_hash = hash;
 		options.user_data   = user_data;
 		options.back_code   = back_code;
@@ -670,7 +670,7 @@ struct PipelineCache::ProgramCache {
 		auto result = ShaderRecompiler::CompileProgram(std::move(translated), options,
 		                                               specialization, push_data_start_dword);
 		if (!ValidateShaderSpirv(options.dump_label, options.shader_hash, result.spirv,
-		                         options.maintenance8_enabled)) {
+		                         options.profile->maintenance8)) {
 			DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
 			EXIT("%s failed hash=0x%016" PRIx64 ": SPIR-V validation failed\n", options.dump_label,
 			     options.shader_hash);
@@ -1319,7 +1319,14 @@ struct PipelineCache::ProgramCache {
 		job_done.wait(lock, finished);
 	}
 
-	explicit ProgramCache(GraphicContext& graphics): device(graphics.device), graphics(graphics) {
+	explicit ProgramCache(GraphicContext& graphics)
+	    : device(graphics.device),
+	      graphics(graphics),
+	      // AMD GPUs (vendor 0x1002) run NMin/NMax as v_min/v_max, which give the guest's NaN and
+	      // signed-zero results; GLSL.std.450 alone does not order -0 below +0.
+	      profile {.maintenance8 = graphics.maintenance8_enabled,
+		           .native_float_min_max =
+		               graphics.physical_device_properties.vendorID == 0x1002u} {
 		lookup_key.static_state.reserve(MaxStaticKeyWords);
 	}
 	~ProgramCache() {
@@ -1364,6 +1371,7 @@ struct PipelineCache::ProgramCache {
 	std::atomic<std::thread::id>                                lookup_thread;
 	vk::Device                                                  device;
 	GraphicContext&                                             graphics;
+	const ShaderRecompiler::Spirv::Profile                      profile;
 	uint64_t                                                    next_shader_id = 0;
 
 	// Shared with the workers and the shader map observer, under job_mutex.
@@ -1949,6 +1957,7 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(
 	if (static_params.sample_shading_enable && !m_graphics.sample_rate_shading_enabled) {
 		EXIT("Pipeline: sample-rate shading is required but unsupported by the host\n");
 	}
+	static_params.alpha_to_coverage_enable = ps_active && ctx.GetShaderRegisters().AlphaToMask();
 	const bool rect_list = Prospero::IsRectList(command.GetUserConfig().GetPrimType());
 	static_params.cull_back  = !rect_list && mc.cull_back;
 	static_params.cull_front = !rect_list && mc.cull_front;

@@ -307,6 +307,10 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	SetVulkanObjectNameF(m_graphics.device, m_bda_pagetable_buffer.Handle(),
 	                     "BDA Page Table Buffer");
 	SetVulkanObjectNameF(m_graphics.device, m_write_tracker.Handle(), "Write Tracker");
+	m_scheduler.BeginCommand();
+	for (auto* buffer: {&m_bda_pagetable_buffer, m_fault_manager.GetFaultBuffer()}) {
+		buffer->Fill(0, buffer->Size(), 0);
+	}
 	const auto null_id =
 	    m_slot_buffers.insert(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, 16);
 	EXIT_IF(null_id != NULL_BUFFER_ID);
