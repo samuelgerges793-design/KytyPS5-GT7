@@ -4166,13 +4166,20 @@ void PipelineCache::InitializeDriverCache() {
 }
 
 void PipelineCache::SnapshotLoop() {
+	KYTY_PROFILER_THREAD("PipelineSnapshot");
 	std::unique_lock lock(m_snapshot_mutex);
 	while (!m_snapshot_wake.wait_for(lock, std::chrono::minutes(g_pipeline_save_minutes),
 	                                 [this] { return m_snapshot_stop; })) {
 		size_t size = 0;
 		if (m_graphics.device.getPipelineCacheData(m_driver_cache, &size, nullptr) !=
-		        vk::Result::eSuccess ||
-		    size < std::max<size_t>(m_snapshot_bytes, m_driver_cache_loaded) + (size_t {64} << 20u)) {
+		    vk::Result::eSuccess) {
+			continue;
+		}
+		const auto written = std::max<size_t>(m_snapshot_bytes, m_driver_cache_loaded);
+		if (size < written + (size_t {64} << 20u)) {
+			PipelineCacheLog("Vulkan pipeline cache: {} MB ({} MB new since it was last written); "
+			                 "the snapshot waits for 64 MB",
+			                 size >> 20u, (size - std::min(size, written)) >> 20u);
 			continue;
 		}
 		std::vector<uint8_t> payload(size);
