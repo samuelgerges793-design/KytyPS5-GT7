@@ -1659,6 +1659,17 @@ static const std::optional<uint32_t> g_pipeline_frame_wait_ms = []() -> std::opt
 	}
 	return static_cast<uint32_t>(std::strtoul(value, nullptr, 10));
 }();
+// How long a draw that may not be skipped waits for its background compile before it is skipped
+// after all (KYTY_PIPELINE_MUST_WAIT_MS, default 10 s).
+static const std::chrono::milliseconds g_pipeline_must_wait = [] {
+	const char* value = std::getenv("KYTY_PIPELINE_MUST_WAIT_MS");
+	return std::chrono::milliseconds(value != nullptr ? std::strtoul(value, nullptr, 10) : 10000u);
+}();
+// Minutes between snapshots of the driver cache (KYTY_PIPELINE_SAVE_MINUTES; 0: only at exit).
+static const uint32_t g_pipeline_save_minutes = [] {
+	const char* value = std::getenv("KYTY_PIPELINE_SAVE_MINUTES");
+	return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 3u;
+}();
 // KYTY_PIPELINE_PROBE=0: never ask the driver's caches first (round 87).
 static const bool g_pipeline_probe = [] {
 	const char* value = std::getenv("KYTY_PIPELINE_PROBE");
@@ -1750,6 +1761,19 @@ public:
 			m_queue.push_back(std::move(job));
 		}
 		m_work.notify_one();
+	}
+
+	// Moves a job still in the queue to its front: a draw that may not be skipped waits for it,
+	// and with a cold driver cache thousands of compiles can be queued ahead of it.
+	void Promote(const PendingGraphicsPipeline& job) {
+		std::lock_guard lock(m_mutex);
+		const auto queued = std::ranges::find_if(
+		    m_queue, [&job](const auto& entry) { return entry.get() == &job; });
+		if (queued != m_queue.end() && queued != m_queue.begin()) {
+			auto entry = std::move(*queued);
+			m_queue.erase(queued);
+			m_queue.push_front(std::move(entry));
+		}
 	}
 
 	// Waits up to the budget; true when the job is done.
@@ -3872,6 +3896,9 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 	    graphics.mixed_attachment_samples == GraphicContext::MixedAttachmentSamples::Nv &&
 	    !EqaaPerSampleShading();
 	InitializeDriverCache();
+	if (g_pipeline_save_minutes != 0 && m_driver_cache != nullptr && !m_driver_cache_path.empty()) {
+		m_snapshot_thread = std::thread([this] { SnapshotLoop(); });
+	}
 	if (g_async_pipelines) {
 		// KYTY_PIPELINE_THREADS=<n>; by default a third of the processors, 2 to 10 (4 at most
 		// before round 70). A race brings hundreds of new pipelines at once (other cars, lap 2),
@@ -4138,7 +4165,38 @@ void PipelineCache::InitializeDriverCache() {
 	                 (older_bytes + initial_data.size()) >> 20u);
 }
 
+void PipelineCache::SnapshotLoop() {
+	std::unique_lock lock(m_snapshot_mutex);
+	while (!m_snapshot_wake.wait_for(lock, std::chrono::minutes(g_pipeline_save_minutes),
+	                                 [this] { return m_snapshot_stop; })) {
+		size_t size = 0;
+		if (m_graphics.device.getPipelineCacheData(m_driver_cache, &size, nullptr) !=
+		        vk::Result::eSuccess ||
+		    size < std::max<size_t>(m_snapshot_bytes, m_driver_cache_loaded) + (size_t {64} << 20u)) {
+			continue;
+		}
+		std::vector<uint8_t> payload(size);
+		// eIncomplete: pipelines were added meanwhile; the next snapshot takes them.
+		if (m_graphics.device.getPipelineCacheData(m_driver_cache, &size, payload.data()) !=
+		    vk::Result::eSuccess) {
+			continue;
+		}
+		payload.resize(size);
+		if (WriteDriverCacheFile(payload)) {
+			m_snapshot_bytes = size;
+		}
+	}
+}
+
 void PipelineCache::Save() {
+	{
+		std::lock_guard lock(m_snapshot_mutex);
+		m_snapshot_stop = true;
+	}
+	m_snapshot_wake.notify_all();
+	if (m_snapshot_thread.joinable()) {
+		m_snapshot_thread.join();
+	}
 	m_program_cache->FlushDisk();
 	// No worker may use the driver caches once they are destroyed below; later pipelines are
 	// compiled on the GPU thread (FinishPending).
@@ -4199,10 +4257,9 @@ void PipelineCache::Save() {
 		return;
 	}
 	payload.resize(size);
-	auto       prefix       = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
-	const auto payload_hash = XXH3_64bits(payload.data(), payload.size());
-	prefix.append(reinterpret_cast<const char*>(&payload_hash), sizeof(payload_hash));
-	if (prefix.size() + payload.size() > DriverCacheMaxBytes) {
+	if (payload.size() + DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties()).size() +
+	        sizeof(uint64_t) >
+	    DriverCacheMaxBytes) {
 		// The next run would refuse a file this large and compile everything again (round 64's
 		// runs, after the file passed the old 1 GiB limit). The file already there stays.
 		PipelineCacheLog("Vulkan pipeline cache: {} MB is past the {} MB a file may hold; not "
@@ -4215,9 +4272,29 @@ void PipelineCache::Save() {
 		ReleaseDriverCache(still_compiling);
 		return;
 	}
+	if (!WriteDriverCacheFile(payload)) {
+		return;
+	}
+	if (const auto marker = DriverCacheFullMarker(m_driver_cache_path);
+	    Common::File::IsFileExisting(marker)) {
+		std::error_code error;
+		std::filesystem::remove(marker, error);
+	}
+	ReleaseDriverCache(still_compiling);
+}
+
+// The signature, the payload's hash and the payload, through a temporary file (Save and the
+// snapshots).
+bool PipelineCache::WriteDriverCacheFile(const std::vector<uint8_t>& payload) {
+	auto       prefix       = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
+	const auto payload_hash = XXH3_64bits(payload.data(), payload.size());
+	prefix.append(reinterpret_cast<const char*>(&payload_hash), sizeof(payload_hash));
+	if (prefix.size() + payload.size() > DriverCacheMaxBytes) {
+		return false;
+	}
 	if (!Common::File::CreateDirectories(m_driver_cache_path.parent_path())) {
 		PipelineCacheLog("Vulkan pipeline cache: failed to create cache directory");
-		return;
+		return false;
 	}
 	auto temp_path = m_driver_cache_path;
 	temp_path += ".tmp";
@@ -4234,16 +4311,11 @@ void PipelineCache::Save() {
 	    !Common::File::RenameFile(temp_path, m_driver_cache_path)) {
 		PipelineCacheLog("Vulkan pipeline cache: failed to write {}",
 		                 Common::PathToString(m_driver_cache_path));
-		return;
+		return false;
 	}
 	PipelineCacheLog("Vulkan pipeline cache: saved {} bytes to {}", payload.size(),
 	                 Common::PathToString(m_driver_cache_path));
-	if (const auto marker = DriverCacheFullMarker(m_driver_cache_path);
-	    Common::File::IsFileExisting(marker)) {
-		std::error_code error;
-		std::filesystem::remove(marker, error);
-	}
-	ReleaseDriverCache(still_compiling);
+	return true;
 }
 
 void PipelineCache::ReleaseDriverCache(size_t still_compiling) {
@@ -5237,9 +5309,28 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 				return skip_draw();
 			}
 			// A draw that may not be skipped waits for the compile another draw of the same
-			// pipeline sent to the background (round 87: more of those are sent now).
+			// pipeline sent to the background (round 87: more of those are sent now). Its job goes
+			// first: behind a cold driver cache's queue the wait took minutes, with the game frozen.
+			// Past KYTY_PIPELINE_MUST_WAIT_MS (default 10 s) such a draw is skipped after all,
+			// except for GetGraphicsPipeline's.
 			const GpuPhases::Scope wait_phase(GpuPhases::Phase::PipelineWait);
+			m_compiler->Promote(*found.pending);
+			const auto begin = std::chrono::steady_clock::now();
 			while (!FinishPending(found)) {
+				if (defer != PipelineDefer::Never &&
+				    std::chrono::steady_clock::now() - begin >= g_pipeline_must_wait) {
+					static std::atomic<uint32_t> logged {0};
+					if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+						PipelineCacheLog("PipelineCache: a draw that may not be skipped ({}) waited "
+						                 "{} ms for its pipeline (VS 0x{:016x} PS 0x{:016x}); "
+						                 "skipped this time",
+						                 defer == PipelineDefer::WritesMemory ? "writes memory"
+						                                                      : "small target",
+						                 g_pipeline_must_wait.count(), found.pending->vs_hash,
+						                 found.pending->ps_hash);
+					}
+					return nullptr;
+				}
 				(void)m_compiler->Wait(*found.pending, std::chrono::milliseconds(100));
 			}
 		}

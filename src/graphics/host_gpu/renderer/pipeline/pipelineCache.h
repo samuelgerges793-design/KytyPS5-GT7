@@ -12,11 +12,14 @@
 
 #include <array>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <span>
+#include <thread>
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
@@ -458,6 +461,16 @@ private:
 	std::chrono::steady_clock::time_point m_wait_renewed {};
 
 	void InitializeDriverCache();
+	// The driver cache is also written every KYTY_PIPELINE_SAVE_MINUTES (default 3; 0: only at
+	// exit) once it has grown by 64 MB: a run that hangs or crashes never reaches Save, and the
+	// next one compiled every pipeline again, its draws waiting on a cold cache's queue.
+	void               SnapshotLoop();
+	[[nodiscard]] bool WriteDriverCacheFile(const std::vector<uint8_t>& payload);
+	std::mutex              m_snapshot_mutex;
+	std::condition_variable m_snapshot_wake;
+	bool                    m_snapshot_stop  = false;
+	size_t                  m_snapshot_bytes = 0;
+	std::thread             m_snapshot_thread;
 	// Takes a finished background compile into the pipeline; false while it still runs.
 	bool FinishPending(Pipeline& pipeline);
 	// Waits for a background compile while this frame's budget lasts.
