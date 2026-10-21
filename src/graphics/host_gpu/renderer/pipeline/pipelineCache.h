@@ -74,7 +74,7 @@ struct PipelineStaticParameters {
 static_assert(std::is_trivially_copyable_v<PipelineStaticParameters>);
 static_assert(std::is_standard_layout_v<PipelineStaticParameters>);
 static_assert(alignof(PipelineStaticParameters) == 1);
-static_assert(sizeof(PipelineStaticParameters) == 117);
+static_assert(sizeof(PipelineStaticParameters) == 118);
 
 struct PipelineRenderingState {
 	std::array<vk::Format, RENDER_COLOR_ATTACHMENTS_MAX> color_formats {};
