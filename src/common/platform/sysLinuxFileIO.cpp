@@ -655,6 +655,14 @@ bool SysFileRenameFile(const std::filesystem::path& src, const std::filesystem::
 	return 0 == rename(real_src.string().c_str(), real_dst.string().c_str());
 }
 
+bool SysFileRenameReplacing(const std::filesystem::path& src, const std::filesystem::path& dst) {
+	auto real_src = get_internal_name(src);
+	auto real_dst = get_internal_name(dst);
+
+	// rename replaces an existing destination atomically.
+	return 0 == rename(real_src.string().c_str(), real_dst.string().c_str());
+}
+
 void SysFileRemoveReadonly(const std::filesystem::path& name) {
 	auto real_name     = get_internal_name(name);
 	auto real_name_str = real_name.string();

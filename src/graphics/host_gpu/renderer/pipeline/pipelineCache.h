@@ -464,8 +464,8 @@ private:
 	// The driver cache is also written every KYTY_PIPELINE_SAVE_MINUTES (default 3; 0: only at
 	// exit) once it has grown by 64 MB: a run that hangs or crashes never reaches Save, and the
 	// next one compiled every pipeline again, its draws waiting on a cold cache's queue.
-	void               SnapshotLoop();
-	[[nodiscard]] bool WriteDriverCacheFile(const std::vector<uint8_t>& payload);
+	void                    SnapshotLoop();
+	[[nodiscard]] bool      WriteDriverCacheFile(std::span<const uint8_t> payload);
 	std::mutex              m_snapshot_mutex;
 	std::condition_variable m_snapshot_wake;
 	bool                    m_snapshot_stop  = false;

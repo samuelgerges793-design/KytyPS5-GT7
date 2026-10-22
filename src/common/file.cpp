@@ -596,6 +596,16 @@ bool File::RenameFile(const std::filesystem::path& src,
 	return SysFileRenameFile(src, dst);
 }
 
+bool File::RenameReplacing(
+    const std::filesystem::path& src,
+    const std::filesystem::path& dst) // @suppress("Member declaration not found")
+{
+	if (IsArchivePath(src) || IsArchivePath(dst)) {
+		return false;
+	}
+	return SysFileRenameReplacing(src, dst);
+}
+
 void File::RemoveReadonly(const std::filesystem::path& name) {
 	if (IsArchivePath(name)) {
 		return;

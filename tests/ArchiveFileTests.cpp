@@ -187,10 +187,46 @@ void CheckCancellation(const std::filesystem::path &path,
 }
 #endif
 
+void WriteText(const std::filesystem::path &path, const std::string &text) {
+  Common::File file;
+  Check(file.Create(path), "create a rename fixture");
+  uint32_t written = 0;
+  file.Write(text.data(), static_cast<uint32_t>(text.size()), &written);
+  Check(written == text.size(), "write a rename fixture");
+  file.Close();
+}
+
+std::string ReadText(const std::filesystem::path &path) {
+  Common::File file(path, Common::File::Mode::Read);
+  Check(!file.IsInvalid(), "open a renamed file");
+  const auto bytes = file.ReadWholeBuffer();
+  return {reinterpret_cast<const char *>(bytes.data()), bytes.size()};
+}
+
+// RenameReplacing replaces an existing destination in one step (the pipeline cache's file),
+// where RenameFile deletes it first.
+void CheckRenameReplacing(const std::filesystem::path &directory) {
+  const auto source = directory / "replacing.tmp";
+  const auto target = directory / "replacing.bin";
+  WriteText(target, "old contents");
+  WriteText(source, "new");
+  Check(Common::File::RenameReplacing(source, target), "replace an existing file");
+  Check(ReadText(target) == "new" && !Common::File::IsFileExisting(source),
+        "the replaced file holds the new contents and the source is gone");
+  Check(!Common::File::RenameReplacing(source, target) && ReadText(target) == "new",
+        "a missing source fails and leaves the destination alone");
+  const auto fresh = directory / "replacing-new.bin";
+  WriteText(source, "first");
+  Check(Common::File::RenameReplacing(source, fresh) && ReadText(fresh) == "first" &&
+            !Common::File::IsFileExisting(source),
+        "rename to a destination that does not exist yet");
+}
+
 } // namespace
 
 int main() {
   TempDirectory temporary;
+  CheckRenameReplacing(temporary.Path());
   const auto archive_path =
       temporary.Path() / std::filesystem::path(u8"game-テスト.zar");
 
@@ -374,7 +410,9 @@ int main() {
   Check(!Common::File::CopyFile(data_path, copied) &&
             !Common::File::CopyFile(copied, data_path) &&
             !Common::File::RenameFile(data_path, copied) &&
-            !Common::File::RenameFile(copied, data_path),
+            !Common::File::RenameFile(copied, data_path) &&
+            !Common::File::RenameReplacing(data_path, copied) &&
+            !Common::File::RenameReplacing(copied, data_path),
         "reject unsupported copy and rename operations involving archives");
 
   CheckMalformedArchives(archive_path, payload);
