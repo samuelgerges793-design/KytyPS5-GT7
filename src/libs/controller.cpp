@@ -425,6 +425,41 @@ static bool PadScriptSleep(int ms) {
 	                                   [] { return g_pad_script_stop; });
 }
 
+static bool PadScriptRunning() {
+	std::lock_guard lock(g_pad_script_mutex);
+	return !g_pad_script_stop;
+}
+
+// Runs the complete lines at the front of pending and removes them. False once the script is
+// stopped: no further line runs, not even a down or up line, which never sleeps.
+static bool PadScriptRun(const std::string& path, std::string& pending, uint64_t& done) {
+	for (auto eol = pending.find('\n'); eol != std::string::npos; eol = pending.find('\n')) {
+		if (!PadScriptRunning()) {
+			return false;
+		}
+		const auto line = PadScriptParse(pending.substr(0, eol));
+		pending.erase(0, eol + 1);
+		if (line.command == PadScriptCommand::None) {
+			continue;
+		}
+		if (line.command == PadScriptCommand::Wait) {
+			if (!PadScriptSleep(line.ms)) {
+				return false;
+			}
+		} else {
+			PadScriptSet(line.buttons, line.command != PadScriptCommand::Up);
+			if (line.command == PadScriptCommand::Press) {
+				if (!PadScriptSleep(line.ms)) {
+					return false;
+				}
+				PadScriptSet(line.buttons, false);
+			}
+		}
+		std::ofstream(path + ".ack", std::ios::trunc) << ++done << "\n";
+	}
+	return true;
+}
+
 static void PadScriptThread(std::string path) {
 	KYTY_PROFILER_THREAD("Thread_PadScript");
 
@@ -455,26 +490,8 @@ static void PadScriptThread(std::string path) {
 		chunk.resize(static_cast<size_t>(file.gcount()));
 		offset += static_cast<std::streamoff>(chunk.size());
 		pending += chunk;
-		for (auto eol = pending.find('\n'); eol != std::string::npos; eol = pending.find('\n')) {
-			const auto line = PadScriptParse(pending.substr(0, eol));
-			pending.erase(0, eol + 1);
-			if (line.command == PadScriptCommand::None) {
-				continue;
-			}
-			if (line.command == PadScriptCommand::Wait) {
-				if (!PadScriptSleep(line.ms)) {
-					return;
-				}
-			} else {
-				PadScriptSet(line.buttons, line.command != PadScriptCommand::Up);
-				if (line.command == PadScriptCommand::Press) {
-					if (!PadScriptSleep(line.ms)) {
-						return;
-					}
-					PadScriptSet(line.buttons, false);
-				}
-			}
-			std::ofstream(path + ".ack", std::ios::trunc) << ++done << "\n";
+		if (!PadScriptRun(path, pending, done)) {
+			return;
 		}
 	}
 }

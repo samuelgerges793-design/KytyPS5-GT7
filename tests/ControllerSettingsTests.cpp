@@ -443,6 +443,15 @@ void TestPadScriptFile() {
 	Check(std::chrono::steady_clock::now() - stopping < std::chrono::seconds(5) && ack() == 6 &&
 	          g_pad_script_thread == nullptr,
 	      "Shutdown waited for the script's wait or left its thread running");
+	// Once stopped, the rest of a batch does not run, though down and up lines never sleep.
+	{
+		Controller  controller;
+		std::string pending = "down cross\nup cross\ndown circle\n";
+		uint64_t    done    = 6;
+		PadScriptStop();
+		Check(!PadScriptRun(path, pending, done) && done == 6 && ack() == 6 && state().buttons == 0,
+		      "a stopped script still ran the down and up lines left in its batch");
+	}
 	std::remove(path.c_str());
 	std::remove(ack_path.c_str());
 }
