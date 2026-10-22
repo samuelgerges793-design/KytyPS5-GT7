@@ -28227,6 +28227,56 @@ TestCase BranchVccnzUsesWaveMask() {
   return test;
 }
 
+// A scalar branch decides for the whole wave (upstream a8beac19 and bb2d6dbe): s_cbranch_execz
+// with one lane enabled is not taken, s_cbranch_execnz with only the last lane enabled is taken,
+// and the branch's code restores EXEC before reading the last lane. Partial waves (4 threads)
+// check that lanes the host subgroup lacks do not vote.
+TestCase ScalarBranchRestoresInactiveLanes(u32 wave_size, u32 threads, bool upper_nonzero = false) {
+  using O = ShaderOpcode;
+  TestCase test;
+  if (upper_nonzero) {
+    test.name = wave_size == 32 ? "ScalarBranchRestoresLastLaneWave32"
+                               : "ScalarBranchRestoresUpperHalfWave64";
+  } else if (threads < wave_size) {
+    test.name = wave_size == 32 ? "ScalarBranchRestoresPartialWave32"
+                               : "ScalarBranchRestoresPartialWave64";
+  } else {
+    test.name = wave_size == 32 ? "ScalarBranchRestoresInactiveWave32"
+                               : "ScalarBranchRestoresInactiveWave64";
+  }
+  auto &code = test.code;
+  code = {EncodeVop1(0x01, 1, InlineU32(32)),
+          EncodeVop2(0x25, 1, Vgpr(0), 1),
+          EncodeSop1(0x04, 8, 126), // Save all participating lanes.
+          EncodeSMovB32(20, InlineU32(0))};
+  AppendSMovLiteral(&code, 126, upper_nonzero ? (wave_size == 32 ? 0x80000000u : 0u) : 1u);
+  AppendSMovLiteral(&code, 127, upper_nonzero && wave_size == 64 ? 0x80000000u : 0u);
+  if (upper_nonzero) {
+    code.push_back(EncodeSopp(0x09, 1)); // Last lane makes the whole-wave EXEC nonzero.
+    code.push_back(EncodeSopp(0x02, 3));
+  } else {
+    code.push_back(EncodeSopp(0x08, 3)); // EXEC is nonzero for the whole wave.
+  }
+  code.push_back(EncodeSop1(0x04, 126, 8));
+  // The branch restores inactive lanes before reading the last lane's value.
+  AppendVop3(&code, 0x360, 20, Vgpr(1), InlineU32(threads - 1));
+  code.push_back(EncodeSop1(0x04, 126, 8));
+  AppendStoreSgprAtLaneDwordOffset(&code, 20, 0, 0);
+  AppendEnd(&code);
+  test.initial.assign(threads, 0);
+  test.expected.assign(threads, 32 + threads - 1);
+  test.opcodes = {O::V_MOV_B32, O::V_ADD_NC_U32, O::S_MOV_B32, O::S_MOV_B64,
+                  upper_nonzero ? O::S_CBRANCH_EXECNZ : O::S_CBRANCH_EXECZ,
+                  O::V_READLANE_B32, O::V_LSHLREV_B32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {upper_nonzero ? "OpGroupNonUniformAny" : "OpGroupNonUniformAll"};
+  test.compute_info.wave_size = wave_size;
+  test.compute_info.threads_num[0] = threads;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
 TestCase ScalarMemRealtimeReadsDeviceClock() {
   using O = ShaderOpcode;
   namespace D = ShaderRecompiler::Decoder;
@@ -36293,6 +36343,12 @@ std::vector<TestCase> MakeCases() {
   AddCase(SharedReturnKeepsSelectedValues);
   AddCase(SiblingSharedExitKeepsCapturedConditions);
   AddCase(BranchVccnzUsesWaveMask);
+  AddCase([] { return ScalarBranchRestoresInactiveLanes(32, 32); });
+  AddCase([] { return ScalarBranchRestoresInactiveLanes(64, 64); });
+  AddCase([] { return ScalarBranchRestoresInactiveLanes(32, 4); });
+  AddCase([] { return ScalarBranchRestoresInactiveLanes(64, 4); });
+  AddCase([] { return ScalarBranchRestoresInactiveLanes(32, 32, true); });
+  AddCase([] { return ScalarBranchRestoresInactiveLanes(64, 64, true); });
   AddCase(BranchVccnzUsesCarryProducedWaveMask);
   AddCase(ScalarMemRealtimeReadsDeviceClock);
   AddCase(ScalarMemoryLoadVariants);
@@ -42825,6 +42881,12 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, ScratchIsPrivatePerInvocation());
     RunCase(&vulkan, Vop1MoveRelDestination());
     RunCase(&vulkan, BranchVccnzUsesWaveMask());
+    RunCase(&vulkan, ScalarBranchRestoresInactiveLanes(32, 32));
+    RunCase(&vulkan, ScalarBranchRestoresInactiveLanes(64, 64));
+    RunCase(&vulkan, ScalarBranchRestoresInactiveLanes(32, 4));
+    RunCase(&vulkan, ScalarBranchRestoresInactiveLanes(64, 4));
+    RunCase(&vulkan, ScalarBranchRestoresInactiveLanes(32, 32, true));
+    RunCase(&vulkan, ScalarBranchRestoresInactiveLanes(64, 64, true));
     RunCase(&vulkan, BranchVccnzUsesCarryProducedWaveMask());
     RunCase(&vulkan, ImageSampleAndGather());
     RunCase(&vulkan, ImageGatherExplicitLod());

@@ -15021,6 +15021,59 @@ void TestSpirvEmissionOwnsRequirements() {
         "emission reused requirements from an earlier IR version");
 }
 
+// Scalar branch conditions are decided by one vote over the wave (upstream a8beac19 and
+// bb2d6dbe): All for the zero kinds, Any for the others, none for a scalar instruction's own
+// condition. Two emulated halves combine their lanes first and vote once.
+void TestSpirvConditionVotes() {
+  using namespace ShaderRecompiler;
+  using K = CFG::BranchCondition;
+  for (const auto [wave, host] : {std::pair{32u, 32u}, std::pair{64u, 64u},
+                                  std::pair{64u, 32u}}) {
+    const auto emit = [wave = wave, host = host](bool with_conditions) {
+      const uint32_t shader[] = {EncodeSopp(0x01)};
+      ShaderComputeInputInfo compute{};
+      compute.wave_size = wave;
+      compute.host_subgroup_size = host;
+      compute.threads_num[0] = wave;
+      compute.threads_num[1] = compute.threads_num[2] = 1;
+      auto options = MakeCompileOptions(ShaderType::Compute);
+      options.wave_size = wave;
+      options.input_info.compute = &compute;
+      auto compiled = RecompileForTest(shader, options);
+      IR::IREmitter emitter(compiled.program.blocks.front());
+      const auto lane = emitter.Emit(IR::ValueOpcode::LaneId, {});
+      const auto predicate = emitter.Emit(IR::ValueOpcode::IEqual32, {lane, IR::Value(33u)});
+      if (with_conditions) {
+        for (const auto kind : {K::ExecZero, K::VccZero, K::SccZero, K::ExecNonZero,
+                                K::VccNonZero, K::SccNonZero, K::ScalarInstruction}) {
+          emitter.Emit(IR::ValueOpcode::ConditionRef, {predicate}, kind);
+        }
+      }
+      auto binary = Spirv::EmitProgram(compiled.program, options.input_info);
+      CheckSpirvBinaryValidates(binary);
+      return binary;
+    };
+    const auto without = emit(false);
+    const auto with = emit(true);
+    Check(SpirvContainsCapability(with, spv::CapabilityGroupNonUniformVote) &&
+              !SpirvContainsCapability(without, spv::CapabilityGroupNonUniformVote),
+          "condition votes did not require GroupNonUniformVote, or other code did");
+    Check(SpirvInstructionOpcodeCount(with, spv::OpGroupNonUniformAll) == 3 &&
+              SpirvInstructionOpcodeCount(with, spv::OpGroupNonUniformAny) == 3,
+          "a condition was decided per lane, per half, or for a scalar instruction");
+    Check(SpirvInstructionOpcodeCount(with, spv::OpGroupNonUniformBallot) ==
+              SpirvInstructionOpcodeCount(without, spv::OpGroupNonUniformBallot),
+          "condition votes went through ballots");
+    if (wave != host) {
+      Check(SpirvInstructionOpcodeCount(with, spv::OpLogicalAnd) ==
+                    SpirvInstructionOpcodeCount(without, spv::OpLogicalAnd) + 3 &&
+                SpirvInstructionOpcodeCount(with, spv::OpLogicalOr) ==
+                    SpirvInstructionOpcodeCount(without, spv::OpLogicalOr) + 3,
+            "condition votes did not combine both emulated halves");
+    }
+  }
+}
+
 void TestRepeatedExportsHaveOneInterface() {
   const uint32_t shader[] = {EncodeExp0(0x0c, 0xf), EncodeExp1(0, 1, 2, 3),
                              EncodeExp0(0x0c, 0xf), EncodeExp1(0, 1, 2, 3),
@@ -15089,8 +15142,8 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
       EncodeSopp(0x01),
   };
   const auto structured_result = compile("structured-phi", structured_phi,
-                                         {.words = 140,
-                                          .instructions = 41,
+                                         {.words = 153,
+                                          .instructions = 45,
                                           .phis = 1,
                                           .labels = 8,
                                           .loop_merges = 1,
@@ -15106,8 +15159,8 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
   CheckSpirvPhiParents(structured_result.spirv);
   const auto structured_repeat =
       compile("structured-phi-repeat", structured_phi,
-              {.words = 140,
-               .instructions = 41,
+              {.words = 153,
+               .instructions = 45,
                .phis = 1,
                .labels = 8,
                .loop_merges = 1,
@@ -15279,8 +15332,8 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
   };
   // The dispatcher's transition cap adds a counter phi and its test.
   const auto dispatcher_result = compile("dispatcher", dispatcher,
-                                         {.words = 248,
-                                          .instructions = 67,
+                                         {.words = 257,
+                                          .instructions = 70,
                                           .variables = 3,
                                           .function_variables = 3,
                                           .loads = 3,
@@ -15320,6 +15373,7 @@ int main() {
   TestDeferredSpirvPhiPatching();
   TestCompilerStageInputOwnership();
   TestSpirvEmissionOwnsRequirements();
+  TestSpirvConditionVotes();
   TestRepeatedExportsHaveOneInterface();
   TestNewShaderRecompilerSpirvSizeBaselines();
   TestDemandDrivenSpirvDeclarations();

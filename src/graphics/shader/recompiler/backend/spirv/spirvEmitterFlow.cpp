@@ -826,64 +826,33 @@ uint32_t EmitDppUpdateU32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	                                                ctx.Arg(inst, 1));
 }
 
-// A wave64 workgroup shader on a 64-wide host subgroup (compute and mesh shaders on AMD) runs
-// natively. Its VCC and EXEC branches decide for the wave as well, as the two emulated halves
-// below do; a lane's own bit would split the wave. Lanes a partial workgroup lacks are not in the
-// ballot, so a zero condition holds when no present lane fails it. SCC is computed from scalars
-// and whole-wave mask words, so it is the same in every lane already.
-static uint32_t EmitNativeWaveCondition(ValueEmitContext& ctx, const IR::Inst& inst) {
-	auto&      state = ctx.state;
-	const auto kind  = inst.Flags<CFG::BranchCondition>();
-	const bool zero  = kind == CFG::BranchCondition::ExecZero || kind == CFG::BranchCondition::VccZero;
-	if (!zero && kind != CFG::BranchCondition::ExecNonZero &&
-	    kind != CFG::BranchCondition::VccNonZero) {
-		return ctx.Arg(inst, 0);
-	}
-	auto predicate = ctx.Arg(inst, 0);
-	if (zero) {
-		predicate = Unary(state, spv::OpLogicalNot, TypeBool(state), predicate);
-	}
-	state.builder.RequireCapability(spv::CapabilityGroupNonUniform);
-	state.builder.RequireCapability(spv::CapabilityGroupNonUniformBallot);
-	const auto ballot = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpGroupNonUniformBallot, TypeU32Vector(state, 4), ballot,
-	                          ConstantU32(state, spv::ScopeSubgroup), predicate);
-	const auto low  = state.builder.AllocateId();
-	const auto high = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), low, ballot, 0);
-	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), high, ballot, 1);
-	const auto any = Binary(state, spv::OpBitwiseOr, TypeU32(state), low, high);
-	return Binary(state, zero ? spv::OpIEqual : spv::OpINotEqual, TypeBool(state), any,
-	              ConstantU32(state, 0));
-}
-
+// A scalar branch (s_cbranch_execz/execnz/vccz/vccnz/scc0/scc1) decides once for the whole wave
+// (upstream a8beac19 and bb2d6dbe). Each lane holds its own bit of the condition: zero kinds are
+// inverted by translation, so the branch is taken when every lane's predicate holds, and the
+// non-zero kinds when any lane's does. A vote over the host subgroup is that decision. On a wave32
+// program the lane's own bit used to decide (lanes of one wave could go different ways on NVIDIA);
+// the two emulated wave64 halves required every one of 64 ballot bits, so a zero kind was never
+// taken in a host subgroup that was not full. Votes count only the lanes present, which also
+// covers a partial workgroup on a native 64-wide subgroup (the AMD path this replaces). SCC is the
+// same in every lane already, so its vote changes nothing. Lanes disabled by EXEC take part, as on
+// hardware: the branch body may enable them again.
 uint32_t EmitConditionRef(ValueEmitContext& ctx, const IR::Inst& inst) {
-	if (ctx.other_half == nullptr) {
-		const auto* workgroup = ShaderWorkgroupInput(ctx.state.program.stage, ctx.state.input_info);
-		if (workgroup != nullptr && ctx.state.program.wave_size == 64u &&
-		    workgroup->host_subgroup_size == 64u) {
-			return EmitNativeWaveCondition(ctx, inst);
-		}
-		return ctx.Arg(inst, 0);
-	}
-	// A native scalar branch makes one decision for both emulated wave halves.
-	if (ctx.half != 0) return ctx.other_half->Def(IR::Value(&inst));
+	// The second emulated half takes the first half's decision.
+	if (ctx.other_half != nullptr && ctx.half != 0) return ctx.other_half->Def(IR::Value(&inst));
 	const auto kind = inst.Flags<CFG::BranchCondition>();
 	if (kind == CFG::BranchCondition::ScalarInstruction) return ctx.Arg(inst, 0);
-	const auto ballot = ctx.Ballot(inst.Arg(0));
-	const auto low = ctx.state.builder.AllocateId();
-	const auto high = ctx.state.builder.AllocateId();
-	const auto combined = ctx.state.builder.AllocateId();
-	const auto result = ctx.state.builder.AllocateId();
-	ctx.state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(ctx.state), low, ballot, 0);
-	ctx.state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(ctx.state), high, ballot, 1);
 	const bool zero = kind == CFG::BranchCondition::ExecZero ||
 	                  kind == CFG::BranchCondition::VccZero || kind == CFG::BranchCondition::SccZero;
-	ctx.state.builder.AddFunction(zero ? spv::OpBitwiseAnd : spv::OpBitwiseOr,
-	                              TypeU32(ctx.state), combined, low, high);
-	ctx.state.builder.AddFunction(zero ? spv::OpIEqual : spv::OpINotEqual,
-	                              TypeBool(ctx.state), result, combined,
-	                              ConstantU32(ctx.state, zero ? ~0u : 0u));
+	auto predicate = ctx.Arg(inst, 0);
+	if (ctx.other_half != nullptr) {
+		// Each host lane holds two guest lanes: combine them before the vote.
+		predicate = Binary(ctx.state, zero ? spv::OpLogicalAnd : spv::OpLogicalOr,
+		                   TypeBool(ctx.state), predicate, ctx.HalfArg(inst, 0, 1));
+	}
+	const auto result = ctx.state.builder.AllocateId();
+	ctx.state.builder.AddFunction(zero ? spv::OpGroupNonUniformAll : spv::OpGroupNonUniformAny,
+	                              TypeBool(ctx.state), result,
+	                              ConstantU32(ctx.state, spv::ScopeSubgroup), predicate);
 	return result;
 }
 
