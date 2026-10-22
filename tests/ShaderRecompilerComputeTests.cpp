@@ -16223,7 +16223,10 @@ public:
           view.viewType = test.sampled_image_view_type;
           view.format = sampled_image->format;
           view.subresourceRange = {
-              image.depth_compare ? vk::ImageAspectFlagBits::eDepth : vk::ImageAspectFlagBits::eColor, mip, 1,
+              compiled.program.info.images[resource].depth_compare
+                  ? vk::ImageAspectFlagBits::eDepth
+                  : vk::ImageAspectFlagBits::eColor,
+              mip, 1,
               test.sampled_image_view_base_layer,
               test.sampled_image_view_layers != 0
                   ? test.sampled_image_view_layers
