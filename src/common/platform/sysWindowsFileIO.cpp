@@ -519,6 +519,13 @@ bool SysFileRenameFile(const std::filesystem::path& src, const std::filesystem::
 	return MoveFileW(src_wide.c_str(), dst_wide.c_str()) != 0;
 }
 
+bool SysFileRenameReplacing(const std::filesystem::path& src, const std::filesystem::path& dst) {
+	auto src_wide = src.wstring();
+	auto dst_wide = dst.wstring();
+	return MoveFileExW(src_wide.c_str(), dst_wide.c_str(),
+	                   MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+}
+
 void SysFileRemoveReadonly(const std::filesystem::path& name) {
 	auto wide = name.wstring();
 	SetFileAttributesW(wide.c_str(), GetFileAttributesW(wide.c_str()) &

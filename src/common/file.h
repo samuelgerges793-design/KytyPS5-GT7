@@ -99,6 +99,9 @@ public:
 	static std::vector<DirEntry> GetDirEntries(const std::filesystem::path& path);
 	static bool CopyFile(const std::filesystem::path& src, const std::filesystem::path& dst);
 	static bool RenameFile(const std::filesystem::path& src, const std::filesystem::path& dst);
+	// RenameFile deletes dst first; this replaces it in one step, so a crash between the two
+	// leaves the old file instead of none.
+	static bool RenameReplacing(const std::filesystem::path& src, const std::filesystem::path& dst);
 	static void RemoveReadonly(const std::filesystem::path& name);
 
 	KYTY_CLASS_NO_COPY(File);
