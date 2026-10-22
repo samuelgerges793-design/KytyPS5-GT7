@@ -46,11 +46,11 @@ uint32_t EmitMinMaxF64(EmitterState& state, uint32_t lhs, uint32_t rhs, bool max
 	result = Select(state, TypeF64(state), equal,
 	                Unary(state, spv::OpBitcast, TypeF64(state), equal_bits), result);
 
-	// Non-IEEE mode selects the other operand for NaN, including rhs when both are NaN.
-	result = Select(state, TypeF64(state), Unary(state, spv::OpIsNan, TypeBool(state), rhs),
-	                lhs, result);
-	return Select(state, TypeF64(state), Unary(state, spv::OpIsNan, TypeBool(state), lhs),
-	              rhs, result);
+	// Non-IEEE mode selects the other operand for NaN, and lhs when both are NaN.
+	result = Select(state, TypeF64(state), Unary(state, spv::OpIsNan, TypeBool(state), lhs),
+	                rhs, result);
+	return Select(state, TypeF64(state), Unary(state, spv::OpIsNan, TypeBool(state), rhs),
+	              lhs, result);
 }
 
 uint32_t CompareOrdered64(EmitterState& state, uint32_t lhs_value, uint32_t rhs_value,
@@ -456,7 +456,9 @@ uint32_t EmitPackFloat2x16Rtz(EmitterState& state, uint32_t arg0, uint32_t arg1)
 }
 
 uint32_t EmitFPSaturate32(EmitterState& state, uint32_t arg0) {
-	return EmitExt(state, TypeF32(state), GLSLstd450FClamp,
+	// The clamp modifier runs in DX10 clamp mode: NaN becomes 0, as NClamp's NMax step does
+	// (upstream 4f1f3b1b, in 3c4124da's form). FClamp left NaN undefined.
+	return EmitExt(state, TypeF32(state), GLSLstd450NClamp,
 	               {arg0, ConstantF32(state, 0), ConstantF32(state, 0x3f800000u)});
 }
 

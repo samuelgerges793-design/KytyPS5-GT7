@@ -185,7 +185,7 @@ Decoder::Operand MemorySourceAt(const Decoder::Instruction& decoded, uint32_t in
 	if (decoded.family == Decoder::Family::MUBUF || decoded.family == Decoder::Family::MTBUF) {
 		const bool store_or_atomic =
 		    (decoded.opcode >= Decoder::Opcode::BUFFER_STORE_FORMAT_X &&
-		     decoded.opcode <= Decoder::Opcode::BUFFER_STORE_FORMAT_XYZW) ||
+		     decoded.opcode <= Decoder::Opcode::BUFFER_STORE_FORMAT_D16_X) ||
 		    (decoded.opcode >= Decoder::Opcode::BUFFER_STORE_BYTE &&
 		     decoded.opcode <= Decoder::Opcode::BUFFER_STORE_DWORDX4) ||
 		    (decoded.opcode >= Decoder::Opcode::TBUFFER_STORE_FORMAT_X &&
@@ -470,7 +470,8 @@ void Translator::BUFFER_STORE(const Decoder::Instruction& inst) {
 	const auto      data     = ReadU32(data_src);
 	IR::ValueOpcode opcode;
 	IR::Value       value;
-	switch (memory.data_bits) {
+	// Formatted stores carry packed VGPR bits; the format determines their conversion.
+	switch (memory.formatted ? 32u : memory.data_bits) {
 		case 8u:
 			opcode = IR::ValueOpcode::StoreBufferU8;
 			value  = NarrowSubdword(data, 8u);
@@ -1047,6 +1048,7 @@ void Translator::EmitMemory(const Decoder::Instruction& inst) {
 		case Decoder::Opcode::BUFFER_STORE_FORMAT_XY:
 		case Decoder::Opcode::BUFFER_STORE_FORMAT_XYZ:
 		case Decoder::Opcode::BUFFER_STORE_FORMAT_XYZW:
+		case Decoder::Opcode::BUFFER_STORE_FORMAT_D16_X:
 		case Decoder::Opcode::TBUFFER_STORE_FORMAT_X:
 		case Decoder::Opcode::TBUFFER_STORE_FORMAT_XY:
 		case Decoder::Opcode::TBUFFER_STORE_FORMAT_XYZ:
@@ -1084,6 +1086,8 @@ void Translator::EmitMemory(const Decoder::Instruction& inst) {
 			return BUFFER_ATOMIC(inst, IR::ValueOpcode::BufferAtomicFMin32);
 		case Decoder::Opcode::BUFFER_ATOMIC_FMAX:
 			return BUFFER_ATOMIC(inst, IR::ValueOpcode::BufferAtomicFMax32);
+		case Decoder::Opcode::BUFFER_ATOMIC_ADD_X2:
+			return BUFFER_ATOMIC(inst, IR::ValueOpcode::BufferAtomicIAdd64);
 
 		case Decoder::Opcode::DS_ADD_U32:
 			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicIAdd32, false);
@@ -1197,6 +1201,7 @@ void Translator::EmitMemory(const Decoder::Instruction& inst) {
 		case Decoder::Opcode::IMAGE_GATHER4_L:
 		case Decoder::Opcode::IMAGE_GATHER4_LZ:
 		case Decoder::Opcode::IMAGE_GATHER4_C:
+		case Decoder::Opcode::IMAGE_GATHER4_C_L:
 		case Decoder::Opcode::IMAGE_GATHER4_C_LZ:
 		case Decoder::Opcode::IMAGE_GATHER4_LZ_O:
 		case Decoder::Opcode::IMAGE_GATHER4_C_O:

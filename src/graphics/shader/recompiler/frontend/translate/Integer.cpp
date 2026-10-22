@@ -32,11 +32,12 @@ void Translator::V_MAD_I16(const Decoder::Instruction& inst) {
 	Write16Bits(DestinationOperand(inst), ir.BitwiseAnd(result, IR::U32(IR::Value(0xffffu))));
 }
 
-void Translator::V_MED3_I16(const Decoder::Instruction& inst) {
+void Translator::Integer16Ternary(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
+                                  bool sign) {
 	const auto result = IR::U32(ir.Emit(
-	    IR::ValueOpcode::SMedTri32, {ReadU16AsU32(inst.src0, true), ReadU16AsU32(inst.src1, true),
-	                                 ReadU16AsU32(inst.src2, true)}));
-	Write16Bits(DestinationOperand(inst), ir.BitwiseAnd(result, IR::U32(IR::Value(0xffffu))));
+	    opcode, {ReadU16AsU32(inst.src0, sign), ReadU16AsU32(inst.src1, sign),
+	             ReadU16AsU32(inst.src2, sign)}));
+	Write16Bits(DestinationOperand(inst), result);
 }
 
 void Translator::PackedInteger16Shift(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
@@ -400,9 +401,8 @@ void Translator::S_QUADMASK_B64(const Decoder::Instruction& inst) {
 void Translator::BFM_B32(const Decoder::Instruction& inst) {
 	const auto count  = ir.BitwiseAnd(ReadU32(inst.src0), IR::U32(IR::Value(31u)));
 	const auto offset = ir.BitwiseAnd(ReadU32(inst.src1), IR::U32(IR::Value(31u)));
-	const auto result = ir.Emit(IR::ValueOpcode::BitFieldInsert,
-	                            {IR::Value(0u), IR::Value(0xffffffffu), offset, count});
-	WriteOperand(DestinationOperand(inst), result);
+	// Mask bits shifted past bit 31 are dropped.
+	WriteOperand(DestinationOperand(inst), ir.ShiftLeftLogical(RightMask32(count), offset));
 }
 
 IR::U32 Translator::RightMask32(IR::U32 count) {

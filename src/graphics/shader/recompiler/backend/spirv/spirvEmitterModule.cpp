@@ -905,12 +905,15 @@ void DefineModule(EmitterState& state) {
 		state.builder.RequireCapability(spv::CapabilityImageGatherExtended);
 	}
 	if (state.lane_count == 2 || state.requirements.subgroup_barrier ||
-	    state.requirements.subgroup_ballot || state.requirements.subgroup_shuffle ||
-	    state.requirements.subgroup_local_invocation_id) {
+	    state.requirements.subgroup_ballot || state.requirements.subgroup_vote ||
+	    state.requirements.subgroup_shuffle || state.requirements.subgroup_local_invocation_id) {
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniform);
 	}
 	if (state.lane_count == 2 || state.requirements.subgroup_ballot) {
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniformBallot);
+	}
+	if (state.requirements.subgroup_vote) {
+		state.builder.RequireCapability(spv::CapabilityGroupNonUniformVote);
 	}
 	if (state.requirements.subgroup_shuffle) {
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniformShuffle);

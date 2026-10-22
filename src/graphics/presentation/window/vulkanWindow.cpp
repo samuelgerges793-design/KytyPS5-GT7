@@ -638,6 +638,12 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	     static_cast<vk::ShaderStageFlags::MaskType>(graphics.required_subgroup_size_stages),
 	     graphics.compute_subgroup_size_control_enabled ? "true" : "false",
 	     graphics.SupportsComputeWave64() ? "true" : "false");
+	// Shaders decide scalar branches by subgroup votes (EmitConditionRef); every desktop driver
+	// has them, and without them pipeline creation fails for those shaders.
+	if (!(properties11.subgroupSupportedOperations & vk::SubgroupFeatureFlagBits::eVote)) {
+		LOGF("Vulkan subgroup: the device lacks vote operations; shaders with scalar branches "
+		     "will fail to build\n");
+	}
 	graphics.provoking_vertex_last_enabled = provoking_extension && provoking_vertex.provokingVertexLast;
 	graphics.attachment_feedback_loop_enabled =
 	    feedback_extensions && feedback_layout.attachmentFeedbackLoopLayout &&

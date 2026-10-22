@@ -61,6 +61,8 @@ const ImageDimensionInfo& ImageDimensionInfoFor(ImageDimension dimension);
 struct SpirvRequirements {
 	bool bvh                          = false;
 	bool subgroup_ballot              = false;
+	// Scalar branches decided by a vote over the wave (EmitConditionRef).
+	bool subgroup_vote                = false;
 	bool subgroup_barrier             = false;
 	bool subgroup_shuffle             = false;
 	bool subgroup_local_invocation_id = false;

@@ -380,6 +380,10 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 				case IR::ValueOpcode::BvhIntersect: requirements.bvh = true; break;
 				case IR::ValueOpcode::LoopBudgetTick: requirements.ray_loop_rounds = true; break;
 				case IR::ValueOpcode::ShaderStuckProbe: requirements.stuck_probe = true; break;
+				case IR::ValueOpcode::ConditionRef:
+					requirements.subgroup_vote |=
+					    inst.Flags<CFG::BranchCondition>() != CFG::BranchCondition::ScalarInstruction;
+					break;
 				case IR::ValueOpcode::Ballot: requirements.subgroup_ballot = true; break;
 				case IR::ValueOpcode::ReadClockRealtime64: requirements.shader_clock = true; break;
 				case IR::ValueOpcode::DppMoveU32:
