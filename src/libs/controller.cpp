@@ -5,6 +5,7 @@
 #include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
+#include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "kernel/pthread.h"
@@ -16,8 +17,17 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cmath>
+#include <condition_variable>
+#include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <mutex>
+#include <sstream>
+#include <string>
+#include <thread>
+#include <utility>
 #include <vector>
 
 namespace Libs::Controller {
@@ -330,20 +340,194 @@ static bool trigger_effect_to_dualsense(const PadTriggerEffectCommand& command, 
 	}
 }
 
+// Scripted pad input for unattended tests (KYTY_PAD_FILE=<path>): lines appended to the file are
+// run in order as player-1 input, so no window focus or host keyboard is needed. Commands:
+// "press <buttons> [ms]" (buttons joined with '+', default 150 ms), "down <buttons>",
+// "up <buttons>", "wait <ms>". Buttons: up down left right cross circle square triangle l1 r1 l2
+// r2 l3 r3 options. Other lines are skipped. After each line that ran, <path>.ack holds the number
+// of lines run so far. The file is polled every 50 ms for appended bytes, and a last line without
+// its newline waits for it; when the file shrinks, it is read again from the start.
+enum class PadScriptCommand { None, Press, Down, Up, Wait };
+
+struct PadScriptLine {
+	PadScriptCommand command = PadScriptCommand::None;
+	uint32_t         buttons = 0;
+	int              ms      = 0;
+};
+
+// Shutdown stops the thread and joins it before g_controller is deleted.
+static std::mutex              g_pad_script_mutex;
+static std::condition_variable g_pad_script_wake;
+static bool                    g_pad_script_stop   = false;
+static std::thread*            g_pad_script_thread = nullptr;
+
+static uint32_t PadScriptButtons(const std::string& names) {
+	static constexpr std::pair<const char*, uint32_t> BUTTONS[] = {
+	    {"up", PAD_BUTTON_UP},          {"down", PAD_BUTTON_DOWN},
+	    {"left", PAD_BUTTON_LEFT},      {"right", PAD_BUTTON_RIGHT},
+	    {"cross", PAD_BUTTON_CROSS},    {"circle", PAD_BUTTON_CIRCLE},
+	    {"square", PAD_BUTTON_SQUARE},  {"triangle", PAD_BUTTON_TRIANGLE},
+	    {"l1", PAD_BUTTON_L1},          {"r1", PAD_BUTTON_R1},
+	    {"l2", PAD_BUTTON_L2},          {"r2", PAD_BUTTON_R2},
+	    {"l3", PAD_BUTTON_L3},          {"r3", PAD_BUTTON_R3},
+	    {"options", PAD_BUTTON_OPTIONS}};
+	uint32_t          buttons = 0;
+	std::stringstream ss(names);
+	std::string       name;
+	while (std::getline(ss, name, '+')) {
+		for (const auto& [n, b]: BUTTONS) {
+			if (name == n) {
+				buttons |= b;
+			}
+		}
+	}
+	return buttons;
+}
+
+static PadScriptLine PadScriptParse(const std::string& text) {
+	std::stringstream line(text);
+	std::string       cmd;
+	std::string       arg;
+	int               ms = 150;
+	line >> cmd >> arg >> ms;
+	if (cmd == "press") {
+		return {PadScriptCommand::Press, PadScriptButtons(arg), ms};
+	}
+	if (cmd == "down" || cmd == "up") {
+		return {cmd == "down" ? PadScriptCommand::Down : PadScriptCommand::Up,
+		        PadScriptButtons(arg)};
+	}
+	if (cmd == "wait") {
+		return {PadScriptCommand::Wait, 0, std::atoi(arg.c_str())};
+	}
+	return {};
+}
+
+static void PadScriptSet(uint32_t buttons, bool down) {
+	for (uint32_t bit = 1; bit != 0; bit <<= 1u) {
+		if ((buttons & bit) == 0) {
+			continue;
+		}
+		if (bit == PAD_BUTTON_L2 || bit == PAD_BUTTON_R2) {
+			// The triggers are analog, as on the keyboard: their axis also sets the digital bit.
+			SetAxis(HOST_INPUT_CONTROLLER_ID,
+			        bit == PAD_BUTTON_L2 ? Axis::TriggerLeft : Axis::TriggerRight, down ? 255 : 0);
+		} else {
+			SetButton(HOST_INPUT_CONTROLLER_ID, bit, down);
+		}
+	}
+}
+
+// False once the script is stopped, which ends the sleep at once.
+static bool PadScriptSleep(int ms) {
+	std::unique_lock lock(g_pad_script_mutex);
+	return !g_pad_script_wake.wait_for(lock, std::chrono::milliseconds(std::max(ms, 0)),
+	                                   [] { return g_pad_script_stop; });
+}
+
+static void PadScriptThread(std::string path) {
+	KYTY_PROFILER_THREAD("Thread_PadScript");
+
+	std::streamoff offset = 0;
+	uint64_t       done   = 0;
+	std::string    pending;
+	while (PadScriptSleep(50)) {
+		std::ifstream file(path, std::ios::binary);
+		if (!file) {
+			continue;
+		}
+		file.seekg(0, std::ios::end);
+		const auto size = static_cast<std::streamoff>(file.tellg());
+		if (size < 0) {
+			continue;
+		}
+		if (size < offset) {
+			// Truncated: start over, without the old file's unfinished line.
+			offset = 0;
+			pending.clear();
+		}
+		if (size == offset) {
+			continue;
+		}
+		file.seekg(offset);
+		std::string chunk(static_cast<size_t>(size - offset), '\0');
+		file.read(chunk.data(), static_cast<std::streamsize>(chunk.size()));
+		chunk.resize(static_cast<size_t>(file.gcount()));
+		offset += static_cast<std::streamoff>(chunk.size());
+		pending += chunk;
+		for (auto eol = pending.find('\n'); eol != std::string::npos; eol = pending.find('\n')) {
+			const auto line = PadScriptParse(pending.substr(0, eol));
+			pending.erase(0, eol + 1);
+			if (line.command == PadScriptCommand::None) {
+				continue;
+			}
+			if (line.command == PadScriptCommand::Wait) {
+				if (!PadScriptSleep(line.ms)) {
+					return;
+				}
+			} else {
+				PadScriptSet(line.buttons, line.command != PadScriptCommand::Up);
+				if (line.command == PadScriptCommand::Press) {
+					if (!PadScriptSleep(line.ms)) {
+						return;
+					}
+					PadScriptSet(line.buttons, false);
+				}
+			}
+			std::ofstream(path + ".ack", std::ios::trunc) << ++done << "\n";
+		}
+	}
+}
+
+static void PadScriptStart(const std::string& path) {
+	EXIT_IF(g_pad_script_thread != nullptr);
+
+	{
+		std::lock_guard lock(g_pad_script_mutex);
+		g_pad_script_stop = false;
+	}
+	g_pad_script_thread = new std::thread(PadScriptThread, path);
+}
+
+static void PadScriptStop() {
+	{
+		std::lock_guard lock(g_pad_script_mutex);
+		g_pad_script_stop = true;
+	}
+	g_pad_script_wake.notify_all();
+}
+
 void Initialize() {
 	EXIT_IF(g_controller != nullptr);
 
 	g_controller = new GameController;
 	g_controller->Connect(HOST_INPUT_CONTROLLER_ID);
+
+	if (const char* path = std::getenv("KYTY_PAD_FILE"); path != nullptr && *path != 0) {
+		LOGF("Pad script: player 1 also takes its input from %s (KYTY_PAD_FILE); %s.ack counts "
+		     "the lines run\n",
+		     path, path);
+		PadScriptStart(path);
+	}
 }
 
 void Shutdown() {
+	PadScriptStop();
+	if (g_pad_script_thread != nullptr) {
+		g_pad_script_thread->join();
+		delete g_pad_script_thread;
+		g_pad_script_thread = nullptr;
+	}
 	EmergencyShutdown();
 	delete g_controller;
 	g_controller = nullptr;
 }
 
 void EmergencyShutdown() {
+	// The crash and exit paths only stop the script. They can run on its own thread (a fatal error
+	// inside SetButton) or with the controller locked, where a join would throw or hang, and they
+	// end the process without deleting g_controller.
+	PadScriptStop();
 	if (g_controller != nullptr) {
 		g_controller->ReleaseHostPads();
 	}

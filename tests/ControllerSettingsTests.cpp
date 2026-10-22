@@ -1,9 +1,13 @@
 // Exercise the production controller with deterministic host output and time.
 #include <SDL3/SDL.h>
 #include <array>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -343,9 +347,114 @@ void TestIndependentOutputsAndPadSwitch() {
 		      "released controller retained a cached vibration");
 	}
 }
+
+void TestPadScriptParse() {
+	Check(PadScriptButtons(
+	          "up+down+left+right+cross+circle+square+triangle+l1+r1+l2+r2+l3+r3+options") ==
+	          (PAD_BUTTON_UP | PAD_BUTTON_DOWN | PAD_BUTTON_LEFT | PAD_BUTTON_RIGHT |
+	           PAD_BUTTON_CROSS | PAD_BUTTON_CIRCLE | PAD_BUTTON_SQUARE | PAD_BUTTON_TRIANGLE |
+	           PAD_BUTTON_L1 | PAD_BUTTON_R1 | PAD_BUTTON_L2 | PAD_BUTTON_R2 | PAD_BUTTON_L3 |
+	           PAD_BUTTON_R3 | PAD_BUTTON_OPTIONS),
+	      "a script button name was not recognised");
+	Check(PadScriptButtons("cross+jump+Circle+") == PAD_BUTTON_CROSS,
+	      "unknown script button names were not skipped");
+	auto line = PadScriptParse("press cross+circle");
+	Check(line.command == PadScriptCommand::Press &&
+	          line.buttons == (PAD_BUTTON_CROSS | PAD_BUTTON_CIRCLE) && line.ms == 150,
+	      "press did not default to 150 ms");
+	line = PadScriptParse("press r2 1000\r");
+	Check(line.command == PadScriptCommand::Press && line.buttons == PAD_BUTTON_R2 &&
+	          line.ms == 1000,
+	      "press with a time and a CRLF ending was misread");
+	line = PadScriptParse("  down\tl1+r1 ");
+	Check(line.command == PadScriptCommand::Down && line.buttons == (PAD_BUTTON_L1 | PAD_BUTTON_R1),
+	      "down was misread");
+	line = PadScriptParse("up options");
+	Check(line.command == PadScriptCommand::Up && line.buttons == PAD_BUTTON_OPTIONS,
+	      "up was misread");
+	line = PadScriptParse("wait 2500");
+	Check(line.command == PadScriptCommand::Wait && line.ms == 2500, "wait was misread");
+	line = PadScriptParse("wait");
+	Check(line.command == PadScriptCommand::Wait && line.ms == 0, "a bare wait did not wait 0 ms");
+	for (const char* text: {"", " \r", "# press cross", "hold cross", "Press cross", "wait2500"}) {
+		Check(PadScriptParse(text).command == PadScriptCommand::None,
+		      "an unknown line was not skipped");
+	}
+}
+
+// The script thread drives player 1 from the file; Shutdown ends a long wait at once.
+void TestPadScriptFile() {
+	const std::string path     = "controller_settings_pad_script.txt";
+	const std::string ack_path = path + ".ack";
+	std::remove(path.c_str());
+	std::remove(ack_path.c_str());
+	const auto append = [&](const char* text) {
+		std::ofstream(path, std::ios::binary | std::ios::app) << text;
+	};
+	const auto ack = [&] {
+		int count = -1;
+		std::ifstream(ack_path) >> count;
+		return count;
+	};
+	const auto wait_ack = [&](int count, const char* text) {
+		for (int i = 0; i < 500 && ack() != count; ++i) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(10));
+		}
+		Check(ack() == count, text);
+	};
+	const auto state = [] {
+		ControllerState current;
+		bool            connected = false;
+		int             count     = 0;
+		g_controller->ReadState(&current, &connected, &count);
+		return current;
+	};
+	constexpr int   left_trigger = static_cast<int>(Axis::TriggerLeft);
+	ControllerState states[64];
+	bool            connected = false;
+	int             count     = 0;
+	auto            stopping  = std::chrono::steady_clock::now();
+	{
+		Controller controller;
+		PadScriptStart(path);
+		append("down cross+l2\nup cross\n");
+		wait_ack(2, "scripted down and up lines did not run");
+		Check(state().buttons == PAD_BUTTON_L2 && state().axes[left_trigger] == 255,
+		      "a scripted L2 did not pull the analog trigger as the keyboard does");
+		append("jump\nup l2\ndown tri");
+		wait_ack(3, "an unknown line stopped the script");
+		std::this_thread::sleep_for(std::chrono::milliseconds(200));
+		Check(ack() == 3 && state().buttons == 0 && state().axes[left_trigger] == 0,
+		      "an unknown line was counted, a line ran before its newline, or L2 stayed down");
+		append("angle\n");
+		wait_ack(4, "a line split across two appends did not run");
+		Check(state().buttons == PAD_BUTTON_TRIANGLE, "the split line set the wrong button");
+		(void)g_controller->ReadStates(states, 64, &connected, &count);
+		std::ofstream(path, std::ios::binary | std::ios::trunc) << "up triangle\npress circle 30\n";
+		wait_ack(6, "the script did not start over after the file was truncated");
+		Check(g_controller->ReadStates(states, 64, &connected, &count) == 3 &&
+		          states[0].buttons == 0 && states[1].buttons == PAD_BUTTON_CIRCLE &&
+		          states[2].buttons == 0,
+		      "press did not hold the button and then release it");
+		append("wait 60000\n");
+		std::this_thread::sleep_for(std::chrono::milliseconds(200));
+		stopping = std::chrono::steady_clock::now();
+	}
+	Check(std::chrono::steady_clock::now() - stopping < std::chrono::seconds(5) && ack() == 6 &&
+	          g_pad_script_thread == nullptr,
+	      "Shutdown waited for the script's wait or left its thread running");
+	std::remove(path.c_str());
+	std::remove(ack_path.c_str());
+}
 } // namespace
 
 int main() {
+	// A pad file set for an emulator run must not drive these controllers.
+#if defined(_WIN32)
+	(void)_putenv_s("KYTY_PAD_FILE", "");
+#else
+	(void)unsetenv("KYTY_PAD_FILE");
+#endif
 	Config::Initialize();
 	TestSettingCycles();
 	TestGlobalControllerLevels();
@@ -353,6 +462,8 @@ int main() {
 	TestVibrationLifetime();
 	TestMaskedTriggersAndValidation();
 	TestIndependentOutputsAndPadSwitch();
+	TestPadScriptParse();
+	TestPadScriptFile();
 	Config::Shutdown();
 	return 0;
 }
