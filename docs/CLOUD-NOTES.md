@@ -8,7 +8,7 @@ what is an estimate.
 
 | Branch | Content | PR |
 | --- | --- | --- |
-| `claude/gt7-base` | **The proposed new base for `gt7-local`; it fast-forwards from it.** It is `gt7-local` plus #1, #2 and #3, plus this file. | #5 |
+| `claude/gt7-base` | **The proposed new base for `gt7-local`; it fast-forwards from it.** It is `gt7-local` plus #1, #2 and #3, plus usa-ratt's `1e1de7b`, upstream's `f5f4e7d4` and this file. | #5 |
 | `claude/pad-file-input` | `KYTY_PAD_FILE` scripted input, in the old branch's format, with a safe stop at shutdown | #1 |
 | `claude/pipeline-cache-fixes` | Must-wait cap per pipeline; snapshots with headroom and retries; atomic file replace (`File::RenameReplacing`); env vars clamped | #2 |
 | `claude/upstream-b46eeb7` | 29 upstream picks (22 safe, plus a 7-commit shader bundle); two test fixes | #3 |
@@ -56,15 +56,16 @@ The pad-file harness now makes runs repeatable, so measure each lead against the
 
 The 120 Hz mode is not a realistic target. Even 25-30 fps in races would need about 1.5x on both threads.
 
-## Pending (not on gt7-base)
+## Merged on gt7-base after the Windows test (not yet tested on Windows)
 
-- **usa-ratt's release `1e1de7b` (Rounds 115-118).**
+- **usa-ratt's release `1e1de7b` (Rounds 115-118), merge `39e78059`.**
   - It fixes the race crash with `resource.mip_count` (their issues 3 and 9) and the ray tracing materials.
-  - Every shader compiles again after updating.
-  - Merging it into `gt7-local` or `gt7-base` conflicts in one hunk, at the start of `PipelineCache::Save()`. Keep both the snapshot-thread stop/join and their `m_saved = true;`, after checking what `m_saved` guards.
-- **Upstream `f5f4e7d4`** "usbd: return an empty device list from sceUsbdGetDeviceList (Gran Turismo 7)".
-  - The fork lacks NIDs `8qB9Ar4P5nc` and `EQ6SCLMqzkM`. A call to either lands in the unresolved-import stub (`runtimeLinker.cpp`), which logs `Unresolved import stub called: <symbol>` and returns 0 without writing the list pointer.
-  - It cherry-picks cleanly: `git fetch https://github.com/KytyPS5/KytyPS5.git main && git cherry-pick -x f5f4e7d4`.
+  - Every shader compiles again once.
+  - The one conflict was in `PipelineCache::Save()`. The resolution sets `m_saved = true` first, so no background partition starts while closing, and then stops and joins the snapshot thread.
+- **Upstream `f5f4e7d4`, commit `83e047fa`:** `sceUsbdGetDeviceList` returns an empty device list and `sceUsbdFreeDeviceList` does nothing (NIDs `8qB9Ar4P5nc`, `EQ6SCLMqzkM`). Before, GT7's calls landed in the unresolved-import stub (`runtimeLinker.cpp`). That stub logs `Unresolved import stub called: <symbol>` and returns 0 without writing the list pointer.
+
+## Not taken
+
 - **Upstream commits since b46eeb7 that the fork lacks, worth porting only if the logs show the opcodes:** `d7c18966` (`V_INTERP_P1LL_F16`/`P2_F16`), and `753f2851` + `c5016d94` (D16 XY/XYZ buffer formats). Look for `gave up hash` or `unsupported family` lines.
 - **From the earlier triage, not taken:**
   - `feed075a`: real user clip planes. GT7 sets them (Tokyo, the LM55 page), and the fork draws those draws unclipped.
@@ -91,6 +92,7 @@ The 120 Hz mode is not a realistic target. Even 25-30 fps in races would need ab
 - **Formatting:** the pre-commit hook pins clang-format 22.1.3 (`pip install clang-format==22.1.3`).
 - **`shader_cfg` SPIR-V size budgets are upper bounds.** When a change grows a shader, raise its budget by the measured growth.
 - **The root `AGENTS.md` is a stale handoff for another game;** ignore it.
+- **Incremental builds after a pull that adds source files** make CMake re-run, and the ZArchive fetch then tries to apply `3rdparty/patches/zarchive-reader.patch` a second time ("patch does not apply" in `zarchive_source-populate`). Run `git -C <build dir>/_deps/zarchive_source-src checkout -- .` and build again. This happened in the cloud build after merging usa-ratt's `1e1de7b`.
 - **Pipeline-cache env vars:**
   - `KYTY_PIPELINE_MUST_WAIT_MS`: default 10 s. The budget is per pipeline: later draws on that pipeline skip until it's ready.
   - `KYTY_PIPELINE_SAVE_MINUTES`: default 3; 0 or less saves only at exit.
