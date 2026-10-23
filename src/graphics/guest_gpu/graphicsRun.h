@@ -48,6 +48,9 @@ public:
 	// barrier of before (KYTY_PM4_BARRIERS=global, or KYTY_BISECT's barriers:global), and draws
 	// that write buffers go without the write-hazard barrier the change gave them.
 	[[nodiscard]] static bool GlobalPm4Barriers();
+	// How many full barriers EmitGlobalBarrier has recorded so far (KYTY_BISECT's
+	// barriers:guest, which also turns GlobalPm4Barriers on, logs them).
+	[[nodiscard]] static uint64_t GlobalBarriersEmitted() noexcept;
 	// Whether any label write has been deferred (so ReadLabel must consult the pending ones).
 	[[nodiscard]] static bool LabelsDeferred() noexcept;
 	// GPU thread.

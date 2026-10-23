@@ -273,6 +273,9 @@
 //                (BufferCache::SynchronizeBdaPending; on by default since its A/B)
 //   uploads:each  each upload of such a walk has its own pair again, as before
 //                (KYTY_UPLOAD_BATCH=0 for the whole run)
+//   barriers:guest dispatches go without the barrier before them (for their storage writes) and
+//                the one after them; the guest's PM4 partial flushes, cache actions, RELEASE_MEM
+//                and suspend points record full barriers instead, as barriers:global does
 // KYTY_BISECT_AB=1: while a step is on, it is turned off and on again at each Perf line (every
 // 2 s), so its lines and the lines without it ("<name> base") alternate, and each can be compared
 // with the ones next to it, made on nearly the same frames.
@@ -410,8 +413,9 @@ void RequestPicture(const std::string& name);
 [[nodiscard]] bool CleanPageOld();
 [[nodiscard]] bool ReadWaitWriter();
 [[nodiscard]] bool GlobalPm4Barriers();
-// GPU thread: uploads:batched, uploads:each (2026-10-23).
+// GPU thread: uploads:batched, uploads:each, barriers:guest (2026-10-23).
 [[nodiscard]] bool UploadBatch();
+[[nodiscard]] bool GuestBarriers();
 // GPU thread: gbuffer:sync; depthread:old (round 91).
 [[nodiscard]] bool GbufferSync();
 [[nodiscard]] bool DepthReadOld();

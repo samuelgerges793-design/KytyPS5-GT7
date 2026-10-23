@@ -1930,11 +1930,18 @@ bool GuestGpu::GlobalPm4Barriers() {
 		        : "the renderer's resource barriers only");
 		return on;
 	}();
-	return whole_run || Bisect::GlobalPm4Barriers();
+	return whole_run || Bisect::GlobalPm4Barriers() || Bisect::GuestBarriers();
+}
+
+static std::atomic<uint64_t> g_global_barriers {0};
+
+uint64_t GuestGpu::GlobalBarriersEmitted() noexcept {
+	return g_global_barriers.load(std::memory_order_relaxed);
 }
 
 void CommandProcessor::EmitGlobalBarrier() {
 	const RendererLock lock(m_renderer.GetMutex());
+	g_global_barriers.fetch_add(1, std::memory_order_relaxed);
 
 	vk::MemoryBarrier2 barrier {};
 	barrier.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;

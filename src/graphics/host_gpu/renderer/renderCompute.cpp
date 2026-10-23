@@ -63,6 +63,41 @@
 
 namespace Libs::Graphics {
 
+// KYTY_BISECT's barriers:guest (2026-10-23): whether this dispatch goes without its own two
+// barriers, the guest's synchronization recording full barriers instead
+// (GuestGpu::GlobalPm4Barriers). The two drained the host GPU around each of ~1,000 dispatches a
+// frame in a race, ~14 us of its time each (the Perf GPU line's fit). A change of the mode records
+// one full barrier, for the dispatches on either side of it. Every 10 s the log tells how many
+// dispatches went without and how many full barriers the guest's synchronization recorded.
+static bool GuestDispatchBarriers(const CommandRecorder& vk_buffer) {
+	const bool      guest          = Bisect::GuestBarriers();
+	static bool     last           = false;
+	static uint64_t without        = 0;
+	static uint64_t emitted_before = GuestGpu::GlobalBarriersEmitted();
+	static auto     logged         = std::chrono::steady_clock::now();
+	if (guest != last) {
+		vk::MemoryBarrier barrier {};
+		barrier.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+		barrier.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+		vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+		                          vk::PipelineStageFlagBits::eAllCommands, {}, 1, &barrier, 0,
+		                          nullptr, 0, nullptr);
+		last = guest;
+	}
+	without += guest ? 1u : 0u;
+	if (const auto now = std::chrono::steady_clock::now();
+	    now - logged >= std::chrono::seconds(10) && without != 0) {
+		const auto emitted = GuestGpu::GlobalBarriersEmitted();
+		LOGF("Guest barriers (%.1f s): %" PRIu64 " dispatches without their own barriers, %" PRIu64
+		     " full barriers at the guest's synchronization\n",
+		     std::chrono::duration<double>(now - logged).count(), without, emitted - emitted_before);
+		logged         = now;
+		without        = 0;
+		emitted_before = emitted;
+	}
+	return guest;
+}
+
 // KYTY_LOG_SKIPPED_DISPATCHES=<n>: log the first n dispatches of compute shaders that gave up,
 // with their user data, to see which guest buffers they would have written.
 static bool EarlyDispatchSkip() {
@@ -1902,7 +1937,8 @@ void RenderExecutor::DispatchDirectPart(uint64_t submit_id, CommandBuffer& buffe
 			                           ShaderRecompiler::IR::ImageResourceClass::Storage;
 		                }) ||
 		    has_storage_writes;
-		if (has_storage_writes) {
+		const bool guest_barriers = GuestDispatchBarriers(vk_buffer);
+		if (has_storage_writes && !guest_barriers) {
 			// A host fence used to serialize every dispatch. Preserve its read-before-write ordering
 			// while allowing the queue to execute asynchronously.
 			ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
@@ -1930,7 +1966,9 @@ void RenderExecutor::DispatchDirectPart(uint64_t submit_id, CommandBuffer& buffe
 		                   (thread_group_y << 16u) | thread_group_z);
 
 		// The removed host fence also ordered read-only dispatches before later writers.
-		ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+		if (!guest_barriers) {
+			ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+		}
 	} while (recovery.Retry());
 	// The dispatch's writes are in this command buffer now.
 	m_context.GetBufferCache().WritesRecorded(program.has_address_writes, program.shader_hash);
@@ -2154,7 +2192,8 @@ void RenderExecutor::DispatchIndirectPart(uint64_t submit_id, CommandBuffer& buf
 			        return image.written && image.resource_class ==
 			                                    ShaderRecompiler::IR::ImageResourceClass::Storage;
 		        });
-		if (has_storage_writes) {
+		const bool guest_barriers = GuestDispatchBarriers(vk_buffer);
+		if (has_storage_writes && !guest_barriers) {
 			ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 		}
 		vk::MemoryBarrier barrier {};
@@ -2183,7 +2222,9 @@ void RenderExecutor::DispatchIndirectPart(uint64_t submit_id, CommandBuffer& buf
 		GpuProfiler::End(buffer, gpu_zone);
 		GpuTiming::After(m_context, buffer, program.shader_hash, GpuTiming::Dispatch);
 		Timeline::Mark("dispatch-indirect", program.shader_hash, 0);
-		ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+		if (!guest_barriers) {
+			ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+		}
 	} while (recovery.Retry());
 	// The dispatch's writes are in this command buffer now.
 	m_context.GetBufferCache().WritesRecorded(program.has_address_writes, program.shader_hash);

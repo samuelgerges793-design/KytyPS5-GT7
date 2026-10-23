@@ -128,6 +128,7 @@ struct Step {
 	bool              protect_excl    = false; // protect:exclusive
 	bool              upload_batch    = false; // uploads:batched (2026-10-23)
 	bool              upload_each     = false; // uploads:each
+	bool              guest_barriers  = false; // barriers:guest
 	std::string       cpu_set;          // empty: as at the start
 	std::string       name;             // for the screen and the picture's file name
 	std::string       text;             // name and actions, for the log
@@ -452,6 +453,10 @@ bool ParseAction(std::string_view action, Step& step) {
 	}
 	if (action == "uploads:each") {
 		step.upload_each = true;
+		return true;
+	}
+	if (action == "barriers:guest") {
+		step.guest_barriers = true;
 		return true;
 	}
 	if (action == "memsync:sync") {
@@ -1249,6 +1254,11 @@ bool ReadWaitWriter() {
 bool GlobalPm4Barriers() {
 	const auto* step = Current();
 	return step != nullptr && step->barriers_global;
+}
+
+bool GuestBarriers() {
+	const auto* step = Current();
+	return step != nullptr && step->guest_barriers;
 }
 
 bool UploadBatch() {
