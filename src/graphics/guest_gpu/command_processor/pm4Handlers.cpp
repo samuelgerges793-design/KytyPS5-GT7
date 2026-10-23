@@ -314,6 +314,10 @@ static void HwCtxSetDepthBoundsRegister(CommandProcessor& cp, uint32_t cmd_offse
 
 static void HwCtxSetDepthMetadataRegister(CommandProcessor& cp, uint32_t cmd_offset,
                                          uint32_t value) {
+	if (cmd_offset == Pm4::DB_COUNT_CONTROL) {
+		// Round 119: whether the draws count occlusion samples (OcclusionQueries).
+		cp.GetCtx().SetDbCountControl(value);
+	}
 	if (cmd_offset == Pm4::DB_RENDER_OVERRIDE) {
 		HW::DepthRenderOverride control;
 		control.force_z_valid       = (value & 0x20000000u) != 0;
@@ -1396,7 +1400,7 @@ KYTY_CP_OP_PARSER(CpOpRewind) {
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0005900);
 	EXIT_NOT_IMPLEMENTED((buffer[0] & ~0x81000000u) != 0);
 
-	cp.WaitForRewind((buffer[0] & 0x80000000u) != 0);
+	cp.WaitForRewind((buffer[0] & 0x80000000u) != 0, buffer);
 
 	return 1;
 }
@@ -2264,27 +2268,24 @@ KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
 KYTY_CP_OP_PARSER(CpOpMarker) {
 	KYTY_PROFILER_FUNCTION();
 
-	// EXIT_NOT_IMPLEMENTED(cmd_id != 0xC0001000);
-
-	uint32_t id     = buffer[0] & 0xfffu;
 	uint32_t len_dw = ((cmd_id >> 16u) & 0x3fffu);
 
-	switch (id) {
-		case 0x0: break;
-		case 0x4: cp.SetUserDataMarker(HW::UserSgprType::Vsharp); break;
-		case 0xd: cp.SetUserDataMarker(HW::UserSgprType::Region); break;
-		case 0x777: {
+	switch (buffer[0]) {
+		case 0x68750000: break;
+		case 0x68750004: cp.SetUserDataMarker(HW::UserSgprType::Vsharp); break;
+		case 0x6875000d: cp.SetUserDataMarker(HW::UserSgprType::Region); break;
+		case 0x68750777: {
 			cp.Flip();
 			break;
 		}
-		case 0x778: {
+		case 0x68750778: {
 			auto* addr =
 			    reinterpret_cast<void*>(buffer[1] | (static_cast<uint64_t>(buffer[2]) << 32u));
 			uint32_t value = buffer[3];
 			cp.Flip(addr, value);
 			break;
 		}
-		case 0x781: {
+		case 0x68750781: {
 			auto* addr =
 			    reinterpret_cast<void*>(buffer[1] | (static_cast<uint64_t>(buffer[2]) << 32u));
 			uint32_t value          = buffer[3];
@@ -2293,7 +2294,8 @@ KYTY_CP_OP_PARSER(CpOpMarker) {
 			cp.FlipWithInterrupt(eop_event_type, cache_action, addr, value);
 			break;
 		}
-		default: EXIT("unknown marker at %05" PRIx32 ": 0x%" PRIx32 "\n", num_dw - dw, id);
+		// NOP payloads are caller-owned data; only complete known marker tags execute.
+		default: break;
 	}
 
 	return len_dw + 1;

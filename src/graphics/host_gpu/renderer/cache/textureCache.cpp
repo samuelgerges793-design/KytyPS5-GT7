@@ -161,7 +161,9 @@ void ForgetLandedReadbacks(uint64_t address, uint64_t size) {
 [[nodiscard]] bool DecodeColorClear(const TextureCache::ImageDesc& desc, uint8_t code,
                                   vk::ClearColorValue& clear) {
 	const auto& metadata = desc.info.metadata;
-	const auto  format   = desc.view_info.format;
+	const auto  format   = desc.info.IsDepth()
+	                           ? TextureGetSurfaceFormatInfo(desc.info.guest_format).vk_format
+	                           : desc.view_info.format;
 	const bool  cmask    = metadata.kind == ImageMetadataKind::Cmask;
 	if (cmask ? code == 0 : code == 0x20) {
 		// Register clears belong to the color buffer; the texture pipe cannot decode them.
@@ -400,6 +402,55 @@ void ForgetLandedReadbacks(uint64_t address, uint64_t size) {
 		copy.imageExtent       = {info.extent.width, info.extent.height, 1};
 	}
 	return copies;
+}
+
+// Round 123: `info` (the requested image with the layers of the cached one it replaces) gets a
+// range that holds those layers: the requested slices, stacked from the same address (as a depth
+// target's are), and the stencil and HTile ranges likewise. False when the requested image is not
+// such a stack (another first address, mips, a range its layers do not divide), and the caller
+// keeps the requested layers.
+[[nodiscard]] bool GrowDepthLayers(ImageInfo& info, const ImageInfo& requested,
+                                   const ImageInfo& cached) {
+	const auto old_layers = requested.resources.layers;
+	const auto new_layers = info.resources.layers;
+	if (info.resources.levels != requested.resources.levels || requested.resources.levels != 1 ||
+	    old_layers == 0 || new_layers <= old_layers || info.IsVolume() ||
+	    requested.data.address != cached.data.address || requested.data.size % old_layers != 0 ||
+	    requested.mip_layout[0].offset != 0 ||
+	    requested.mip_layout[0].size != requested.data.size ||
+	    requested.stencil.size % old_layers != 0 ||
+	    requested.metadata.range.size % old_layers != 0) {
+		return false;
+	}
+	const auto grow = [&](GuestRange range) -> std::optional<GuestRange> {
+		if (range.Empty()) {
+			return range;
+		}
+		const auto slice = range.size / old_layers;
+		if (slice > UINT64_MAX / new_layers) {
+			return std::nullopt;
+		}
+		const GuestRange grown {range.address, slice * new_layers};
+		return grown.Valid() ? std::optional {grown} : std::nullopt;
+	};
+	const auto data     = grow(requested.data);
+	const auto stencil  = grow(requested.stencil);
+	const auto metadata = grow(requested.metadata.range);
+	if (!data || !stencil || !metadata) {
+		return false;
+	}
+	info.data               = *data;
+	info.stencil            = *stencil;
+	info.metadata.range     = *metadata;
+	info.mip_layout[0].size = data->size;
+	static std::atomic<uint32_t> logged {0};
+	if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+		LOGF("TextureCache: depth image 0x%012" PRIx64 " %ux%u of %u layers replaced for a "
+		     "binding of %u: the new one keeps %u layers, 0x%" PRIx64 " bytes (round 123)\n",
+		     requested.data.address, requested.extent.width, requested.extent.height,
+		     cached.resources.layers, old_layers, new_layers, data->size);
+	}
+	return true;
 }
 
 [[nodiscard]] std::vector<GpuTileInfo> BuildDepthTiles(const ImageInfo& info) {
@@ -1245,6 +1296,24 @@ void TextureCache::FreeImage(ImageId id, const char* why, bool copied) {
 	if (image.IsGpuModified()) {
 		image.ClearGpuModified();
 	}
+	// Its copies (SingleSampleDepth, SingleSampleStencil, SubExtentCopy) go with it.
+	for (auto* copies: {&m_single_sample_depths, &m_single_sample_stencils}) {
+		if (const auto copy = copies->find(id); copy != copies->end()) {
+			const auto copy_id = copy->second.copy;
+			copies->erase(copy);
+			if (copy_id) {
+				m_scheduler.DeferRelease([this, copy_id] { ReleaseImage(copy_id); });
+			}
+		}
+	}
+	if (const auto copies = m_sub_extent_copies.find(id); copies != m_sub_extent_copies.end()) {
+		for (const auto& entry: copies->second) {
+			if (const auto copy_id = entry.copy; copy_id) {
+				m_scheduler.DeferRelease([this, copy_id] { ReleaseImage(copy_id); });
+			}
+		}
+		m_sub_extent_copies.erase(copies);
+	}
 	DeleteImage(id);
 }
 
@@ -1376,24 +1445,275 @@ void TextureCache::UntrackImageTail(ImageId id) {
 	}
 }
 
-// KYTY_READBACK_SMALL_IMAGES_KB (default 64, 0: off): GPU-written linear images up to this size
-// are copied back to guest memory after each submission, as --readback-linear-images does for
+// KYTY_READBACK_SMALL_IMAGES_KB (default 32768 since round 126, 64 before; 0: off): GPU-written
+// linear images up to this size are copied back to guest memory after each submission, as
+// --readback-linear-images does for
 // every linear image. A small linear target or storage image nothing on the GPU reads is how a
 // game reads GPU results on the CPU: GT7 writes 16x16 and 32x32 reductions of its scene colour
 // and depth each frame for the CPU, which sets the white balance (and more) from them. Without
 // this the CPU read stale bytes; small render targets are never evicted, so never written back.
+// Round 126: a livery's pictures are drawn into a 1920x540 linear target (4 MB) twice, the halves
+// of the 1920x1080 picture the CPU encodes as PNG; with 64 KB that picture was noise, with 16 MB
+// right. 32 MB holds a 3840x2160 RGBA8 picture (a photo). The frames of a race write none above
+// 64 KB, so they read back what they did before.
 static uint64_t SmallReadbackBytes() {
 	static const uint64_t bytes = [] {
 		const char* value = std::getenv("KYTY_READBACK_SMALL_IMAGES_KB");
-		return (value != nullptr ? std::strtoull(value, nullptr, 10) : 64ull) << 10u;
+		return (value != nullptr ? std::strtoull(value, nullptr, 10) : 32768ull) << 10u;
 	}();
 	return bytes;
 }
+
+namespace {
+
+// Round 120 (KYTY_READBACK_PREFILL, default on; 0 turns it off). A read-back for the CPU lands in
+// guest memory once the host GPU has run the submission that drew it, but the guest may see the
+// GPU finish before that: labels and interrupts are written as they are recorded. A game thread
+// that reads the result at once takes what the memory held before. A game that takes its
+// read-backs from a ring of per-frame memory finds another kind of read-back there as often as
+// not (depth floats read as colour halves, values in the tens of thousands): its white balance,
+// set from a 16x16 reduction of the scene colour, went to its limit in tunnels, and the picture
+// turned green. So when a read-back is enrolled (its draw recorded, before any later label), its
+// guest memory gets the bytes the last read-back of its kind landed: a reader that comes early
+// takes the frame before's result instead. A kind is a format, a size, and the order among the
+// read-backs of that format and size in a frame (a game may make two of them a frame).
+struct ReadbackKind {
+	int32_t  format = 0;
+	uint32_t width  = 0;
+	uint32_t height = 0;
+	uint64_t size   = 0;
+	uint32_t index  = 0;
+
+	[[nodiscard]] bool operator<(const ReadbackKind& other) const noexcept {
+		return std::tie(format, width, height, size, index) <
+		       std::tie(other.format, other.width, other.height, other.size, other.index);
+	}
+	[[nodiscard]] bool operator==(const ReadbackKind& other) const noexcept {
+		return format == other.format && width == other.width && height == other.height &&
+		       size == other.size && index == other.index;
+	}
+};
+
+struct ReadbackPrefill {
+	std::mutex mutex;
+	// The GPU thread (enrolment) and the priority thread (landing), under the mutex.
+	std::map<ReadbackKind, std::vector<uint8_t>> latest;      // the last bytes each kind landed
+	std::map<uint64_t, ReadbackKind>             landed_kind; // the kind that last landed there
+	struct Enrolled {
+		ReadbackKind kind;
+		uint64_t     ns = 0; // when its draw was recorded
+	};
+	std::map<uint64_t, Enrolled> enrolled;
+	// The GPU thread only: the read-backs of this frame, and how many of each format and size.
+	uint64_t                         frame = UINT64_MAX;
+	std::unordered_set<uint64_t>     frame_addresses;
+	std::map<ReadbackKind, uint32_t> frame_counts;
+	// Statistics (under the mutex), logged every 10 s.
+	uint64_t since_ns    = 0;
+	uint64_t enrolments  = 0;
+	uint64_t other_kind  = 0; // held a read-back of another kind
+	uint64_t other_bytes = 0; // held bytes no read-back landed
+	uint64_t older_own   = 0; // held an older read-back of its kind
+	uint64_t already     = 0; // held the latest of its kind
+	uint64_t first       = 0; // no read-back of its kind had landed yet
+	uint64_t written     = 0;
+	uint64_t landed      = 0;
+	uint64_t landed_ns   = 0;
+	uint64_t longest_ns  = 0;
+	uint64_t dropped     = 0;
+};
+
+ReadbackPrefill& GetReadbackPrefill() {
+	// Never destroyed: read-backs may still land during static destruction.
+	static auto* prefill = new ReadbackPrefill;
+	return *prefill;
+}
+
+bool ReadbackPrefillEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_READBACK_PREFILL");
+		const bool  on    = value == nullptr || value[0] != '0';
+		LOGF("Read-backs for the CPU: %s (KYTY_READBACK_PREFILL)\n",
+		     on ? "until one lands, its guest memory holds the last of its kind"
+		        : "guest memory keeps what it held until a read-back lands");
+		return on;
+	}();
+	return enabled;
+}
+
+// Under the mutex: every 10 s, what the read-backs' guest memory held when they were enrolled.
+void LogReadbackPrefill(ReadbackPrefill& prefill, uint64_t now_ns) {
+	if (prefill.since_ns == 0) {
+		prefill.since_ns = now_ns;
+		return;
+	}
+	if (now_ns - prefill.since_ns < 10'000'000'000ull) {
+		return;
+	}
+	const bool on = ReadbackPrefillEnabled();
+	LOGF("Read-backs for the CPU (%.0f s): %" PRIu64 " new; before they landed, their memory held "
+	     "another kind of read-back in %" PRIu64 ", bytes no read-back left in %" PRIu64
+	     ", an older one of their kind in %" PRIu64 " (%s %" PRIu64
+	     " of these the last bytes of their kind), the latest of their kind in %" PRIu64
+	     ", and %" PRIu64 " were the first of their kind; %" PRIu64
+	     " landed, %.2f ms after their draw on average (longest %.2f ms), %" PRIu64
+	     " dropped (the guest wrote there first)\n",
+	     static_cast<double>(now_ns - prefill.since_ns) / 1e9, prefill.enrolments,
+	     prefill.other_kind, prefill.other_bytes, prefill.older_own,
+	     on ? "gave" : "would have given (KYTY_READBACK_PREFILL=0)", prefill.written,
+	     prefill.already, prefill.first, prefill.landed,
+	     prefill.landed != 0
+	         ? static_cast<double>(prefill.landed_ns) / 1e6 / static_cast<double>(prefill.landed)
+	         : 0.0,
+	     static_cast<double>(prefill.longest_ns) / 1e6, prefill.dropped);
+	prefill.since_ns    = now_ns;
+	prefill.enrolments  = 0;
+	prefill.other_kind  = 0;
+	prefill.other_bytes = 0;
+	prefill.older_own   = 0;
+	prefill.already     = 0;
+	prefill.first       = 0;
+	prefill.written     = 0;
+	prefill.landed      = 0;
+	prefill.landed_ns   = 0;
+	prefill.longest_ns  = 0;
+	prefill.dropped     = 0;
+}
+
+// GPU thread: a small read-back enrolled in `frame` (presented frames so far).
+void PrefillReadback(const ImageInfo& info, uint64_t frame) {
+	const auto range = info.data;
+	if (range.Empty() || range.size > SmallReadbackBytes() || info.samples != 1) {
+		return;
+	}
+	(void)ReadbackPrefillEnabled(); // logs the setting at the first read-back
+	auto& prefill = GetReadbackPrefill();
+	if (prefill.frame != frame) {
+		prefill.frame = frame;
+		prefill.frame_addresses.clear();
+		prefill.frame_counts.clear();
+	}
+	if (!prefill.frame_addresses.insert(range.address).second) {
+		// Drawn again in a later submission of the frame: its first read-back may have landed.
+		return;
+	}
+	ReadbackKind kind;
+	kind.format = static_cast<int32_t>(info.pixel_format);
+	kind.width  = info.extent.width;
+	kind.height = info.extent.height;
+	kind.size   = range.size;
+	kind.index  = prefill.frame_counts[kind]++;
+
+	std::vector<uint8_t> current(static_cast<size_t>(range.size));
+	const bool           readable =
+	    LibKernel::Memory::TryReadBacking(range.address, current.data(), range.size);
+	const auto own_hash = LandedReadbackHash(range.address);
+	const auto now_ns   = LibKernel::Memory::JournalNowNs();
+
+	std::lock_guard lock(prefill.mutex);
+	prefill.enrolments++;
+	prefill.enrolled[range.address] = {kind, now_ns};
+	LogReadbackPrefill(prefill, now_ns);
+	const auto latest = prefill.latest.find(kind);
+	if (!readable || latest == prefill.latest.end() || latest->second.size() != current.size()) {
+		prefill.first++;
+		return;
+	}
+	if (current == latest->second) {
+		prefill.already++;
+		return;
+	}
+	const auto landed = prefill.landed_kind.find(range.address);
+	if (own_hash == 0 || landed == prefill.landed_kind.end() ||
+	    HashBytes(current.data(), current.size()) != own_hash) {
+		prefill.other_bytes++;
+	} else if (landed->second.format != kind.format || landed->second.size != kind.size ||
+	           landed->second.width != kind.width || landed->second.height != kind.height) {
+		prefill.other_kind++;
+	} else {
+		prefill.older_own++;
+	}
+	prefill.written++;
+	if (ReadbackPrefillEnabled()) {
+		const LibKernel::Memory::WriteSourceScope source(
+		    LibKernel::Memory::WriteSource::ImageWriteBack);
+		(void)LibKernel::Memory::TryWriteBacking(range.address, latest->second.data(),
+		                                         latest->second.size());
+	}
+}
+
+// Priority thread: a small read-back landed (its bytes are in guest memory now), or was dropped.
+void NoteReadbackLanded(uint64_t address, const uint8_t* bytes, uint64_t size, bool dropped) {
+	auto&           prefill = GetReadbackPrefill();
+	const auto      now_ns  = LibKernel::Memory::JournalNowNs();
+	std::lock_guard lock(prefill.mutex);
+	const auto      enrolled = prefill.enrolled.find(address);
+	if (enrolled == prefill.enrolled.end() || enrolled->second.kind.size != size) {
+		return;
+	}
+	if (dropped) {
+		prefill.dropped++;
+	} else {
+		prefill.latest[enrolled->second.kind].assign(bytes, bytes + size);
+		prefill.landed_kind[address] = enrolled->second.kind;
+		const auto waited            = now_ns - std::min(now_ns, enrolled->second.ns);
+		prefill.landed++;
+		prefill.landed_ns += waited;
+		prefill.longest_ns = std::max(prefill.longest_ns, waited);
+	}
+	prefill.enrolled.erase(enrolled);
+}
+
+// Guest memory unmapped.
+void ForgetReadbackPrefill(uint64_t address, uint64_t size) {
+	auto&           prefill = GetReadbackPrefill();
+	std::lock_guard lock(prefill.mutex);
+	prefill.landed_kind.erase(prefill.landed_kind.lower_bound(address),
+	                          prefill.landed_kind.lower_bound(address + size));
+	prefill.enrolled.erase(prefill.enrolled.lower_bound(address),
+	                       prefill.enrolled.lower_bound(address + size));
+}
+
+} // namespace
 
 bool TextureCache::ReadsBackForCpu(const ImageInfo& info) const {
 	return !info.IsTiled() && !info.data.Empty() &&
 	       (m_readback_linear_images ||
 	        (info.data.size <= SmallReadbackBytes() && info.samples == 1));
+}
+
+std::vector<std::string> TextureCache::DescribeImagesInRange(uint64_t address, uint64_t size,
+                                                             size_t count) {
+	std::vector<std::string> lines;
+	std::scoped_lock         lock {m_lock};
+	const auto               ids = FindImagesInRegion(address, size, false);
+	for (const auto id: ids) {
+		if (lines.size() >= count) {
+			break;
+		}
+		const auto* image = m_slot_images.try_get(id);
+		if (image == nullptr) {
+			continue;
+		}
+		const auto& info = image->info;
+		lines.push_back(fmt::format(
+		    "0x{:012x}+0x{:x} {}x{}x{} layers {} mips {} fmt {} guest {} tile {} samples "
+		    "{}{}{}{}{}{}, {}",
+		    info.data.address, info.data.size, info.extent.width, info.extent.height,
+		    info.extent.depth, info.resources.layers, info.resources.levels,
+		    static_cast<int>(info.pixel_format), static_cast<uint32_t>(info.guest_format),
+		    static_cast<uint32_t>(info.tile_mode), info.samples,
+		    image->registered ? "" : ", unregistered",
+		    image->IsGpuModified() ? ", GPU-written" : "", image->gpu_pixels ? ", GPU pixels" : "",
+		    image->IsCpuDirty() ? ", CPU-dirty" : "",
+		    image->usage.render_target ? ", a render target" : "",
+		    ReadsBackForCpu(info) ? "read back for the CPU after each submission"
+		                          : "not read back for the CPU after each submission"));
+	}
+	if (ids.size() > lines.size()) {
+		lines.push_back(fmt::format("{} more", ids.size() - lines.size()));
+	}
+	return lines;
 }
 
 void TextureCache::TrackImageDownload(ImageId id, Image& image) {
@@ -1403,7 +1723,10 @@ void TextureCache::TrackImageDownload(ImageId id, Image& image) {
 	if (!image.IsGpuModified()) {
 		EXIT("TextureCache: cannot enroll a non-GPU-owned image for download\n");
 	}
-	m_download_images.insert(id);
+	const bool added = m_download_images.insert(id).second;
+	if (added) {
+		PrefillReadback(image.info, m_graphics.presented_frames.load(std::memory_order_relaxed));
+	}
 	if (!m_readback_linear_images) {
 		// The first images read back, each once (under m_lock).
 		static std::unordered_set<uint64_t> logged;
@@ -1414,7 +1737,7 @@ void TextureCache::TrackImageDownload(ImageId id, Image& image) {
 			     image.info.extent.height, static_cast<int>(image.info.pixel_format),
 			     logged.size() == 1
 			         ? " (GPU-written linear images up to KYTY_READBACK_SMALL_IMAGES_KB, default "
-			           "64, go back to guest memory after each submission)"
+			           "32768, go back to guest memory after each submission)"
 			         : "");
 		}
 	}
@@ -1431,6 +1754,13 @@ TextureCache::DiagnosticState TextureCache::DiagnosticImageState(ImageId id) {
 	state.gpu_written  = image->IsGpuModified();
 	state.buffer_write = image->IsBufferModified();
 	state.cpu_dirty    = image->IsCpuDirty();
+	state.data         = image->info.data;
+	state.extent       = image->info.extent;
+	state.levels       = image->info.resources.levels;
+	state.layers       = image->info.resources.layers;
+	state.host_width   = image->backing.extent.width;
+	state.host_height  = image->backing.extent.height;
+	state.format       = image->info.pixel_format;
 	if (!image->registered || image->info.data.Empty()) {
 		return state;
 	}
@@ -1748,6 +2078,14 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 		info.mip_layout = cached.info.mip_layout;
 	} else {
 		info.resources = std::max(requested.resources, cached.info.resources);
+		// Round 123: the layers of the image it replaces, in a range that holds them. Before,
+		// a depth binding of one slice over a depth image of four (the livery editor saving a
+		// livery) made an image of four layers in the range of one, and its first upload ended
+		// the emulator in the tiler (a 512x512 32-bit slice in 256 KB).
+		if (info.resources != requested.resources &&
+		    !GrowDepthLayers(info, requested, cached.info)) {
+			info.resources = requested.resources;
+		}
 	}
 	info.htile_clear_mask     = 0;
 	const auto replacement_id = InsertImage(info);
@@ -1865,6 +2203,8 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		if (requested.type != cached.info.type) {
 			return {merged_id};
 		}
+		// A texture smaller than the image with the same layout is viewed through the image here;
+		// its binding reads a copy of the image's corner (SubExtentCopy, round 124).
 		if (requested.pixel_format != cached.info.pixel_format ||
 		    requested.data.size <= cached.info.data.size) {
 			const auto result_id = merged_id ? merged_id : cached_id;
@@ -2165,6 +2505,22 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 	}
 	const auto          layers          = info.resources.layers;
 	const auto          full_slice_size = info.data.size / layers;
+	// Round 123: a slice its range cannot hold (an image made with more layers than its range
+	// has room for) is left as it is rather than ending the emulator in the tiler.
+	if (const uint64_t slice_bytes =
+	        static_cast<uint64_t>(info.pitch) * info.extent.height * info.bytes_per_block;
+	    info.extent.height == 0 || slice_bytes > full_slice_size) {
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+			LOGF("TextureCache: depth %s 0x%012" PRIx64 "+0x%" PRIx64
+			     " %ux%u pitch %u, %u bytes a texel, %u layers: a slice needs 0x%" PRIx64
+			     " bytes and has 0x%" PRIx64 "; not uploaded (round 123)\n",
+			     image.depth_id ? "stencil" : "image", info.data.address, info.data.size,
+			     info.extent.width, info.extent.height, info.pitch, info.bytes_per_block, layers,
+			     slice_bytes, full_slice_size);
+		}
+		return;
+	}
 	auto copies = BuildDepthCopies(info, full_slice_size, image.depth_id
 	                                                        ? vk::ImageAspectFlagBits::eStencil
 	                                                        : vk::ImageAspectFlagBits::eDepth);
@@ -3199,9 +3555,16 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		}
 		{
 			std::scoped_lock lock {m_lock};
-			ClearImage(m_scheduler.Current(), id, view.format,
-			           {vk::ImageAspectFlagBits::eColor, view.base_level, view.level_count,
-			            image_first + slice, 1}, clear);
+			const auto&      cleared = m_slot_images[id];
+			const bool       depth   = cleared.info.IsDepth();
+			if (depth) {
+				const auto value   = clear.color.float32[0];
+				clear.depthStencil = vk::ClearDepthStencilValue {value, 0u};
+			}
+			ClearImage(m_scheduler.Current(), id, depth ? cleared.backing.format : view.format,
+			           {depth ? vk::ImageAspectFlagBits::eDepth : vk::ImageAspectFlagBits::eColor,
+			            view.base_level, view.level_count, image_first + slice, 1},
+			           clear);
 		}
 		// Publish the conversion's expanded keys without treating them as guest writes
 		// to overlapping image data. Invalidate the buffer before updating its backing.
@@ -4348,7 +4711,18 @@ void TextureCache::DownloadDepth(Image& image, Buffer& destination, uint64_t des
 	const uint64_t guest_slice    = texels_per_slice * info.bytes_per_block;
 	EXIT_NOT_IMPLEMENTED(transfer_slice > UINT64_MAX / layers);
 	const uint64_t transfer_size = transfer_slice * layers;
-	EXIT_NOT_IMPLEMENTED(guest_slice > full_slice_size);
+	if (guest_slice > full_slice_size) {
+		// Round 123: as in UploadImage, a slice its range cannot hold is not written back.
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+			LOGF("TextureCache: depth image 0x%012" PRIx64 "+0x%" PRIx64
+			     " %ux%u, %u layers: a slice needs 0x%" PRIx64 " bytes and has 0x%" PRIx64
+			     "; not written back (round 123)\n",
+			     info.data.address, info.data.size, info.extent.width, info.extent.height, layers,
+			     guest_slice, full_slice_size);
+		}
+		return;
+	}
 	auto copies = BuildDepthCopies(info, full_slice_size, vk::ImageAspectFlagBits::eDepth);
 	if (transfer_bytes == info.bytes_per_block) {
 		if (!info.IsTiled()) {
@@ -4626,6 +5000,7 @@ bool TextureCache::DownloadImageMemory(ImageId id, bool evicting,
 				     " size=0x%" PRIx64 ": the guest wrote the bytes after it was recorded\n",
 				     range.address, range.size);
 			}
+			NoteReadbackLanded(range.address, mapped, range.size, true);
 			return;
 		}
 		const LibKernel::Memory::WriteSourceScope source(
@@ -4633,6 +5008,7 @@ bool TextureCache::DownloadImageMemory(ImageId id, bool evicting,
 		LibKernel::Memory::WriteBacking(range.address, mapped, range.size);
 		if (readback_guard) {
 			NoteLandedReadback(range.address, mapped, range.size);
+			NoteReadbackLanded(range.address, mapped, range.size, false);
 		}
 	});
 	return true;
@@ -6396,6 +6772,7 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 	}
 	std::scoped_lock lock {m_lock};
 	ForgetLandedReadbacks(address, size);
+	ForgetReadbackPrefill(address, size);
 	for (auto metadata = m_surface_metas.begin(); metadata != m_surface_metas.end();) {
 		const auto base = metadata->first;
 		if (base >= address && base < address + size) {
@@ -6773,6 +7150,303 @@ void TextureCache::SetBindlessEvictable(std::span<const ImageId> ids) {
 	std::scoped_lock lock {m_lock};
 	m_bindless_evictable.clear();
 	m_bindless_evictable.insert(ids.begin(), ids.end());
+}
+
+bool TextureCache::ReadbacksOnTheirWay() {
+	{
+		std::scoped_lock lock {m_lock};
+		if (!m_download_images.empty()) {
+			return true;
+		}
+	}
+	std::lock_guard lock(m_pending_writebacks->mutex);
+	return !m_pending_writebacks->ranges.empty();
+}
+
+namespace {
+
+// KYTY_MS_DEPTH_SAMPLE0=0: single-sample reads of multisample depth and stencil make no copy.
+// Since round 124 the shader's image is a single-sample one there, and a multisample image bound
+// to it is a mismatch Vulkan leaves undefined, so those reads get a null texture: for comparisons
+// only.
+bool MsDepthSample0Enabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_MS_DEPTH_SAMPLE0");
+		const bool  on    = value == nullptr || value[0] != '0';
+		LOGF("Multisample depth read as single-sample: %s (KYTY_MS_DEPTH_SAMPLE0)\n",
+		     on ? "from a copy of its first sample" : "a null texture (no copy)");
+		return on;
+	}();
+	return enabled;
+}
+
+// The reads and copies of SingleSampleDepth and SingleSampleStencil, logged every 10 s.
+struct SingleSampleStats {
+	uint64_t                              depth_reads    = 0;
+	uint64_t                              depth_copies   = 0;
+	uint64_t                              stencil_reads  = 0;
+	uint64_t                              stencil_copies = 0;
+	std::chrono::steady_clock::time_point since          = std::chrono::steady_clock::now();
+};
+SingleSampleStats g_single_sample_stats;
+
+void LogSingleSampleStats(size_t depth_images, size_t stencil_images) {
+	auto&      stats = g_single_sample_stats;
+	const auto now   = std::chrono::steady_clock::now();
+	if (now - stats.since < std::chrono::seconds(10)) {
+		return;
+	}
+	LOGF("Multisample depth read as single-sample (%.0f s): %" PRIu64 " depth reads, %" PRIu64
+	     " copies of the first sample (%zu depth images); %" PRIu64 " stencil reads, %" PRIu64
+	     " copies (%zu stencil planes)\n",
+	     std::chrono::duration<double>(now - stats.since).count(), stats.depth_reads,
+	     stats.depth_copies, depth_images, stats.stencil_reads, stats.stencil_copies,
+	     stencil_images);
+	stats = {};
+}
+
+} // namespace
+
+ImageId TextureCache::SingleSampleDepth(ImageId id) {
+	if (!MsDepthSample0Enabled()) {
+		return id;
+	}
+	std::scoped_lock lock {m_lock};
+	const auto*      source = m_slot_images.try_get(id);
+	if (source == nullptr || source->backing.samples <= 1 || !source->info.IsDepth() ||
+	    source->backing.image == nullptr || source->backing.image_type != vk::ImageType::e2D ||
+	    source->info.resources.layers == 0 ||
+	    source->info.resources.layers != source->backing.layers ||
+	    source->info.resources.levels != 1 || source->depth_id) {
+		return id;
+	}
+	// What FindTexture does with an image it binds, done here for the source the copy is made
+	// from: its use is noted, and what the CPU or a buffer write put in its memory is uploaded
+	// first (which changes its content serial, so the copy is made again).
+	TouchImage(m_slot_images[id]);
+	if (source->registered && !source->binding.needs_rebind) {
+		RefreshImage(id);
+		source = &m_slot_images[id];
+	}
+	const auto width  = source->info.extent.width;
+	const auto height = source->info.extent.height;
+	const auto layers = source->info.resources.layers;
+	auto&      entry  = m_single_sample_depths[id];
+	auto*      copy   = entry.copy ? m_slot_images.try_get(entry.copy) : nullptr;
+	if (copy == nullptr || copy->info.extent.width != width || copy->info.extent.height != height ||
+	    copy->info.resources.layers != layers) {
+		if (copy != nullptr) {
+			const auto old = entry.copy;
+			m_scheduler.DeferRelease([this, old] { ReleaseImage(old); });
+		}
+		ImageInfo info {};
+		info.pixel_format    = vk::Format::eD32Sfloat;
+		info.guest_format    = source->info.guest_format;
+		info.type            = source->info.type;
+		info.extent          = {width, height, 1};
+		info.resources       = {1, layers};
+		info.pitch           = width;
+		info.bytes_per_block = 4;
+		info.samples         = 1;
+		info.tile_mode       = Prospero::TileMode::kLinear;
+		info.mip_layout[0]   = {0, uint64_t {width} * height * 4u, width, height};
+		const auto guest     = source->info.data.address;
+		const auto samples   = source->backing.samples;
+		entry.copy           = InsertImage(info);
+		entry.serial         = UINT64_MAX;
+		copy                 = &m_slot_images[entry.copy];
+		source               = &m_slot_images[id];
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+			LOGF("Multisample depth read as single-sample: 0x%012" PRIx64 " %ux%u, %u layers, %u "
+			     "samples: read from a copy of its first sample\n",
+			     guest, width, height, layers, samples);
+		}
+	}
+	copy->tick_accessed_last = m_scheduler.CurrentTick();
+	g_single_sample_stats.depth_reads++;
+	if (entry.serial != source->content_serial) {
+		m_blit_helper.CopyMsDepthSample0(m_slot_images[id], *copy);
+		entry.serial = m_slot_images[id].content_serial;
+		g_single_sample_stats.depth_copies++;
+	}
+	LogSingleSampleStats(m_single_sample_depths.size(), m_single_sample_stencils.size());
+	return entry.copy;
+}
+
+ImageId TextureCache::SingleSampleStencil(ImageId depth_id) {
+	if (!MsDepthSample0Enabled()) {
+		return depth_id;
+	}
+	std::scoped_lock lock {m_lock};
+	const auto*      source = m_slot_images.try_get(depth_id);
+	if (source == nullptr || source->backing.samples <= 1 || !source->info.IsDepth() ||
+	    !HasStencilAspect(source->backing.format) || source->backing.image == nullptr ||
+	    source->backing.image_type != vk::ImageType::e2D || source->info.resources.layers == 0 ||
+	    source->info.resources.layers != source->backing.layers ||
+	    source->info.resources.levels != 1 || source->depth_id) {
+		return depth_id;
+	}
+	// As SingleSampleDepth (FindTexture's refresh), for the depth image and its stencil planes.
+	TouchImage(m_slot_images[depth_id]);
+	if (source->registered && !source->binding.needs_rebind) {
+		RefreshImage(depth_id);
+		const auto stencil_ids = m_slot_images[depth_id].stencil_ids;
+		for (const auto stencil_id: stencil_ids) {
+			if (const auto* stencil = m_slot_images.try_get(stencil_id);
+			    stencil != nullptr && stencil->depth_id == depth_id) {
+				RefreshImage(stencil_id);
+			}
+		}
+		source = &m_slot_images[depth_id];
+	}
+	// What the stencil holds changes with the depth image (its draws, clears and copies) and with
+	// its stencil planes (their own clears and uploads).
+	const auto serial_of = [&](const Image& depth) {
+		uint64_t serial = depth.content_serial;
+		for (const auto stencil_id: depth.stencil_ids) {
+			if (const auto* stencil = m_slot_images.try_get(stencil_id); stencil != nullptr) {
+				serial = serial * 31u + stencil->content_serial + 1u;
+			}
+		}
+		return serial;
+	};
+	const auto width  = source->info.extent.width;
+	const auto height = source->info.extent.height;
+	const auto layers = source->info.resources.layers;
+	auto&      entry  = m_single_sample_stencils[depth_id];
+	auto*      copy   = entry.copy ? m_slot_images.try_get(entry.copy) : nullptr;
+	if (copy == nullptr || copy->info.extent.width != width || copy->info.extent.height != height ||
+	    copy->info.resources.layers != layers) {
+		if (copy != nullptr) {
+			const auto old = entry.copy;
+			m_scheduler.DeferRelease([this, old] { ReleaseImage(old); });
+		}
+		ImageInfo info {};
+		info.pixel_format    = vk::Format::eR8Uint;
+		info.guest_format    = Prospero::BufferFormat::k8UInt;
+		info.type            = source->info.type;
+		info.extent          = {width, height, 1};
+		info.resources       = {1, layers};
+		info.pitch           = width;
+		info.bytes_per_block = 1;
+		info.samples         = 1;
+		info.tile_mode       = Prospero::TileMode::kLinear;
+		info.mip_layout[0]   = {0, uint64_t {width} * height, width, height};
+		const auto guest     = source->info.data.address;
+		const auto samples   = source->backing.samples;
+		entry.copy           = InsertImage(info);
+		entry.serial         = UINT64_MAX;
+		copy                 = &m_slot_images[entry.copy];
+		source               = &m_slot_images[depth_id];
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+			LOGF("Multisample depth read as single-sample: the stencil of 0x%012" PRIx64
+			     " %ux%u, %u layers, %u samples: read from a copy of its first sample\n",
+			     guest, width, height, layers, samples);
+		}
+	}
+	copy->tick_accessed_last = m_scheduler.CurrentTick();
+	g_single_sample_stats.stencil_reads++;
+	if (const auto serial = serial_of(*source); entry.serial != serial) {
+		m_blit_helper.CopyMsStencilSample0(m_slot_images[depth_id], *copy);
+		entry.serial = serial;
+		g_single_sample_stats.stencil_copies++;
+	}
+	LogSingleSampleStats(m_single_sample_depths.size(), m_single_sample_stencils.size());
+	return entry.copy;
+}
+
+ImageId TextureCache::SubExtentCopy(ImageId id, const ImageInfo& requested) {
+	std::scoped_lock lock {m_lock};
+	const auto*      source = m_slot_images.try_get(id);
+	if (source == nullptr || !source->registered || source->depth_id ||
+	    source->backing.image == nullptr || source->binding.needs_rebind) {
+		return id;
+	}
+	const auto& info = source->info;
+	if (info.data.Empty() || info.IsDepth() || info.HasStencil() || info.IsBlock() ||
+	    info.IsVolume() || source->backing.samples != 1 ||
+	    source->backing.image_type != vk::ImageType::e2D || requested.samples != 1 ||
+	    requested.type != info.type || requested.data.address != info.data.address ||
+	    requested.data.size != info.data.size || requested.tile_mode != info.tile_mode ||
+	    requested.resources != info.resources || requested.resources.levels != 1 ||
+	    requested.extent.depth != info.extent.depth || requested.extent.width == 0 ||
+	    requested.extent.height == 0 || requested.extent.width > info.extent.width ||
+	    requested.extent.height > info.extent.height ||
+	    (requested.extent.width == info.extent.width &&
+	     requested.extent.height == info.extent.height) ||
+	    !ImageViewOps::FormatsCompatible(info.pixel_format, requested.pixel_format)) {
+		return id;
+	}
+	// FindTexture's refresh of an image it binds, for the image the copy is made from (an upload
+	// changes its content serial, so the copy is made again).
+	TouchImage(m_slot_images[id]);
+	RefreshImage(id);
+	source            = &m_slot_images[id];
+	const auto width  = requested.extent.width;
+	const auto height = requested.extent.height;
+	const auto tick   = m_scheduler.CurrentTick();
+	auto&      copies = m_sub_extent_copies[id];
+	size_t     index  = copies.size();
+	for (size_t i = 0; i < copies.size(); i++) {
+		if (copies[i].width == width && copies[i].height == height &&
+		    m_slot_images.try_get(copies[i].copy) != nullptr) {
+			index = i;
+			break;
+		}
+	}
+	if (index == copies.size()) {
+		// At most 4 extents an image: the one used longest ago goes.
+		if (copies.size() >= 4) {
+			size_t oldest = 0;
+			for (size_t i = 1; i < copies.size(); i++) {
+				if (copies[i].used < copies[oldest].used) {
+					oldest = i;
+				}
+			}
+			if (const auto old = copies[oldest].copy; old) {
+				m_scheduler.DeferRelease([this, old] { ReleaseImage(old); });
+			}
+			copies.erase(copies.begin() + static_cast<std::ptrdiff_t>(oldest));
+		}
+		ImageInfo copy_info {};
+		copy_info.pixel_format    = source->info.pixel_format;
+		copy_info.guest_format    = source->info.guest_format;
+		copy_info.type            = source->info.type;
+		copy_info.extent          = {width, height, source->info.extent.depth};
+		copy_info.resources       = source->info.resources;
+		copy_info.pitch           = width;
+		copy_info.bytes_per_block = source->info.bytes_per_block;
+		copy_info.samples         = 1;
+		copy_info.tile_mode       = Prospero::TileMode::kLinear;
+		copy_info.bgra16          = source->info.bgra16;
+		copy_info.mip_layout[0]   = {0, uint64_t {width} * height * source->info.bytes_per_block,
+		                             width, height};
+		const auto guest          = source->info.data.address;
+		const auto source_width   = source->info.extent.width;
+		const auto source_height  = source->info.extent.height;
+		const auto copy_id        = InsertImage(copy_info);
+		copies.push_back({copy_id, width, height, UINT64_MAX, tick});
+		index  = copies.size() - 1;
+		source = &m_slot_images[id];
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+			LOGF("TextureCache: 0x%012" PRIx64 " %ux%u read as a %ux%u texture (same memory and "
+			     "tiling): from a copy of that corner (round 124)\n",
+			     guest, source_width, source_height, width, height);
+		}
+	}
+	auto& entry             = copies[index];
+	auto& copy              = m_slot_images[entry.copy];
+	entry.used              = tick;
+	copy.tick_accessed_last = tick;
+	if (entry.serial != m_slot_images[id].content_serial) {
+		// Within both images: the corner of the source the copy's extent covers.
+		copy.CopyImage(m_slot_images[id]);
+		entry.serial = m_slot_images[id].content_serial;
+	}
+	return entry.copy;
 }
 
 void TextureCache::ProcessDownloadImages() {

@@ -23,11 +23,26 @@ public:
 	KYTY_CLASS_NO_COPY(BlitHelper);
 
 	void ReinterpretColorAsMsDepth(Image& source, Image& destination);
+	// Round 122: the first sample of a multisample depth image into a single-sample depth image
+	// of its size (a D32 one), for texture reads that see it as single-sample. Round 124:
+	// recorded through the command recorder (no drain of the recording thread).
+	void CopyMsDepthSample0(Image& source, Image& destination);
+	// Round 124: the first sample of a multisample depth/stencil image's stencil into a
+	// single-sample R8_UINT colour image of its size, for texture reads of the stencil that see
+	// it as single-sample.
+	void CopyMsStencilSample0(Image& source, Image& destination);
 
 private:
+	// The fragment shader a pipeline runs, and what it writes.
+	enum class PipelineKind : uint32_t {
+		ColorToMsDepth,   // a colour image's texels as depth samples (depth attachment)
+		MsDepthSample0,   // a multisample depth image's first sample (depth attachment)
+		MsStencilSample0, // a multisample stencil's first sample (R8_UINT colour attachment)
+	};
 	struct PipelineKey {
-		uint32_t   samples = 1;
-		vk::Format format  = vk::Format::eUndefined;
+		uint32_t     samples = 1;
+		vk::Format   format  = vk::Format::eUndefined;
+		PipelineKind kind    = PipelineKind::ColorToMsDepth;
 
 		auto operator<=>(const PipelineKey&) const = default;
 	};
@@ -45,6 +60,8 @@ private:
 	vk::PipelineLayout      m_pipeline_layout   = nullptr;
 	vk::ShaderModule        m_vertex_shader     = nullptr;
 	vk::ShaderModule        m_fragment_shader   = nullptr;
+	vk::ShaderModule        m_sample0_shader    = nullptr;
+	vk::ShaderModule        m_stencil0_shader   = nullptr;
 	std::vector<Pipeline>   m_pipelines;
 };
 

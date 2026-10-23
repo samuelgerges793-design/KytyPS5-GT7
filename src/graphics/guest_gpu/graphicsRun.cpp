@@ -18,8 +18,10 @@
 #include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/drawPrep.h"
 #include "graphics/host_gpu/renderer/frameGraph.h"
+#include "graphics/host_gpu/renderer/occlusionQueries.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/rendererLock.h"
 #include "graphics/host_gpu/renderer/sync.h"
 #include "graphics/host_gpu/timeline.h"
 #include "graphics/presentation/videoOut.h"
@@ -500,11 +502,51 @@ void CommandProcessor::WaitDeDiff(uint32_t diff) {
 	}
 }
 
-void CommandProcessor::WaitForRewind(bool valid) {
-	if (!valid) {
+void CommandProcessor::WaitForRewind(bool valid, const uint32_t* packet) {
+	const bool compute = m_interrupt_event_id != 0;
+	if (valid) {
+		if (compute && packet == m_rewind_packet && !m_rewind_released) {
+			// The CPU released a REWIND this queue waited at: its rewinds work.
+			m_rewind_released = true;
+			LOGF("PM4: compute queue 0x%x: the CPU released the REWIND at %p it waited at "
+			     "(round 124)\n",
+			     static_cast<unsigned>(m_interrupt_event_id), static_cast<const void*>(packet));
+		}
+	} else if (!compute) {
 		SuspendPm4();
 		return;
+	} else if (!m_rewind_waits_off) {
+		// The time this packet was polled: a longer gap between two polls (the host busy
+		// elsewhere, compiling pipelines or paused) counts as 250 ms.
+		const auto now = std::chrono::steady_clock::now();
+		if (packet != m_rewind_packet) {
+			m_rewind_packet = packet;
+			m_rewind_waited = {};
+		} else {
+			m_rewind_waited += std::min<std::chrono::steady_clock::duration>(
+			    now - m_rewind_polled, std::chrono::milliseconds(250));
+		}
+		m_rewind_polled = now;
+		if (m_rewind_waited < std::chrono::seconds(3)) {
+			SuspendPm4();
+			return;
+		}
+		const auto releases = Gen5::AcbRewindReleases();
+		const bool released = m_rewind_released || releases != 0;
+		if (released && ++m_rewind_timeouts < 8) {
+			LOGF("PM4: compute queue 0x%x waited 3 s at the REWIND at %p: passed (timeout %u of "
+			     "8; the CPU released %" PRIu64 " ACB rewinds so far, round 124)\n",
+			     static_cast<unsigned>(m_interrupt_event_id), static_cast<const void*>(packet),
+			     m_rewind_timeouts, releases);
+		} else {
+			m_rewind_waits_off = true;
+			LOGF("PM4: compute queue 0x%x waited 3 s at the REWIND at %p, %s: it no longer waits "
+			     "at REWINDs (round 124)\n",
+			     static_cast<unsigned>(m_interrupt_event_id), static_cast<const void*>(packet),
+			     released ? "its eighth timeout" : "and the CPU has released no rewind");
+		}
 	}
+	m_rewind_packet = nullptr;
 	// The CPU let the GPU go on, as a WAIT_REG_MEM that passes (round 90).
 	g_guest_wait_seq.fetch_add(1, std::memory_order_relaxed);
 	GpuPhases::Count(GpuPhases::Phase::WaitPassed, 1);
@@ -1664,7 +1706,26 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 		default: EXIT("unknown interrupt_selector\n");
 	}
 
-	const bool at_completion = !with_interrupt && GuestGpu::LabelsAtCompletion();
+	// Round 121 (KYTY_READBACK_LABELS=1, off by default): while a read-back for the CPU is on its
+	// way (a small linear image the GPU wrote, going back to guest memory), a label is written once
+	// the GPU has run the work before it, as with KYTY_LABELS_AT_COMPLETION, and its read-back is
+	// recorded first, so that it lands before the label: a game thread that waits for the label
+	// and then reads the result takes this frame's. With KYTY_LABELS_AT_COMPLETION the read-backs
+	// are recorded first as well.
+	static const bool readback_labels = [] {
+		const char* value = std::getenv("KYTY_READBACK_LABELS");
+		const bool  on    = value != nullptr && value[0] == '1';
+		LOGF("Read-backs for the CPU: %s (KYTY_READBACK_LABELS)\n",
+		     on ? "a label written while one is on its way waits for it to land"
+		        : "labels do not wait for them");
+		return on;
+	}();
+	bool at_completion = !with_interrupt && GuestGpu::LabelsAtCompletion();
+	if (!with_interrupt && (at_completion || readback_labels) &&
+	    m_renderer.GetTextureCache().ReadbacksOnTheirWay()) {
+		at_completion = true;
+		m_renderer.GetTextureCache().ProcessDownloadImages();
+	}
 
 	auto write32 = [&](bool with_writeback) {
 		auto* dst  = static_cast<uint32_t*>(dst_gpu_addr);
@@ -1858,7 +1919,7 @@ void CommandProcessor::WriteAtEndOfPipe64(uint32_t cache_policy, uint32_t event_
 }
 
 void CommandProcessor::EmitGlobalBarrier() {
-	Common::LockGuard lock(m_renderer.GetMutex());
+	const RendererLock lock(m_renderer.GetMutex());
 
 	vk::MemoryBarrier2 barrier {};
 	barrier.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
@@ -1931,6 +1992,11 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 				EXIT("invalid occlusion-counter dump: index=0x%08" PRIx32 ", address=0x%016" PRIx64
 				     "\n",
 				     event_index, event_address);
+			}
+			// Round 119: the host GPU counts the samples (OcclusionQueries), and the counters are
+			// written once it has run the work before the dump.
+			if (OcclusionQueries::Enabled() && OcclusionQueries::Dump(m_renderer, event_address)) {
+				break;
 			}
 			static std::once_flag warning_once;
 			std::call_once(warning_once, [] {

@@ -23,6 +23,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h> // IWYU pragma: keep
+#include <psapi.h>
 #include <tlhelp32.h>
 #else
 #include <dirent.h>
@@ -238,6 +239,34 @@ std::unordered_map<uint32_t, uint64_t> ThreadCpuTimes() {
 	return times;
 }
 
+// Round 125: the process's memory and what Windows has left, at the end of each summary: a
+// process that runs out of commit (RAM and page file) ends without a word of its own.
+std::string MemoryText() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	PROCESS_MEMORY_COUNTERS_EX counters {};
+	counters.cb = sizeof(counters);
+	MEMORYSTATUSEX status {};
+	status.dwLength = sizeof(status);
+	if (K32GetProcessMemoryInfo(GetCurrentProcess(),
+	                            reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters),
+	                            sizeof(counters)) == FALSE ||
+	    GlobalMemoryStatusEx(&status) == FALSE) {
+		return {};
+	}
+	constexpr double gb = 1024.0 * 1024.0 * 1024.0;
+	return fmt::format(
+	    " | memory: {:.1f} GB committed, {:.1f} GB in RAM; Windows: {:.1f} of {:.1f} "
+	    "GB commit left, {:.1f} GB RAM free",
+	    static_cast<double>(counters.PrivateUsage) / gb,
+	    static_cast<double>(counters.WorkingSetSize) / gb,
+	    static_cast<double>(status.ullAvailPageFile) / gb,
+	    static_cast<double>(status.ullTotalPageFile) / gb,
+	    static_cast<double>(status.ullAvailPhys) / gb);
+#else
+	return {};
+#endif
+}
+
 std::string Percent(uint64_t part, uint64_t whole) {
 	return fmt::format("{:.0f}%",
 	                   whole == 0 ? 0.0
@@ -277,7 +306,7 @@ void Report(double seconds, std::unordered_map<uint32_t, uint64_t>& last_cpu) {
 	    "Perf: {:.1f} s, {:.1f} fps{} | GPU thread: busy {} (host GPU {}), idle {}, blocked {} | "
 	    "{} draws, {} dispatches a frame, {:.1f} us each | faults {:.0f}/s ({:.0f} reads, "
 	    "{:.0f} emulated), {:.0f} ms/s in handlers, {:.0f}/s of 1 ms or more, longest {:.1f} ms "
-	    "| downloads {:.0f}/s, {:.1f} MB/s\n",
+	    "| downloads {:.0f}/s, {:.1f} MB/s{}\n",
 	    seconds, static_cast<double>(presents) / seconds, configuration, Percent(busy, interval),
 	    Percent(host_gpu, interval), Percent(idle, interval), Percent(blocked, interval),
 	    draws / frames, dispatch / frames,
@@ -285,7 +314,8 @@ void Report(double seconds, std::unordered_map<uint32_t, uint64_t>& last_cpu) {
 	    static_cast<double>(faults) / seconds, static_cast<double>(reads) / seconds,
 	    static_cast<double>(emulated) / seconds, static_cast<double>(fault_ns) / 1e6 / seconds,
 	    static_cast<double>(longs) / seconds, static_cast<double>(longest) / 1e6,
-	    static_cast<double>(loads) / seconds, static_cast<double>(bytes) / 1e6 / seconds));
+	    static_cast<double>(loads) / seconds, static_cast<double>(bytes) / 1e6 / seconds,
+	    MemoryText()));
 
 	// The host GPU's queue, and what game-thread accesses to GPU-written memory wait for.
 	{
@@ -358,15 +388,17 @@ void Report(double seconds, std::unordered_map<uint32_t, uint64_t>& last_cpu) {
 	// The graphics caches' locks: how often a thread found one held, and how long it waited.
 	{
 		std::string          line = fmt::format("Perf locks:{}", configuration);
-		constexpr std::array names {"texture cache", "memory tracker"};
+		constexpr std::array names {"texture cache", "memory tracker", "renderer",
+		                            "renderer held by the presenter"};
+		constexpr std::array nouns {"waits", "waits", "waits", "holds"};
 		static_assert(names.size() == static_cast<size_t>(Lock::Count));
 		for (size_t i = 0; i < names.size(); i++) {
 			const auto waits        = take(c.lock_waits[i]);
 			const auto wait_ns      = take(c.lock_wait_ns[i]);
 			const auto longest_wait = take(c.longest_lock_wait_ns[i]);
-			line += fmt::format("{} {} {:.0f} waits/s, {:.1f} ms/s, longest {:.2f} ms",
+			line += fmt::format("{} {} {:.0f} {}/s, {:.1f} ms/s, longest {:.2f} ms",
 			                    i == 0 ? "" : " |", names[i], static_cast<double>(waits) / seconds,
-			                    static_cast<double>(wait_ns) / 1e6 / seconds,
+			                    nouns[i], static_cast<double>(wait_ns) / 1e6 / seconds,
 			                    static_cast<double>(longest_wait) / 1e6);
 		}
 		line += SpinLocks() ? " (spinning as before round 65)" : "";

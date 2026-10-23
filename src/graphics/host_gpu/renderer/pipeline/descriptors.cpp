@@ -4,6 +4,7 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/file.h"
+#include "common/guestWatch.h"
 #include "common/logging/log.h"
 #include "common/perfStats.h"
 #include "common/profiler.h"
@@ -375,7 +376,9 @@ static void ValidateSampledDepthBinding(const ShaderRecompiler::IR::ImageResourc
                                         const ShaderTextureResource& descriptor, const Image& image,
                                         vk::Format view_format, uint64_t size) {
 	const bool resource_ok = IsSupportedSampledDepthResource(resource);
-	const bool encoding_ok = IsSupportedDepthTextureEncoding(descriptor, resource.r128);
+	// Comparison sampling changes the host format, not the guest metadata encoding.
+	const bool encoding_ok = descriptor.TileMode() != Prospero::TileMode::kDepth ||
+	                         IsSupportedDepthTextureEncoding(descriptor, resource.r128);
 	const bool view_ok =
 	    IsSupportedSampledDepthView(image.info.pixel_format, view_format, descriptor.DstSelXYZW());
 	if (resource_ok && encoding_ok && view_ok) {
@@ -1240,8 +1243,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	    block_bytes != 0 ? block_bytes : Prospero::NumBytesPerElement(format);
 	desc.info.samples   = samples;
 	desc.info.tile_mode = tile;
-	if (!resource.r128 && descriptor.MetaCompress() && tile != Prospero::TileMode::kDepth &&
-	    !desc.info.IsDepth()) {
+	if (!resource.r128 && descriptor.MetaCompress() && tile != Prospero::TileMode::kDepth) {
 		TileSizeAlign metadata_size {};
 		(void)TileGetDccSize(width, height, volume ? depth : image_layers,
 		                     desc.info.bytes_per_block, physical_levels, tile, metadata_size,
@@ -1333,9 +1335,22 @@ TextureBinding RenderExecutor::FindResolvedTexture(const ShaderRecompiler::IR::I
 	auto       id                  = texture_cache.FindImage(desc, shader_conversion, same_backing);
 	auto*      image               = &texture_cache.GetImage(id);
 	const bool stencil_association = static_cast<bool>(image->depth_id);
+	// Round 124: the shader reads it as a single-sample image (an instruction of a single-sample
+	// dimension over a multisample depth T#, ResourceMaterialization's DescriptorDimension).
+	const bool single_sample_read =
+	    resource.dimension != ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaa &&
+	    resource.dimension != ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaaArray;
 	if (stencil_association) {
 		id    = image->depth_id;
 		image = &texture_cache.GetImage(id);
+		// Round 124: the stencil of a multisample depth target read as single-sample (the
+		// stencil plane's T# in replays): a copy of its first sample, as for the depth below.
+		// Not for bindless heap entries: their slots take no image without guest memory (the
+		// entry stays on its placeholder below).
+		if (image->backing.samples > 1 && single_sample_read && !storage && !t_resolving_bindless) {
+			id    = texture_cache.SingleSampleStencil(id);
+			image = &texture_cache.GetImage(id);
+		}
 	} else if (image->info.IsDepth()) {
 		// Round 94: a bindless heap entry the image it found cannot be viewed through (each an
 		// EXIT below) is left on its placeholder, as with the layout checks in ResolveTexture.
@@ -1350,6 +1365,16 @@ TextureBinding RenderExecutor::FindResolvedTexture(const ShaderRecompiler::IR::I
 			EXIT("depth target cannot be bound as a storage image\n");
 		}
 		ValidateSampledDepthBinding(resource, descriptor, *image, pixel_format, size);
+		// Round 122: a multisample depth target read by an instruction of a single-sample
+		// dimension (EQAA depth in replays: the light sprites' occlusion test, depth-based
+		// effects) reads a copy of its first sample, as the console's texture unit does
+		// (TextureCache::SingleSampleDepth). Round 124: the shader's dimension is that
+		// single-sample one now (before, specialization gave it the T#'s multisample one, so
+		// rounds 122 and 123 never made the copy).
+		if (image->backing.samples > 1 && single_sample_read && !t_resolving_bindless) {
+			id    = texture_cache.SingleSampleDepth(id);
+			image = &texture_cache.GetImage(id);
+		}
 	} else if (storage) {
 		ValidateStorageColorView(image->info.pixel_format, view_format, descriptor.DstSelXYZW());
 	} else {
@@ -1360,6 +1385,45 @@ TextureBinding RenderExecutor::FindResolvedTexture(const ShaderRecompiler::IR::I
 		}
 		(void)SelectSampledColorView(image->info.pixel_format, pixel_format,
 		                             descriptor.DstSelXYZW());
+		// Round 124 (Franseven's case): a texture smaller than the image at its address, with the
+		// same memory and tiling (text drawn into part of a wider target), reads a copy of the
+		// image's corner: a view of the image would stretch its coordinates over the whole
+		// image. Not for bindless heap entries (their slots keep a view past the draw).
+		if (!t_resolving_bindless) {
+			if (const auto copy_id = texture_cache.SubExtentCopy(id, desc.info); copy_id != id) {
+				id    = copy_id;
+				image = &texture_cache.GetImage(id);
+			}
+		}
+	}
+	if (image->backing.samples > 1 && single_sample_read) {
+		// Round 124: a multisample image left for a single-sample binding (a colour image under a
+		// depth-tiled multisample T#, or a depth image SingleSampleDepth or SingleSampleStencil
+		// made no copy of). The shader's image is a single-sample one, and a multisample image
+		// bound to it is a mismatch Vulkan leaves undefined (wrong reads or a lost device): a
+		// null texture instead (a bindless entry stays on its placeholder).
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+			LOGF("Multisample depth read as single-sample: 0x%012" PRIx64 " %ux%u fmt %d, %u "
+			     "samples, %u layers, %u levels, %s%s: no single-sample copy, a null texture "
+			     "instead\n",
+			     image->info.data.address, image->info.extent.width, image->info.extent.height,
+			     static_cast<int>(image->info.pixel_format), image->backing.samples,
+			     image->info.resources.layers, image->info.resources.levels,
+			     image->info.IsDepth() ? "a depth image" : "a colour image",
+			     stencil_association ? " (its stencil)" : "");
+		}
+		if (RejectBindlessTexture("a multisample image read as single-sample",
+		                          descriptor.Base40())) {
+			return {};
+		}
+		if (same_backing != nullptr) {
+			*same_backing = false;
+		}
+		auto null_desc     = NullTextureDesc(resource, storage ? TextureCache::BindingType::Storage
+		                                                       : TextureCache::BindingType::Texture);
+		const auto null_id = texture_cache.FindImage(null_desc);
+		return {null_id, nullptr, std::move(null_desc)};
 	}
 	return {id, nullptr, std::move(desc)};
 }
@@ -2439,6 +2503,20 @@ static void LogFrameGraphStage(RenderContext& context, const ShaderStageRuntime&
 		    static_cast<int>(info.pixel_format), static_cast<uint32_t>(info.guest_format),
 		    static_cast<uint32_t>(info.tile_mode), static_cast<uint32_t>(info.type),
 		    state.valid ? flags : "none", state.overlaps, state.gpu_overlaps, state.first_overlap);
+		// Round 123: the image the binding found, when its shape is not the T#'s (a glyph
+		// texture viewed through an older image of another width at its address, a copy of a
+		// depth image's first sample).
+		if (state.valid &&
+		    (state.data != info.data || state.extent != info.extent ||
+		     state.host_width != std::max(info.extent.width, 1u) ||
+		     state.host_height != std::max(info.extent.height, 1u) ||
+		     state.levels < info.resources.levels || state.layers < info.resources.layers)) {
+			FrameGraph::Log("  %s tex[%zu] found image 0x%012" PRIx64 "+0x%" PRIx64
+			                " %ux%ux%u layers %u mips %u fmt %d, host %ux%u",
+			                stage, i, state.data.address, state.data.size, state.extent.width,
+			                state.extent.height, state.extent.depth, state.layers, state.levels,
+			                static_cast<int>(state.format), state.host_width, state.host_height);
+		}
 		// A light grid the CPU wrote: does the GPU's copy hold what the guest wrote? (Shown as
 		// the submission lands.)
 		if (!resource.written && binding.image_id && info.pixel_format == vk::Format::eR32G32Uint &&
@@ -2960,6 +3038,181 @@ void WatchConstants(RenderContext& context, const ShaderStageRuntime& runtime) {
 		watch.last_frame = frame;
 	}
 }
+
+// Round 121, diagnostics: KYTY_FIND_CONSTANTS=<shader hash>:<user sgpr>:<offset>:<bytes> (hex
+// hash and offset, decimal sgpr and byte count, 8 to 64; up to 2, comma-separated). In each F9
+// capture, at the first draw of that shader, the bytes at its user data pointer plus the offset
+// (a colour correction the CPU writes each frame, say) are searched for in all of the guest's
+// committed memory, 4-byte aligned: where else the CPU keeps them. Each place (up to 32) is logged
+// with its mapping and the 512 bytes around it, as hex and as floats ("Find constants"). The first
+// capture that finds places more than 64 MiB from the constants' own memory arms hardware write
+// watches on up to four of them (Common::GuestWatch, Windows): the code that writes them is logged,
+// with its bytes. KYTY_FIND_CONSTANTS_WATCH=0 leaves them unarmed.
+struct FindConstantsItem {
+	uint64_t hash         = 0;
+	uint32_t sgpr         = 0;
+	uint32_t offset       = 0;
+	uint32_t bytes        = 0;
+	uint32_t last_capture = 0;
+};
+
+std::vector<FindConstantsItem>& FindConstantsItems() {
+	static std::vector<FindConstantsItem> items = [] {
+		std::vector<FindConstantsItem> result;
+		const char*                    text = std::getenv("KYTY_FIND_CONSTANTS");
+		while (text != nullptr && *text != '\0' && result.size() < 2) {
+			FindConstantsItem item;
+			char*             end = nullptr;
+			item.hash             = std::strtoull(text, &end, 16);
+			if (end == text || *end != ':') break;
+			text      = end + 1;
+			item.sgpr = static_cast<uint32_t>(std::strtoul(text, &end, 10));
+			if (end == text || *end != ':') break;
+			text        = end + 1;
+			item.offset = static_cast<uint32_t>(std::strtoul(text, &end, 16));
+			if (end == text || *end != ':') break;
+			text = end + 1;
+			item.bytes =
+			    std::clamp<uint32_t>(static_cast<uint32_t>(std::strtoul(text, &end, 10)), 8u, 64u) &
+			    ~3u;
+			if (end == text) break;
+			result.push_back(item);
+			text = *end == ',' ? end + 1 : end;
+		}
+		for (const auto& item: result) {
+			LOGF("Find constants: shader 0x%016" PRIx64 ", s[%u:%u] + 0x%x, %u bytes, searched "
+			     "for in each F9 capture\n",
+			     item.hash, item.sgpr, item.sgpr + 1, item.offset, item.bytes);
+		}
+		return result;
+	}();
+	return items;
+}
+
+// The words around a place, each as hex and as a float, 8 a line, every line naming the place (a
+// search for "Find constants" keeps them all).
+[[nodiscard]] std::string WordsAround(uint64_t address, uint64_t before, uint64_t after) {
+	std::vector<uint32_t> words((before + after) / 4u);
+	if (!Libs::LibKernel::Memory::TryReadBacking(address - before, words.data(),
+	                                             words.size() * 4u)) {
+		return fmt::format("Find constants 0x{:012x}: the bytes around it are unreadable\n",
+		                   address);
+	}
+	std::string text;
+	for (size_t i = 0; i < words.size(); i++) {
+		if (i % 8u == 0) {
+			const auto at = static_cast<int64_t>(i * 4u) - static_cast<int64_t>(before);
+			text += fmt::format("{}Find constants 0x{:012x} {}0x{:03x}:", i == 0 ? "" : "\n",
+			                    address, at < 0 ? "-" : "+", at < 0 ? -at : at);
+		}
+		float value = 0;
+		std::memcpy(&value, &words[i], 4);
+		text += fmt::format(" {:08x}={:.6g}", words[i], value);
+	}
+	return text + "\n";
+}
+
+void FindConstants(RenderContext& context, const ShaderStageRuntime& runtime) {
+	auto& items = FindConstantsItems();
+	if (items.empty() || !FrameGraph::Active() || runtime.program == nullptr ||
+	    runtime.resources == nullptr) {
+		return;
+	}
+	(void)context;
+	const auto& program = *runtime.program;
+	const auto  capture = FrameGraph::CaptureNumber();
+	for (auto& item: items) {
+		if (item.hash != program.shader_hash || item.last_capture == capture) {
+			continue;
+		}
+		const auto& user = runtime.resources->user_data;
+		if (item.sgpr < program.user_data_base ||
+		    item.sgpr + 1 - program.user_data_base >= user.size()) {
+			continue;
+		}
+		const auto     index   = item.sgpr - program.user_data_base;
+		const uint64_t pointer = user[index] | (static_cast<uint64_t>(user[index + 1]) << 32u);
+		const uint64_t own     = pointer + item.offset;
+		std::vector<uint8_t> pattern(item.bytes);
+		if (pointer == 0 ||
+		    !Libs::LibKernel::Memory::TryReadBacking(own, pattern.data(), pattern.size())) {
+			continue;
+		}
+		item.last_capture = capture;
+		std::string values;
+		for (size_t i = 0; i < pattern.size(); i += 4) {
+			float value = 0;
+			std::memcpy(&value, pattern.data() + i, 4);
+			values += fmt::format(" {:.6g}", value);
+		}
+		std::vector<std::pair<uint64_t, uint64_t>> spans;
+		constexpr uint64_t                         From = uint64_t {1} << 32u;
+		constexpr uint64_t                         To   = uint64_t {1} << 40u;
+		if (!Libs::LibKernel::Memory::CommittedSpans(From, To - From, size_t {1} << 20u, &spans)) {
+			LOGF("Find constants (capture %u): too many mappings to search\n", capture);
+			continue;
+		}
+		const auto            start = std::chrono::steady_clock::now();
+		constexpr uint64_t    Chunk = uint64_t {4} << 20u;
+		const auto            n     = static_cast<uint64_t>(pattern.size());
+		std::vector<uint8_t>  buffer(static_cast<size_t>(Chunk));
+		std::vector<uint64_t> hits;
+		uint64_t              scanned = 0;
+		for (const auto& [address, size]: spans) {
+			for (uint64_t done = 0; done + n <= size && hits.size() < 32;) {
+				const auto part = std::min<uint64_t>(size - done, Chunk);
+				if (Libs::LibKernel::Memory::TryReadBacking(address + done, buffer.data(), part)) {
+					scanned += part;
+					for (uint64_t i = 0; i + n <= part && hits.size() < 32; i += 4) {
+						if (std::memcmp(buffer.data() + i, pattern.data(), 4) == 0 &&
+						    std::memcmp(buffer.data() + i, pattern.data(), n) == 0) {
+							const auto at = address + done + i;
+							if (hits.empty() || hits.back() < at) {
+								hits.push_back(at);
+							}
+						}
+					}
+				}
+				// Overlap the next chunk by the pattern, less one word.
+				done += part < size - done ? part - (n - 4) : part;
+			}
+		}
+		const auto ms =
+		    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
+		        .count();
+		LOGF("Find constants (capture %u): shader 0x%016" PRIx64 " reads%s at 0x%012" PRIx64
+		     "; %zu places hold them in %.1f GB of guest memory (%zu mappings, %.0f ms)\n",
+		     capture, item.hash, values.c_str(), own, hits.size(),
+		     static_cast<double>(scanned) / 1e9, spans.size(), ms);
+		std::vector<uint64_t> distant;
+		for (const auto hit: hits) {
+			const auto distance = hit > own ? hit - own : own - hit;
+			const bool is_far   = distance > (uint64_t {64} << 20u);
+			if (is_far) {
+				distant.push_back(hit);
+			}
+			LOGF("Find constants (capture %u): 0x%012" PRIx64 "%s (%s), the 512 bytes around it "
+			     "as hex and float:\n%s",
+			     capture, hit,
+			     hit == own ? " (the constants themselves)"
+			     : is_far   ? ""
+			                : " (within 64 MiB of them)",
+			     Libs::LibKernel::Memory::DescribeMappings(hit, 16).c_str(),
+			     WordsAround(hit, 0x100, 0x100).c_str());
+		}
+		static bool       armed = false;
+		static const bool watch = [] {
+			const char* value = std::getenv("KYTY_FIND_CONSTANTS_WATCH");
+			return value == nullptr || value[0] != '0';
+		}();
+		if (!armed && watch && !distant.empty()) {
+			armed = true;
+			distant.resize(std::min<size_t>(distant.size(), 4));
+			(void)Common::GuestWatch::Arm(distant.data(), static_cast<uint32_t>(distant.size()),
+			                              "KYTY_FIND_CONSTANTS");
+		}
+	}
+}
 } // namespace
 
 void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
@@ -3191,6 +3444,7 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 		ProbeSlowShaderGrids(m_context, runtime, prepared);
 	}
 	WatchConstants(m_context, runtime);
+	FindConstants(m_context, runtime);
 }
 
 // KYTY_SPARSE_WRITES=0: a written buffer over memory with holes is bound up to its first hole.
@@ -3248,7 +3502,15 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 	for (const auto resource: resources) {
 		auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(snapshot.buffers[resource]);
 		const auto address = descriptor.Base48();
-		const auto requested_size = descriptor.GetSize();
+		auto       requested_size = descriptor.GetSize();
+		// Round 124, upstream fde0b98e (nmzik), ported by Franseven: OOB_SELECT=2 only tests
+		// NumRecords != 0; a zero-stride fetch still needs its full payload when NumRecords is
+		// smaller than it.
+		if (requested_size != 0 && descriptor.Stride() == 0 && descriptor.OutOfBounds() == 2 &&
+		    resource < program.info.buffers.size() && !program.info.buffers[resource].scalar) {
+			requested_size =
+			    std::max<uint64_t>(requested_size, program.info.buffers[resource].max_byte_extent);
+		}
 		if (address != 0 && address < BufferCache::CACHING_PAGESIZE) {
 			// A base in guest page 0 cannot be read on the hardware either; the shader must not
 			// touch it, so it binds as null. Logged so the descriptor's origin can be traced.
