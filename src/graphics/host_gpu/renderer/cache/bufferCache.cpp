@@ -3506,7 +3506,7 @@ uint64_t BufferCache::SynchronizeBdaPending(const RangeSet& mapped) {
 	// Round 80: the spans of a region's buffers write-protect their pages again in one change
 	// (MemoryTracker::TakeCpuDirtySpans); KYTY_BISECT's bdaprotect:old syncs each span on its own.
 	const bool                         together = !by_run && !Bisect::BdaProtectOld();
-	// KYTY_BISECT's uploads:batched (KYTY_UPLOAD_BATCH=1 for the whole run): the walk's uploads
+	// Unless KYTY_UPLOAD_BATCH=0 or KYTY_BISECT's uploads:each, the walk's uploads
 	// share one barrier before and one after them. Each with its own pair, a walk drained the GPU
 	// twice an upload: ~33 uploads a walk, ~1,200 drains a frame in a race (2026-10-23), with the
 	// host GPU's command buffers at 0.25 ms each and its clock low (about 60 W of 325).

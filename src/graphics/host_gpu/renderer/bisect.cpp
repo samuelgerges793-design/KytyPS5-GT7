@@ -127,6 +127,7 @@ struct Step {
 	bool              barriers_global = false; // barriers:global
 	bool              protect_excl    = false; // protect:exclusive
 	bool              upload_batch    = false; // uploads:batched (2026-10-23)
+	bool              upload_each     = false; // uploads:each
 	std::string       cpu_set;          // empty: as at the start
 	std::string       name;             // for the screen and the picture's file name
 	std::string       text;             // name and actions, for the log
@@ -447,6 +448,10 @@ bool ParseAction(std::string_view action, Step& step) {
 	}
 	if (action == "uploads:batched") {
 		step.upload_batch = true;
+		return true;
+	}
+	if (action == "uploads:each") {
+		step.upload_each = true;
 		return true;
 	}
 	if (action == "memsync:sync") {
@@ -1247,12 +1252,17 @@ bool GlobalPm4Barriers() {
 }
 
 bool UploadBatch() {
-	static const bool always = [] {
+	// On unless KYTY_UPLOAD_BATCH=0 (or F8's uploads:each, for a step): in a race A/B on
+	// 2026-10-23 it won each of three steady pairs, by 0.3 fps.
+	static const bool on = [] {
 		const char* value = std::getenv("KYTY_UPLOAD_BATCH");
-		return value != nullptr && std::strcmp(value, "1") == 0;
+		return value == nullptr || std::strcmp(value, "0") != 0;
 	}();
 	const auto* step = Current();
-	return always || (step != nullptr && step->upload_batch);
+	if (step != nullptr && step->upload_batch) {
+		return true;
+	}
+	return on && !(step != nullptr && step->upload_each);
 }
 
 bool PhaseTimingAll() {

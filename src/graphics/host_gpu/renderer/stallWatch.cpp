@@ -9,6 +9,7 @@
 #include <atomic>
 #include <chrono>
 #include <cinttypes>
+#include <cmath>
 #include <cstdlib>
 #include <fmt/format.h>
 
@@ -22,6 +23,58 @@ constexpr uint64_t Millisecond  = 1'000'000;
 constexpr size_t   SectionRing  = 512;
 constexpr uint64_t MaxOwnRows   = 48; // this timeline's command buffers in one report
 constexpr uint64_t MaxOtherRows = 12; // another timeline's
+
+// BusyText's estimate of what the host GPU's time goes to: each command buffer's time past the
+// one before it, fitted by least squares to what it held. The terms: one command buffer, a draw, a
+// dispatch, and a transfer of each kind, by count and, for buffer uploads and downloads, by MB.
+constexpr size_t FitTerms = 13;
+constexpr std::array<const char*, FitTerms> FitTermNames {
+    "fixed",        "draws",          "dispatches",  "buffer uploads", "upload MB",
+    "downloads",    "download MB",    "buffer copies", "image uploads", "image downloads",
+    "image copies", "tiling",         "other transfers"};
+using FitRow = std::array<double, FitTerms>;
+
+// Solves (XᵀX + λI) c = Xᵀy in place (Gaussian elimination with partial pivoting); λ, a small
+// fraction of the diagonal's mean, keeps terms that never or always appear together solvable.
+FitRow SolveFit(std::array<FitRow, FitTerms> a, FitRow b) {
+	double trace = 0.0;
+	for (size_t i = 0; i < FitTerms; i++) {
+		trace += a[i][i];
+	}
+	const double ridge = 1e-6 * trace / static_cast<double>(FitTerms) + 1e-12;
+	for (size_t i = 0; i < FitTerms; i++) {
+		a[i][i] += ridge;
+	}
+	for (size_t col = 0; col < FitTerms; col++) {
+		size_t pivot = col;
+		for (size_t row = col + 1; row < FitTerms; row++) {
+			if (std::abs(a[row][col]) > std::abs(a[pivot][col])) {
+				pivot = row;
+			}
+		}
+		std::swap(a[col], a[pivot]);
+		std::swap(b[col], b[pivot]);
+		if (a[col][col] == 0.0) {
+			continue;
+		}
+		for (size_t row = col + 1; row < FitTerms; row++) {
+			const double factor = a[row][col] / a[col][col];
+			for (size_t k = col; k < FitTerms; k++) {
+				a[row][k] -= factor * a[col][k];
+			}
+			b[row] -= factor * b[col];
+		}
+	}
+	FitRow c {};
+	for (size_t i = FitTerms; i-- > 0;) {
+		double sum = b[i];
+		for (size_t k = i + 1; k < FitTerms; k++) {
+			sum -= a[i][k] * c[k];
+		}
+		c[i] = a[i][i] != 0.0 ? sum / a[i][i] : 0.0;
+	}
+	return c;
+}
 
 uint64_t ThresholdNs() {
 	static const uint64_t ns = [] {
@@ -384,6 +437,28 @@ std::string Timeline::BusyText() {
 		uint64_t tick      = 0;
 		uint64_t closed_ns = 0;
 		uint64_t queued_ns = 0;
+		FitRow   terms {};
+	};
+	const auto terms_of = [](const Content& content) {
+		const auto count = [&](Transfer kind) {
+			return static_cast<double>(content.transfers[static_cast<size_t>(kind)]);
+		};
+		const auto mb = [&](Transfer kind) {
+			return static_cast<double>(content.bytes[static_cast<size_t>(kind)]) / 1048576.0;
+		};
+		return FitRow {1.0,
+		               static_cast<double>(content.draws),
+		               static_cast<double>(content.dispatches),
+		               count(Transfer::BufferUpload),
+		               mb(Transfer::BufferUpload),
+		               count(Transfer::BufferDownload),
+		               mb(Transfer::BufferDownload),
+		               count(Transfer::BufferCopy),
+		               count(Transfer::ImageUpload),
+		               count(Transfer::ImageDownload),
+		               count(Transfer::ImageCopy),
+		               count(Transfer::Detile) + count(Transfer::Tile),
+		               count(Transfer::NanScan) + count(Transfer::Other)};
 	};
 	std::vector<Brief> briefs;
 	uint64_t           reference_end = 0;
@@ -399,7 +474,8 @@ std::string Timeline::BusyText() {
 		for (auto tick = first; tick <= last; tick++) {
 			const auto& record = m_records[tick % Slots];
 			if (record.tick == tick) {
-				briefs.push_back({tick, record.closed_ns, record.queued_ns});
+				briefs.push_back(
+				    {tick, record.closed_ns, record.queued_ns, terms_of(record.content)});
 			}
 		}
 		// The last call's end, the start of this span, unless command buffers closed since then
@@ -461,6 +537,12 @@ std::string Timeline::BusyText() {
 	uint64_t latency_count = 0;
 	uint64_t covered       = reference_end;
 	uint64_t latest_begin  = 0;
+	// The fit's sums: XᵀX, Xᵀy and the terms' totals, with y each command buffer's time past the
+	// one before it (its busy time below), in microseconds.
+	std::array<FitRow, FitTerms> xtx {};
+	FitRow                       xty {};
+	FitRow                       totals {};
+	double                       fit_us = 0.0;
 	for (size_t i = 0; i < briefs.size(); i++) {
 		const auto& t = times[i];
 		if (!t.done || t.begin < latest_begin || (reference_end != 0 && t.end < reference_end)) {
@@ -479,6 +561,21 @@ std::string Timeline::BusyText() {
 		const auto from = std::max(t.begin, covered);
 		if (t.end > from) {
 			busy_ns += t.end - from;
+		}
+		{
+			const auto&  x = briefs[i].terms;
+			const double y = t.end > from ? static_cast<double>(t.end - from) / 1000.0 : 0.0;
+			for (size_t r = 0; r < FitTerms; r++) {
+				if (x[r] == 0.0) {
+					continue;
+				}
+				for (size_t c = 0; c < FitTerms; c++) {
+					xtx[r][c] += x[r] * x[c];
+				}
+				xty[r] += x[r] * y;
+				totals[r] += x[r];
+			}
+			fit_us += y;
 		}
 		gpu_ns += t.end - t.begin;
 		covered           = std::max(covered, t.end);
@@ -504,7 +601,7 @@ std::string Timeline::BusyText() {
 	if (span == 0) {
 		return {};
 	}
-	return fmt::format(
+	auto text = fmt::format(
 	    " | host GPU ({}): busy {:.0f}% of {:.1f} s, {} command buffers ({:.3f} ms each on the "
 	    "GPU), "
 	    "{} idle gaps of 0.5 ms or more ({:.0f} ms in all); from hand-over to submission {:.2f} ms "
@@ -517,6 +614,23 @@ std::string Timeline::BusyText() {
 	        ? 0.0
 	        : static_cast<double>(latency_ns) / 1e6 / static_cast<double>(latency_count),
 	    static_cast<double>(latency_max) / 1e6);
+	// The fit (2026-10-23): what each term costs the host GPU, and its share of the busy time.
+	// The terms seen in fewer than 1% of the command buffers' items are left out of the text.
+	if (counted >= 256 && fit_us > 0.0) {
+		const auto coefficients = SolveFit(xtx, xty);
+		text += fmt::format("; its time by what the command buffers held (fitted):");
+		for (size_t term = 0; term < FitTerms; term++) {
+			const double share = coefficients[term] * totals[term] / fit_us;
+			if (term != 0 && totals[term] < static_cast<double>(counted) / 100.0) {
+				continue;
+			}
+			text += fmt::format(" {} {:.1f} us{} ({:.0f}%),", FitTermNames[term],
+			                    coefficients[term], term == 0 ? " a command buffer" : " each",
+			                    100.0 * share);
+		}
+		text.pop_back();
+	}
+	return text;
 }
 
 std::string Timeline::Describe(const Content& content) const {
