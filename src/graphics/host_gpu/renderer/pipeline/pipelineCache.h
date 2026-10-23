@@ -484,6 +484,8 @@ private:
 	std::chrono::steady_clock::time_point                   m_partition_next_build {};
 	std::unique_ptr<PipelineCompiler>                       m_compiler;
 	uint64_t                                                m_deferred_draws = 0;
+	// When the pipeline and program counts were last logged (TryGetGraphicsPipeline).
+	std::chrono::steady_clock::time_point                   m_counts_logged {};
 	// Round 87: whether a new pipeline is first looked up in the driver's caches alone
 	// (pipelineCreationCacheControl; KYTY_PIPELINE_PROBE=0 turns it off), and what is left of
 	// this frame's time for waits on background compiles (KYTY_PIPELINE_FRAME_WAIT_MS).

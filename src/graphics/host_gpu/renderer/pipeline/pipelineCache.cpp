@@ -5289,6 +5289,15 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 	const auto& vertex_program = programs.vertex[0];
 	const auto& pixel_program  = programs.pixel;
 	KYTY_PROFILER_BLOCK("PipelineCache::CreatePipeline(Gfx)", profiler::colors::DeepOrangeA200);
+	// Every 30 s, how many pipelines and shader programs this run holds: logged next to the Perf
+	// lines' committed memory, which grew by 40 GB in a 40-minute session (2026-10-22).
+	if (const auto now = std::chrono::steady_clock::now();
+	    now - m_counts_logged >= std::chrono::seconds(30)) {
+		m_counts_logged = now;
+		LOGF("Pipeline counts: %zu graphics pipelines, %zu compute pipelines, %zu shader programs\n",
+		     m_graphics_pipelines.size(), m_compute_pipelines.size(),
+		     m_program_cache->programs.size());
+	}
 
 	EXIT_IF(colors.size() > RENDER_COLOR_ATTACHMENTS_MAX);
 	EXIT_IF(!vertex_program);
