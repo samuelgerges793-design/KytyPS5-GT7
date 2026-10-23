@@ -26,7 +26,17 @@ namespace Libs::Graphics {
 
 vk::Format  VulkanFormat(Prospero::BufferFormat guest_format);
 void        RequireVulkanSuccess(vk::Result result, const char* operation);
-vk::ShaderModule CompileSPV(std::span<const uint32_t> code, vk::Device device);
+vk::ShaderModule CompileSPV(std::span<const uint32_t> code, vk::Device device,
+                            const vk::AllocationCallbacks* allocator = nullptr);
+
+// The host memory the driver allocates for the guest's shader modules and pipelines, counted
+// through allocation callbacks (KYTY_VK_HOST_MEMORY=0: the driver's own allocator, not counted).
+// An object must be destroyed with the callbacks it was created with: every create and destroy of
+// one kind passes DriverAllocator(kind).
+enum class DriverMemoryKind : uint8_t { ShaderModule, Pipeline, Count };
+[[nodiscard]] const vk::AllocationCallbacks* DriverAllocator(DriverMemoryKind kind);
+// Bytes allocated and not freed yet (0 when not counted).
+[[nodiscard]] uint64_t DriverMemoryBytes(DriverMemoryKind kind);
 
 template <typename Handle, typename... Args>
 void SetVulkanObjectNameF(vk::Device device, Handle handle, fmt::format_string<Args...> format,

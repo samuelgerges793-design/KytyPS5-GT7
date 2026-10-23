@@ -799,7 +799,7 @@ vk::Result CreateGraphicsPipeline(const GraphicsPipelineBuild& build,
 		info.flags |= vk::PipelineCreateFlagBits::eFailOnPipelineCompileRequired;
 	}
 	const auto result =
-	    build.device.createGraphicsPipelines(driver_cache, 1, &info, nullptr, pipeline);
+	    build.device.createGraphicsPipelines(driver_cache, 1, &info, DriverAllocator(DriverMemoryKind::Pipeline), pipeline);
 	// On the GPU thread, a slow pipeline stops every queue.
 	if (const auto create_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
 	                               std::chrono::steady_clock::now() - create_begin)
@@ -920,12 +920,13 @@ bool CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		auto lookup = info;
 		lookup.flags |= vk::PipelineCreateFlagBits::eFailOnPipelineCompileRequired;
 		result =
-		    graphics.device.createComputePipelines(cache, 1, &lookup, nullptr, &pipeline.pipeline);
+		    graphics.device.createComputePipelines(cache, 1, &lookup, DriverAllocator(DriverMemoryKind::Pipeline),
+		                                           &pipeline.pipeline);
 		if (result == vk::Result::eSuccess && pipeline.pipeline != nullptr) {
 			break;
 		}
 		if (pipeline.pipeline != nullptr) {
-			graphics.device.destroyPipeline(pipeline.pipeline, nullptr);
+			graphics.device.destroyPipeline(pipeline.pipeline, DriverAllocator(DriverMemoryKind::Pipeline));
 			pipeline.pipeline = nullptr;
 		}
 		if (result != vk::Result::ePipelineCompileRequired) {
@@ -943,7 +944,7 @@ bool CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	const bool simulated = FailComputePipelineFor(shader_hash);
 	if (simulated) {
 		if (pipeline.pipeline != nullptr) {
-			graphics.device.destroyPipeline(pipeline.pipeline, nullptr);
+			graphics.device.destroyPipeline(pipeline.pipeline, DriverAllocator(DriverMemoryKind::Pipeline));
 			pipeline.pipeline = nullptr;
 		}
 		if (build == ComputeBuild::LookUp) {
@@ -952,7 +953,7 @@ bool CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		}
 		result = vk::Result::eErrorOutOfHostMemory;
 	} else if (result != vk::Result::eSuccess || pipeline.pipeline == nullptr) {
-		result = graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr,
+		result = graphics.device.createComputePipelines(driver_cache, 1, &info, DriverAllocator(DriverMemoryKind::Pipeline),
 		                                                &pipeline.pipeline);
 	}
 	if (const auto create_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -969,7 +970,7 @@ bool CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 			result = vk::Result::eErrorUnknown;
 		}
 		if (pipeline.pipeline != nullptr) {
-			graphics.device.destroyPipeline(pipeline.pipeline, nullptr);
+			graphics.device.destroyPipeline(pipeline.pipeline, DriverAllocator(DriverMemoryKind::Pipeline));
 			pipeline.pipeline = nullptr;
 		}
 		ReportComputePipelineFailure(graphics, shader_hash, result, simulated);

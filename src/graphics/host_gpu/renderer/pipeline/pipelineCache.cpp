@@ -1741,7 +1741,7 @@ static bool CreateFromOlderFiles(const GraphicsPipelineBuild&       build,
 			return true;
 		}
 		if (*pipeline != nullptr) {
-			build.device.destroyPipeline(*pipeline, nullptr);
+			build.device.destroyPipeline(*pipeline, DriverAllocator(DriverMemoryKind::Pipeline));
 			*pipeline = nullptr;
 		}
 		if (result != vk::Result::ePipelineCompileRequired) {
@@ -2249,7 +2249,7 @@ struct PipelineCache::ProgramCache {
 		    ExactFloatShader(options.shader_hash)) {
 			exact = ExactFloatVariant(options, spirv);
 		}
-		const auto module = CompileSPV(exact.empty() ? spirv : exact, device);
+		const auto module = CompileSPV(exact.empty() ? spirv : exact, device, DriverAllocator(DriverMemoryKind::ShaderModule));
 		EXIT_IF(module == nullptr);
 		vk::ShaderModule pixel_rate_module = nullptr;
 		if constexpr (std::is_same_v<InputInfo, ShaderPixelInputInfo>) {
@@ -3166,12 +3166,14 @@ struct PipelineCache::ProgramCache {
 		for (const auto& [key, entry]: programs) {
 			(void)key;
 			for (const auto& permutation: entry.permutations) {
-				device.destroyShaderModule(permutation.handle.module, nullptr);
+				device.destroyShaderModule(permutation.handle.module, DriverAllocator(DriverMemoryKind::ShaderModule));
 				if (permutation.handle.pixel_rate_module != nullptr) {
-					device.destroyShaderModule(permutation.handle.pixel_rate_module, nullptr);
+					device.destroyShaderModule(permutation.handle.pixel_rate_module,
+					                          DriverAllocator(DriverMemoryKind::ShaderModule));
 				}
 				if (permutation.handle.normalized_module != nullptr) {
-					device.destroyShaderModule(permutation.handle.normalized_module, nullptr);
+					device.destroyShaderModule(permutation.handle.normalized_module,
+					                          DriverAllocator(DriverMemoryKind::ShaderModule));
 				}
 			}
 		}
@@ -3205,7 +3207,7 @@ struct PipelineCache::ProgramCache {
 			}
 			pixel_rate_checked++;
 		}
-		const auto                   variant_module = CompileSPV(variant, device);
+		const auto                   variant_module = CompileSPV(variant, device, DriverAllocator(DriverMemoryKind::ShaderModule));
 		static std::atomic<uint32_t> logged {0};
 		if (variant_module != nullptr && logged.fetch_add(1, std::memory_order_relaxed) < 8) {
 			LOGF("Pipeline: pixel shader 0x%016" PRIx64
@@ -3289,7 +3291,7 @@ struct PipelineCache::ProgramCache {
 				return nullptr;
 			}
 		}
-		const auto module = CompileSPV(variant, device);
+		const auto module = CompileSPV(variant, device, DriverAllocator(DriverMemoryKind::ShaderModule));
 		if (module != nullptr && normalized_copies++ < 8) {
 			LOGF("Pipeline: hull shader 0x%016" PRIx64
 			     " samples at an explicit LOD: a copy with normalized coordinates is used where "
@@ -4008,9 +4010,9 @@ PipelineCache::~PipelineCache() {
 		for (const auto& [key, pipeline]: pipelines) {
 			(void)key;
 			if (pipeline->pending && pipeline->pending->done.load(std::memory_order_acquire)) {
-				m_graphics.device.destroyPipeline(pipeline->pending->pipeline, nullptr);
+				m_graphics.device.destroyPipeline(pipeline->pending->pipeline, DriverAllocator(DriverMemoryKind::Pipeline));
 			}
-			m_graphics.device.destroyPipeline(pipeline->pipeline, nullptr);
+			m_graphics.device.destroyPipeline(pipeline->pipeline, DriverAllocator(DriverMemoryKind::Pipeline));
 			m_graphics.device.destroyPipelineLayout(pipeline->pipeline_layout, nullptr);
 			m_graphics.device.destroyDescriptorSetLayout(pipeline->descriptor_set_layout, nullptr);
 		}
@@ -5294,9 +5296,12 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 	if (const auto now = std::chrono::steady_clock::now();
 	    now - m_counts_logged >= std::chrono::seconds(30)) {
 		m_counts_logged = now;
-		LOGF("Pipeline counts: %zu graphics pipelines, %zu compute pipelines, %zu shader programs\n",
+		LOGF("Pipeline counts: %zu graphics pipelines, %zu compute pipelines, %zu shader programs; "
+		     "driver host memory: %.1f MB for shader modules, %.1f MB for pipelines\n",
 		     m_graphics_pipelines.size(), m_compute_pipelines.size(),
-		     m_program_cache->programs.size());
+		     m_program_cache->programs.size(),
+		     static_cast<double>(DriverMemoryBytes(DriverMemoryKind::ShaderModule)) / 1048576.0,
+		     static_cast<double>(DriverMemoryBytes(DriverMemoryKind::Pipeline)) / 1048576.0);
 	}
 
 	EXIT_IF(colors.size() > RENDER_COLOR_ATTACHMENTS_MAX);
@@ -5648,7 +5653,7 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 			return iter->second.get();
 		}
 		if (cached->pipeline != nullptr) {
-			m_graphics.device.destroyPipeline(cached->pipeline, nullptr);
+			m_graphics.device.destroyPipeline(cached->pipeline, DriverAllocator(DriverMemoryKind::Pipeline));
 			cached->pipeline = nullptr;
 		}
 		if (result != vk::Result::ePipelineCompileRequired) {
