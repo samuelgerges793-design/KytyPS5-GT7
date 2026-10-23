@@ -6,6 +6,7 @@
 #include "graphics/host_gpu/renderer/cache/pagedRangeSet.h"
 #include "graphics/host_gpu/renderer/gpuTiming.h"
 #include "kernel/memory.h"
+#include "kernel/syncOnAddress.h"
 
 #include <algorithm>
 #include <atomic>
@@ -111,6 +112,20 @@ struct Step {
 	uint32_t          slow_gpu_us   = 0;
 	uint32_t          slow_fault_us = 0;
 	uint32_t          slow_read_us  = 0;
+	// Round 130.
+	bool              probe_sync = false;
+	// Round 131.
+	bool              phases_all = false;
+	// Round 132.
+	bool              memsync_sync   = false;
+	bool              syncwait_old   = false;
+	bool              storeclean_off = false;
+	bool              hold_off       = false; // hold:off (round 133)
+	// Round 135.
+	bool              cleanpage_old   = false; // cleanpage:old
+	bool              readwait_writer = false; // readwait:writer
+	bool              barriers_global = false; // barriers:global
+	bool              protect_excl    = false; // protect:exclusive
 	std::string       cpu_set;          // empty: as at the start
 	std::string       name;             // for the screen and the picture's file name
 	std::string       text;             // name and actions, for the log
@@ -405,6 +420,46 @@ bool ParseAction(std::string_view action, Step& step) {
 		step.buflen_old = true;
 		return true;
 	}
+	if (action == "storeclean:off") {
+		step.storeclean_off = true;
+		return true;
+	}
+	if (action == "hold:off") {
+		step.hold_off = true;
+		return true;
+	}
+	if (action == "cleanpage:old") {
+		step.cleanpage_old = true;
+		return true;
+	}
+	if (action == "readwait:writer") {
+		step.readwait_writer = true;
+		return true;
+	}
+	if (action == "barriers:global") {
+		step.barriers_global = true;
+		return true;
+	}
+	if (action == "protect:exclusive") {
+		step.protect_excl = true;
+		return true;
+	}
+	if (action == "memsync:sync") {
+		step.memsync_sync = true;
+		return true;
+	}
+	if (action == "syncwait:old") {
+		step.syncwait_old = true;
+		return true;
+	}
+	if (action == "phases:all") {
+		step.phases_all = true;
+		return true;
+	}
+	if (action == "probe:sync") {
+		step.probe_sync = true;
+		return true;
+	}
 	if (action == "bdasync:submission") {
 		step.bdasync_submission = true;
 		return true;
@@ -650,6 +705,8 @@ void ApplyEffects(bool toggled = false) {
 	GpuTiming::SetWatch(step != nullptr && step->gpu_watch);
 	PagedRangeSet::SetIndexOff(step != nullptr && step->dirtyindex_off);
 	LibKernel::Memory::SetBackingCopyLocked(step != nullptr && step->backing_locked);
+	LibKernel::Memory::SetProtectLockExclusive(step != nullptr && step->protect_excl);
+	LibKernel::SyncOnAddress::SetOldWaits(step != nullptr && step->syncwait_old);
 	Common::PerfStats::SetSpinLocks(Common::PerfStats::SpinLocksFromEnvironment() ||
 	                                (step != nullptr && step->locks_spin));
 	static std::string applied = StartCpuSet();
@@ -1003,12 +1060,17 @@ bool HotPages() {
 }
 
 bool AsyncMemorySync() {
-	static const bool always = [] {
+	// Round 132: on unless KYTY_ASYNC_MEMORY_SYNC=0 (or F8's memsync:sync, for a step). In a race
+	// A/B it took 0.4 us off each draw and dispatch of the GPU thread.
+	static const bool on = [] {
 		const char* value = std::getenv("KYTY_ASYNC_MEMORY_SYNC");
-		return value != nullptr && std::strcmp(value, "1") == 0;
+		return value == nullptr || std::strcmp(value, "0") != 0;
 	}();
 	const auto* step = Current();
-	return always || (step != nullptr && step->memsync_async);
+	if (step != nullptr && step->memsync_async) {
+		return true;
+	}
+	return on && !(step != nullptr && step->memsync_sync);
 }
 
 bool HiZOff() {
@@ -1152,6 +1214,41 @@ float DepthEqualRelaxed() {
 bool BdaSyncSubmission() {
 	const auto* step = Current();
 	return step != nullptr && step->bdasync_submission;
+}
+
+bool StoreCleanOff() {
+	const auto* step = Current();
+	return step != nullptr && step->storeclean_off;
+}
+
+bool FrameHoldOff() {
+	const auto* step = Current();
+	return step != nullptr && step->hold_off;
+}
+
+bool CleanPageOld() {
+	const auto* step = Current();
+	return step != nullptr && step->cleanpage_old;
+}
+
+bool ReadWaitWriter() {
+	const auto* step = Current();
+	return step != nullptr && step->readwait_writer;
+}
+
+bool GlobalPm4Barriers() {
+	const auto* step = Current();
+	return step != nullptr && step->barriers_global;
+}
+
+bool PhaseTimingAll() {
+	const auto* step = Current();
+	return step != nullptr && step->phases_all;
+}
+
+bool PipelineProbeSync() {
+	const auto* step = Current();
+	return step != nullptr && step->probe_sync;
 }
 
 bool GbufferSync() {

@@ -2,6 +2,7 @@
 
 #include "common/logging/log.h"
 #include "common/perfStats.h"
+#include "graphics/host_gpu/renderer/bisect.h"
 
 #include <algorithm>
 #include <array>
@@ -26,6 +27,9 @@ struct Reporter {
 	uint64_t                              last_tsc    = 0;
 	uint64_t                              last_frames = 0;
 	uint64_t                              next_check  = 0;
+	// Round 131: the frame whose timing was decided last, and the timed frames at the last report.
+	uint64_t                                            timing_frame      = UINT64_MAX;
+	uint64_t                                            last_timed_frames = 0;
 	Totals                                last {};
 	std::array<uint64_t, PhaseCount + 1>  last_protect_cycles {};
 	std::array<uint64_t, PhaseCount + 1>  last_protect_count {};
@@ -148,6 +152,18 @@ bool EnabledFromEnvironment() {
 	return value == nullptr || value[0] != '0';
 }
 
+// Round 131: KYTY_GPU_PHASES_EVERY=<n> times the draws and dispatches of one frame in n (4 by
+// default; 1, every frame, as before). With KYTY_OP_STATS, which times whole operations, every
+// frame.
+uint64_t TimedEvery() {
+	static const uint64_t every = [] {
+		const char* value = std::getenv("KYTY_GPU_PHASES_EVERY");
+		const auto  n = value != nullptr && *value != '\0' ? std::strtoull(value, nullptr, 10) : 4u;
+		return std::clamp<uint64_t>(n, 1u, 64u);
+	}();
+	return OpStatsOn() ? 1u : every;
+}
+
 } // namespace
 
 bool OpStatsOn() noexcept {
@@ -156,6 +172,74 @@ bool OpStatsOn() noexcept {
 		return value != nullptr && value[0] == '1';
 	}();
 	return on;
+}
+
+bool TakeFrameHold() noexcept {
+	static const uint32_t threshold = [] {
+		const char* value = std::getenv("KYTY_HOLD_SKIPPED_DRAWS");
+		const auto n = value != nullptr && *value != '\0' ? std::strtoul(value, nullptr, 10) : 100u;
+		LOGF("Frame holds: a frame that left out %lu draws or more while their pipelines were "
+		     "looked up is not shown, the one before it stays (KYTY_HOLD_SKIPPED_DRAWS; 0 or F8's "
+		     "hold:off shows every frame)\n",
+		     n);
+		return static_cast<uint32_t>(n);
+	}();
+	constexpr uint32_t MaxInARow  = 2;
+	constexpr uint32_t ShownAfter = 8;
+	struct Holds {
+		std::chrono::steady_clock::time_point since    = std::chrono::steady_clock::now();
+		uint32_t                              in_a_row = 0;
+		uint32_t                              shown    = ShownAfter;
+		// Since the last line.
+		uint64_t frames   = 0;
+		uint64_t skipping = 0; // frames that left draws out
+		uint64_t skipped  = 0;
+		uint64_t most     = 0;
+		uint64_t over_32  = 0;
+		uint64_t over_100 = 0;
+		uint64_t over_300 = 0;
+		uint64_t held     = 0;
+	};
+	static Holds   s;
+	const uint64_t skips = g_frame_lookup_skips.exchange(0, std::memory_order_relaxed);
+	s.frames++;
+	if (skips != 0) {
+		s.skipping++;
+		s.skipped += skips;
+		s.most = std::max(s.most, skips);
+		s.over_32 += skips >= 32 ? 1u : 0u;
+		s.over_100 += skips >= 100 ? 1u : 0u;
+		s.over_300 += skips >= 300 ? 1u : 0u;
+	}
+	const bool hold = threshold != 0 && !Bisect::FrameHoldOff() && skips >= threshold &&
+	                  s.in_a_row < MaxInARow && (s.in_a_row != 0 || s.shown >= ShownAfter);
+	if (hold) {
+		s.in_a_row++;
+		s.shown = 0;
+		s.held++;
+	} else {
+		s.in_a_row = 0;
+		s.shown    = std::min(s.shown + 1u, ShownAfter);
+	}
+	const auto now = std::chrono::steady_clock::now();
+	if (now - s.since >= ReportInterval) {
+		if (s.skipped != 0) {
+			LOGF("Pipeline lookups (%.1f s): %" PRIu64 " draws left out while their pipelines were "
+			     "looked up, in %" PRIu64 " of %" PRIu64 " frames (most in one frame %" PRIu64
+			     "; frames with 32 or more %" PRIu64 ", 100 or more %" PRIu64
+			     ", 300 or more %" PRIu64 "); frames not shown (the one before stayed) %" PRIu64
+			     "\n",
+			     std::chrono::duration<double>(now - s.since).count(), s.skipped, s.skipping,
+			     s.frames, s.most, s.over_32, s.over_100, s.over_300, s.held);
+		}
+		const auto in_a_row = s.in_a_row;
+		const auto shown    = s.shown;
+		s                   = {};
+		s.since             = now;
+		s.in_a_row          = in_a_row;
+		s.shown             = shown;
+	}
+	return hold;
 }
 
 void NoteOp(bool dispatch, uint64_t key, uint64_t extra, uint64_t cycles, uint64_t bda_cycles,
@@ -177,7 +261,9 @@ void Start() {
 	g_reporter.last_tsc   = Now();
 	g_reporter.next_check = g_reporter.last_tsc;
 	LOGF("GPU phases: every 10 s, a \"GPU phases\" line with the GPU thread's time by step of a "
-	     "draw and of a dispatch (KYTY_GPU_PHASES=0 turns it off)\n");
+	     "draw and of a dispatch (KYTY_GPU_PHASES=0 turns it off), the draws and dispatches of one "
+	     "frame in %" PRIu64 " timed (KYTY_GPU_PHASES_EVERY; F8's phases:all times every frame)\n",
+	     TimedEvery());
 	if (OpStatsOn()) {
 		LOGF("GPU phases: with it, \"Dispatch shaders\" and \"Draw targets\" lines: the GPU "
 		     "thread's time by dispatch shader and by draw target (KYTY_OP_STATS)\n");
@@ -187,6 +273,15 @@ void Start() {
 void ReportIfDue(uint64_t frames) {
 	if (!Detail::t_on) {
 		return;
+	}
+	if (frames != g_reporter.timing_frame) {
+		// Round 131: whether this frame's draws and dispatches are timed.
+		g_reporter.timing_frame = frames;
+		const auto every        = Bisect::PhaseTimingAll() ? uint64_t {1} : TimedEvery();
+		Detail::t_timed         = frames % every == 0;
+		if (Detail::t_timed) {
+			Detail::g_timed_frames++;
+		}
 	}
 	const auto tsc = Now();
 	// A clock read only every ~50 million cycles (~10 ms).
@@ -206,6 +301,7 @@ void ReportIfDue(uint64_t frames) {
 	for (size_t i = 0; i < PhaseCount; i++) {
 		delta.cycles[i] = totals.cycles[i] - g_reporter.last.cycles[i];
 		delta.count[i]  = totals.count[i] - g_reporter.last.count[i];
+		delta.timed[i]  = totals.timed[i] - g_reporter.last.timed[i];
 	}
 	std::array<uint64_t, PhaseCount + 1> protect_cycles {};
 	std::array<uint64_t, PhaseCount + 1> protect_count {};
@@ -242,12 +338,21 @@ void ReportIfDue(uint64_t frames) {
 	g_reporter.last_tsc    = tsc;
 	const auto new_frames  = frames - g_reporter.last_frames;
 	g_reporter.last_frames = frames;
+	const auto timed_frames      = Detail::g_timed_frames - g_reporter.last_timed_frames;
+	g_reporter.last_timed_frames = Detail::g_timed_frames;
 	if (cycles_per_us <= 0.0) {
 		return;
 	}
 
+	// A phase's time: its timed scopes' average times its count (round 131: the scopes of the
+	// frames not timed are counted only).
 	const auto us = [&](Phase phase) {
-		return static_cast<double>(delta.cycles[static_cast<size_t>(phase)]) / cycles_per_us;
+		const auto index = static_cast<size_t>(phase);
+		if (delta.timed[index] == 0) {
+			return 0.0;
+		}
+		return static_cast<double>(delta.cycles[index]) / cycles_per_us *
+		       static_cast<double>(delta.count[index]) / static_cast<double>(delta.timed[index]);
 	};
 	const auto count = [&](Phase phase) { return delta.count[static_cast<size_t>(phase)]; };
 	// Microseconds of `phase` per operation of `per`.
@@ -261,6 +366,9 @@ void ReportIfDue(uint64_t frames) {
 		line += fmt::format(" [{}]", step);
 	}
 	line += fmt::format(": {} frames", new_frames);
+	if (timed_frames != new_frames) {
+		line += fmt::format(" ({} timed)", timed_frames);
+	}
 
 	const auto steps = [&](Phase                                                total,
 	                       std::initializer_list<std::pair<const char*, Phase>> parts) {
@@ -326,12 +434,12 @@ void ReportIfDue(uint64_t frames) {
 	};
 	line += fmt::format(" | {} ({:.1f} regions, {:.1f} protects each; {} after a wait in their "
 	                    "submission, {} draws or dispatches after CPU writes left to the last one; "
-	                    "{} waits on memory passed), {}, {}",
+	                    "{} waits on memory passed), {}, {}, stores on watched pages {}",
 	                    counted("bda walks", Phase::BdaWalk), per_walk(Phase::BdaRegions),
 	                    per_walk(Phase::BdaProtects), count(Phase::BdaAfterWait),
 	                    count(Phase::BdaHeldBack), count(Phase::WaitPassed),
 	                    counted("spec checks", Phase::SpecCheck),
-	                    counted("buffers made", Phase::BufferCreate));
+	                    counted("buffers made", Phase::BufferCreate), count(Phase::CleanStore));
 	{
 		// The protection changes by the step they were made in, the costliest first (round 72).
 		std::array<size_t, PhaseCount + 1> order {};
@@ -389,8 +497,9 @@ void ReportIfDue(uint64_t frames) {
 		blocks.clear();
 	}
 	{
-		// Round 113: the slices by the kind of queue they ran, a frame.
-		const double frames_d = new_frames != 0 ? static_cast<double>(new_frames) : 1.0;
+		// Round 113: the slices by the kind of queue they ran, a frame (of the timed frames, which
+		// alone measure them: round 131).
+		const double frames_d = timed_frames != 0 ? static_cast<double>(timed_frames) : 1.0;
 		const auto   ms_frame = [&](uint64_t cycles) {
             return static_cast<double>(cycles) / cycles_per_us / 1000.0 / frames_d;
 		};
@@ -474,20 +583,72 @@ void ReportIfDue(uint64_t frames) {
 			return fmt::format("{} {} in {:.0f} ms (longest {:.1f} ms)", name, count(phase),
 			                   us(phase) / 1000.0, longest_ms(phase));
 		};
+		// Round 130: the lookups made on worker threads since the last report.
+		const uint64_t worker_lookups =
+		    g_worker_lookups.count.exchange(0, std::memory_order_relaxed);
+		const uint64_t worker_us = g_worker_lookups.us.exchange(0, std::memory_order_relaxed);
+		const uint64_t worker_longest =
+		    g_worker_lookups.longest_us.exchange(0, std::memory_order_relaxed);
+		const uint64_t worker_found = g_worker_lookups.found.exchange(0, std::memory_order_relaxed);
+		// Round 134: the shader disk cache reads made on worker threads.
+		const uint64_t disk_reads =
+		    g_worker_disk_reads.count.exchange(0, std::memory_order_relaxed);
+		const uint64_t disk_us = g_worker_disk_reads.us.exchange(0, std::memory_order_relaxed);
+		const uint64_t disk_longest =
+		    g_worker_disk_reads.longest_us.exchange(0, std::memory_order_relaxed);
+		const uint64_t disk_found =
+		    g_worker_disk_reads.found.exchange(0, std::memory_order_relaxed);
 		if (count(Phase::ShaderDisk) + count(Phase::ShaderCompile) + count(Phase::PipelineWait) +
 		        count(Phase::PipelineCompile) + count(Phase::TranslationSkip) +
-		        count(Phase::PipelineSkip) + count(Phase::PipelineProbe) !=
+		        count(Phase::PipelineSkip) + count(Phase::PipelineProbe) +
+		        count(Phase::PipelineLookupSkip) + worker_lookups + disk_reads +
+		        count(Phase::DiskReadSkip) !=
 		    0) {
+			std::string workers;
+			if (worker_lookups + count(Phase::PipelineLookupSkip) != 0) {
+				workers = fmt::format(
+				    "; on worker threads pipeline cache lookups {} in {:.0f} ms (longest {:.1f} "
+				    "ms) (found {}, to compile {}), draws skipped while their pipeline was looked "
+				    "up {}",
+				    worker_lookups, static_cast<double>(worker_us) / 1000.0,
+				    static_cast<double>(worker_longest) / 1000.0, worker_found,
+				    worker_lookups - worker_found, count(Phase::PipelineLookupSkip));
+				// Round 132: each lookup's average time by how many ran at once as it began.
+				std::string                          by;
+				constexpr std::array<const char*, 4> Names {"alone", "2-3", "4-7", "8+"};
+				for (size_t i = 0; i < Names.size(); i++) {
+					const auto n = g_worker_lookups.by_concurrency_count[i].exchange(
+					    0, std::memory_order_relaxed);
+					const auto t = g_worker_lookups.by_concurrency_us[i].exchange(
+					    0, std::memory_order_relaxed);
+					if (n != 0) {
+						by +=
+						    fmt::format("{}{} {} x {:.1f} ms", by.empty() ? "" : ", ", Names[i], n,
+						                static_cast<double>(t) / 1000.0 / static_cast<double>(n));
+					}
+				}
+				if (!by.empty()) {
+					workers += " (by lookups at once: " + by + ")";
+				}
+			}
+			if (disk_reads + count(Phase::DiskReadSkip) != 0) {
+				workers += fmt::format(
+				    "; on worker threads shader disk cache reads {} in {:.0f} ms (longest {:.1f} "
+				    "ms) ({} found), draws skipped while their shaders were read {}",
+				    disk_reads, static_cast<double>(disk_us) / 1000.0,
+				    static_cast<double>(disk_longest) / 1000.0, disk_found,
+				    count(Phase::DiskReadSkip));
+			}
 			LOGF("Shader work (%.1f s): on the GPU thread %s, %s, %s (found %" PRIu64
 			     ", to compile %" PRIu64 "), %s, %s; draws skipped while their shaders "
-			     "translated %" PRIu64 ", while their pipeline compiled %" PRIu64 "\n",
+			     "translated %" PRIu64 ", while their pipeline compiled %" PRIu64 "%s\n",
 			     seconds, work("disk cache reads", Phase::ShaderDisk).c_str(),
 			     work("translations and compiles", Phase::ShaderCompile).c_str(),
 			     work("pipeline cache lookups", Phase::PipelineProbe).c_str(),
 			     count(Phase::PipelineProbeHit), count(Phase::PipelineProbeMiss),
 			     work("pipeline waits", Phase::PipelineWait).c_str(),
 			     work("pipeline compiles", Phase::PipelineCompile).c_str(),
-			     count(Phase::TranslationSkip), count(Phase::PipelineSkip));
+			     count(Phase::TranslationSkip), count(Phase::PipelineSkip), workers.c_str());
 		}
 	}
 	if (OpStatsOn()) {

@@ -214,6 +214,13 @@ RenderContext::RenderContext(GraphicContext& graphics)
 	m_texture_cache.on_bindless_unregister = [this](ImageId id) {
 		m_bindless_table.OnImageUnregistered(id);
 	};
+	// Round 132: a GPU-thread store the buffer cache makes on watched CPU-clean pages
+	// (BufferCache::WriteClean) is a write the bindless table's watches must hear of.
+	m_buffer_cache.SetCleanStoreHook(
+	    [](void* user, uint64_t vaddr, uint64_t size) {
+		    static_cast<BindlessTable*>(user)->OnCpuWrite(vaddr, size);
+	    },
+	    &m_bindless_table);
 	m_texture_cache.on_image_release = [this](const Image& image) {
 		if (!m_bindless_table.Enabled()) {
 			return false;
@@ -457,6 +464,22 @@ bool RenderContext::IsGpuWrittenPage(uint64_t fault_vaddr) noexcept {
 	}
 	const auto page = fault_vaddr & ~(TRACKER_PAGE_SIZE - 1);
 	return m_buffer_cache.IsRegionGpuModified(page, TRACKER_PAGE_SIZE);
+}
+
+std::string RenderContext::DescribeGpuBytes(uint64_t vaddr, uint64_t size) {
+	if (size == 0 || !IsMapped(vaddr, size)) {
+		return "not mapped for the GPU";
+	}
+	const auto  page        = vaddr & ~(TRACKER_PAGE_SIZE - 1);
+	const bool  page_gpu    = m_buffer_cache.IsRegionGpuModified(page, TRACKER_PAGE_SIZE);
+	const bool  bytes_dirty = m_buffer_cache.HasGpuDirtyBytesShared(vaddr, size);
+	const bool  clean       = m_buffer_cache.IsCleanForConcurrentRead(vaddr, size);
+	const char* watched     = m_page_manager.IsReadWatched(vaddr)    ? "reads and writes fault"
+	                          : m_page_manager.IsWriteWatched(vaddr) ? "writes fault"
+	                                                                 : "no access faults";
+	return fmt::format("page GPU-written {}, these bytes GPU-written {}{}, the page: {}",
+	                   page_gpu ? "yes" : "no", bytes_dirty ? "yes" : "no",
+	                   !bytes_dirty && !clean ? " (being downloaded)" : "", watched);
 }
 
 bool RenderContext::TryWriteFaulting(uint64_t pc, uint64_t fault_vaddr, uint64_t vaddr,

@@ -237,6 +237,36 @@
 //                on memory the GPU uses, busy
 //   slow:reads[:<us>]  a game thread's read of bytes the GPU wrote, which waits for them, waits
 //                <us> microseconds more (2500 by default)
+// and, round 130:
+//   probe:sync   a new pipeline is looked up in the driver's caches on the GPU thread, as before
+//                (KYTY_PIPELINE_LOOKUP_THREADS=0 for the whole run), not on a worker thread
+// and, round 131:
+//   phases:all   the GPU phases time the draws and dispatches of every frame, as before
+//                (KYTY_GPU_PHASES_EVERY=1 for the whole run), not of one frame in four
+// and, round 132 (each the way before round 132, for an A/B against the new defaults):
+//   memsync:sync  the GPU thread's syncs make their read-only protections and their uploads'
+//                reads themselves (KYTY_ASYNC_MEMORY_SYNC=0 for the whole run)
+//   syncwait:old  the game's waits on an address use the condition variable, with no spin
+//                (KYTY_SYNC_WAIT=old for the whole run)
+//   flush:16     a command buffer is submitted every 16 draws (64 now; KYTY_DRAW_FLUSH_INTERVAL)
+//   storeclean:off a GPU-thread store to watched CPU-clean pages makes them CPU-dirty
+//                (KYTY_STORE_CLEAN=0 for the whole run; BufferCache::WriteClean)
+// and, round 133:
+//   hold:off     every frame is shown, also one that left out many draws while their pipelines
+//                were looked up (KYTY_HOLD_SKIPPED_DRAWS=0 for the whole run;
+//                GpuPhases::TakeFrameHold)
+// and, round 135 (BufferCache::ReadMemoryStep):
+//   cleanpage:old  a game thread's fault on a page another thread's read has just made current
+//                downloads the rest of its window and waits for it, as before (KYTY_CLEAN_PAGE=old
+//                for the whole run)
+//   readwait:writer a game thread's read of bytes whose writer the GPU is still running waits for
+//                that command buffer and then copies them on the readback queue, instead of a
+//                download behind every command buffer recorded since (KYTY_READ_WAIT=writer for
+//                the whole run)
+//   barriers:global the PM4 cache flushes, RELEASE_MEM and suspend points record a full barrier,
+//                as before round 135 (KYTY_PM4_BARRIERS=global for the whole run)
+//   protect:exclusive the page tracker's protections take the address space's lock exclusively,
+//                as before round 135 (KYTY_PROTECT_LOCK=exclusive for the whole run)
 // KYTY_BISECT_AB=1: while a step is on, it is turned off and on again at each Perf line (every
 // 2 s), so its lines and the lines without it ("<name> base") alternate, and each can be compared
 // with the ones next to it, made on nearly the same frames.
@@ -319,9 +349,10 @@ void RequestPicture(const std::string& name);
 [[nodiscard]] bool ScanOneThread();
 // Any thread: hotpages, or KYTY_HOT_PAGES=1.
 [[nodiscard]] bool HotPages();
-// Round 111, any thread: memsync:async, or KYTY_ASYNC_MEMORY_SYNC=1: the read-only protections
-// the GPU thread's buffer syncs ask for and their uploads' reads are done on the page manager's
-// worker (PageManager::DeferScope, PostDeferred).
+// Round 111, any thread: the read-only protections the GPU thread's buffer syncs ask for and
+// their uploads' reads are done on the page manager's worker (PageManager::DeferScope,
+// PostDeferred): by default since round 132; not with KYTY_ASYNC_MEMORY_SYNC=0 or in a
+// memsync:sync step; always in a memsync:async step.
 [[nodiscard]] bool AsyncMemorySync();
 // Any thread: hiz:off.
 [[nodiscard]] bool HiZOff();
@@ -361,6 +392,18 @@ void RequestPicture(const std::string& name);
 [[nodiscard]] float DepthEqualRelaxed();
 // GPU thread: bdasync:submission.
 [[nodiscard]] bool BdaSyncSubmission();
+// GPU thread: probe:sync (round 130); phases:all (round 131).
+[[nodiscard]] bool PipelineProbeSync();
+[[nodiscard]] bool PhaseTimingAll();
+// GPU thread: storeclean:off (round 132).
+[[nodiscard]] bool StoreCleanOff();
+// GPU thread: hold:off (round 133).
+[[nodiscard]] bool FrameHoldOff();
+// GPU thread: cleanpage:old, readwait:writer, barriers:global (round 135; protect:exclusive is
+// applied to the kernel's memory, LibKernel::Memory::SetProtectLockExclusive).
+[[nodiscard]] bool CleanPageOld();
+[[nodiscard]] bool ReadWaitWriter();
+[[nodiscard]] bool GlobalPm4Barriers();
 // GPU thread: gbuffer:sync; depthread:old (round 91).
 [[nodiscard]] bool GbufferSync();
 [[nodiscard]] bool DepthReadOld();

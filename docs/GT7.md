@@ -60,6 +60,95 @@ update everything is compiled once more.
 To report a problem, open an issue on this repository with the **Bug report** form (attach the
 zipped `_kyty.txt` log).
 
+## What's new (October 23, 2026, sixth build)
+
+No shaders are compiled again after this update.
+
+- **No more crash in some replays** ([issue 18](https://github.com/usa-ratt/KytyPS5-GT7/issues/18)).
+  One tessellated draw in a replay used a setup the emulator doesn't support yet, and the
+  emulator closed. That draw is now skipped (something in the replay may be missing for a
+  moment), and the log names the setup ("Tessellation: ... not supported").
+- **A clearer start-up error on graphics cards that lack something the emulator needs**
+  ([issue 20](https://github.com/usa-ratt/KytyPS5-GT7/issues/20)): it now lists everything the
+  card is missing, not only the first thing.
+
+## What's new (October 23, 2026, fifth build)
+
+No shaders are compiled again after this update. A few pipelines (draws that use
+alpha-to-coverage) compile once, so the first race after updating can stutter a little.
+
+- **Smoother races.** In a 5-lap race at Tokyo twilight against 11 AI cars the frame rate stayed
+  around 22 to 23 fps, rarely below 21 and often 23 to 24, in spots that used to drop to about 18.
+  What changed:
+  - When several of the game's threads read the same results of the graphics work at once, the
+    ones that find the data already fetched go on at once instead of waiting for the area around
+    it to download again.
+  - The memory tracker's locks are held much less, and memory protections from different threads
+    no longer queue behind one another (Franseven's ports of mainline changes).
+  - Fewer full GPU barriers (Franseven's port of a mainline change).
+- **Alpha-to-coverage** is now honoured: the edges of foliage, fences and other cut-out textures
+  are drawn the way the game asks (from mainline, ported by Franseven). `KYTY_ALPHA_TO_COVERAGE=0`
+  turns it off.
+- **The game's online requests fail the way they do on a PS5 with no internet.** Before, each one
+  failed with an emulator error (a bad handle). The emulator still never goes online.
+- The game's checks for a racing wheel now get a proper "no wheel connected" answer.
+- More fixes from Franseven's batch for other games: audio contexts no longer stall each other,
+  network functions some games call, images whose creation the driver refused, and an audio
+  format some games pass the other way round.
+
+## What's new (October 23, 2026, fourth build)
+
+No shaders are compiled again after this update.
+
+- **No more hard freezes at the start of a race.** The emulator read each shader the game used for
+  the first time in a session from its shader cache on disk on the same thread that runs the
+  game's graphics work. On some runs each read took 7 ms, and the start of a race reads about
+  3,000: 22 seconds of the race, most of it in lap 1. These reads now run on 4 helper threads, and
+  a draw whose shader is still being read is left out for a frame or two instead.
+- **No more "the whole track flickers away" at the start of a race.** When hundreds of new
+  pipelines are looked up at once, a frame could be drawn with most of the track missing. Such a
+  frame (one that left out 100 draws or more) is no longer shown; the frame before it stays on the
+  screen instead. `KYTY_HOLD_SKIPPED_DRAWS=0` shows every frame again.
+- **Compiled pipelines are kept after a crash.** They were saved only when the emulator closed
+  normally, so a crash threw away every pipeline the session had compiled, and the next session
+  compiled them all again (thousands, on a new track). They are now also saved every 5 minutes
+  while you play. `KYTY_PIPELINE_SAVE_MINUTES` sets how often (0: only when closing).
+- **Crash reports say more.** A crash inside the graphics driver while it compiles a pipeline
+  names the pipeline, and a crash in the game's own code shows the state of the exact memory it
+  was using. The launcher's console window now prints the emulator's exit code when it ends.
+
+## What's new (October 23, 2026, third build)
+
+No shaders are compiled again after this update.
+
+- **Faster races, about 1.5 fps.** Two settings that won in A/B tests are now on by default, measured
+  in a 5-lap race at Tokyo against 11 AI cars:
+  - Memory protection changes the graphics work asks for now run on a helper thread, instead of
+    holding up the thread that runs the game's graphics work: +0.6 fps.
+  - Draws go to the graphics card in batches of 64 instead of 16: +1.0 fps.
+- **Fewer memory protection round trips.** When the emulator writes a small value into memory the
+  game is watching (mostly "done" markers), it now writes it in place instead of unprotecting and
+  protecting that memory again.
+- **Helper threads wake up at once on Windows.** Waking a sleeping game helper thread could take
+  up to half a millisecond; it now takes about 6 microseconds. The frame rate didn't change
+  measurably.
+- **More detail in crash reports.** When the game's own code crashes, the report now shows the
+  memory at the addresses it was using, whether the graphics card writes that memory, and what the
+  emulator itself wrote there in the last few seconds.
+
+## What's new (October 23, 2026, second build)
+
+No shaders are compiled again after this update.
+
+- **A smoother first lap.** In a race, the first lap of each session was the roughest, with
+  freezes of up to a second, and laps got better from the second on. The emulator looked up each
+  new pipeline (the compiled form of a draw's shaders and settings) in its cache on disk on the
+  same thread that runs the game's graphics work, and on a track each lookup took 4 to 8 ms: about
+  13 seconds of a 5-lap race at Tokyo against 11 AI cars, nearly all in lap 1. The lookups now run
+  on 4 extra threads while the graphics work goes on, and in the same race lap 1 had two short
+  stutters. Something new on screen can show up a frame or two late on lap 1 while its lookup
+  finishes. `KYTY_PIPELINE_LOOKUP_THREADS=0` brings back the old way.
+
 ## What's new (October 23, 2026)
 
 No shaders are compiled again after this update.
@@ -287,6 +376,10 @@ Graphics and shaders:
 - Tokyo at night: some shadows on tunnel ceilings and walls move with the camera.
 - **AMD graphics cards:** the game crashes at the GT logo, inside the AMD driver's shader compiler
   ([issue 12](https://github.com/usa-ratt/KytyPS5-GT7/issues/12)). Being looked into.
+- **Scapes:** the controls stop working after Olivier offers the drift photography tutorial
+  ([issue 19](https://github.com/usa-ratt/KytyPS5-GT7/issues/19)). The tutorial waits for the
+  game's online servers, which the emulator has no stand-in for, so the Menu Book "Take a Photo of
+  Your Car in Scapes" can't be finished yet. Closing the emulator is the only way out of it.
 - **Livery editor:** leaving it shows error CE-210717 (the game uploads the livery to its online
   service, which the emulator has no stand-in for), and some parts of a saved livery's picture can
   have the wrong colour.
@@ -296,8 +389,12 @@ Graphics and shaders:
   names the graphics buffer involved.
 - In-game videos can play out of sync with their sound
   ([issue 4](https://github.com/usa-ratt/KytyPS5-GT7/issues/4)). Being looked into.
-- Once, in a race on a new track in the chase view, most of the track disappeared after it had
-  loaded (cars and some objects stayed); switching to the cockpit view and back brought it back.
+- **Intel Arc graphics cards:** the emulator stops at start-up: the driver lacks fragment shader
+  barycentrics, which the emulator needs
+  ([issue 20](https://github.com/usa-ratt/KytyPS5-GT7/issues/20)). Being looked into.
+- **NVIDIA:** the driver's shader compiler can crash while it compiles new pipelines
+  ([issue 18](https://github.com/usa-ratt/KytyPS5-GT7/issues/18)). Being looked into; the crash
+  report names the pipeline.
 - If a loading screen still never ends, please open an issue with the log.
 
 ## Credits
@@ -306,7 +403,11 @@ Graphics and shaders:
   calls every frame, UI text blending (color One, alpha Zero over a source-alpha destination, with
   dead render-target exports no longer blocking it), UI text sampled narrower than the target it was
   drawn into (the text shadow smear), and ports of upstream fixes by nmzik (zero-stride buffer
-  fetches, oversized image uploads, NOP marker tags, depth DCC metadata).
+  fetches, oversized image uploads, NOP marker tags, depth DCC metadata). His second batch ported
+  mainline changes by nmzik (PM4 barriers, alpha-to-coverage, empty indirect dispatches, the
+  tiler's pipelines, audio system state, HTTP functions), Mr. Big Britches (the shared protection
+  lock, AudioOut2 context mutexes), NeySlim (lock-free dirty bits) and Arda Sahin (image usage),
+  plus his own fixes for storage buffer ranges, read-only buffer syncs and ATRAC9 configurations.
 
 ## Current state
 

@@ -11,8 +11,8 @@
 #include "graphics/shader/shaderCompiler.h"
 
 #include <array>
+#include <atomic>
 #include <chrono>
-#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -56,6 +56,7 @@ struct PipelineStaticParameters {
 	bool                       depth_bounds_test_enable = false;
 	float                      depth_min_bounds         = 0.0f;
 	float                      depth_max_bounds         = 0.0f;
+	bool                       alpha_to_coverage_enable = false;
 	uint32_t                   color_mask[RENDER_COLOR_ATTACHMENTS_MAX]           = {};
 	bool                       cull_front                                         = false;
 	bool                       cull_back                                          = false;
@@ -79,7 +80,7 @@ struct PipelineStaticParameters {
 static_assert(std::is_trivially_copyable_v<PipelineStaticParameters>);
 static_assert(std::is_standard_layout_v<PipelineStaticParameters>);
 static_assert(alignof(PipelineStaticParameters) == 1);
-static_assert(sizeof(PipelineStaticParameters) == 125);
+static_assert(sizeof(PipelineStaticParameters) == 126);
 
 struct PipelineRenderingState {
 	std::array<vk::Format, RENDER_COLOR_ATTACHMENTS_MAX> color_formats {};
@@ -387,6 +388,12 @@ private:
 	const std::vector<uint32_t>* PendingExpansion(uint64_t shader_hash) const;
 	// Save, done with the driver cache: destroyed, or kept while background compiles use it.
 	void ReleaseDriverCache(size_t still_compiling);
+	// Round 134: the write of the driver cache to its file (Save's, and the saves during play).
+	enum class CacheWrite : uint8_t { Saved, Unchanged, TooLarge, Failed };
+	CacheWrite WriteDriverCacheFile(bool during_play, size_t& bytes);
+	// GPU thread, for each new pipeline taken from a background compile: a save during play when
+	// one is due (KYTY_PIPELINE_SAVE_MINUTES).
+	void MaybeSaveDuringPlay();
 	struct ProgramCache;
 
 	// GetGraphicsPrograms' stage inputs from the registers (shared with DrawPrepDescribeGraphics;
@@ -476,6 +483,13 @@ private:
 	std::chrono::steady_clock::time_point m_backlog_begin {};
 	std::chrono::steady_clock::time_point m_backlog_last_report {};
 	bool                                  m_saved = false;
+	// Round 134: the saves of the driver cache during play (MaybeSaveDuringPlay), each on a thread
+	// of its own; Save waits for one still writing.
+	std::mutex                            m_save_mutex;
+	std::thread                           m_save_thread;
+	std::atomic<bool>                     m_save_running {false};
+	std::chrono::steady_clock::time_point m_last_save {};
+	uint64_t                              m_new_since_save = 0;
 	// Round 99: the shaders whose call is partitioned (by hash), their partitions' programs (by
 	// id: their pipelines compile alongside each other), and when the next new partition's SPIR-V
 	// may be made (GetComputeProgram).
@@ -495,16 +509,6 @@ private:
 	std::chrono::steady_clock::time_point m_wait_renewed {};
 
 	void InitializeDriverCache();
-	// The driver cache is also written every KYTY_PIPELINE_SAVE_MINUTES (default 3; 0: only at
-	// exit) once it has grown by 64 MB: a run that hangs or crashes never reaches Save, and the
-	// next one compiled every pipeline again, its draws waiting on a cold cache's queue.
-	void                    SnapshotLoop();
-	[[nodiscard]] bool      WriteDriverCacheFile(std::span<const uint8_t> payload);
-	std::mutex              m_snapshot_mutex;
-	std::condition_variable m_snapshot_wake;
-	bool                    m_snapshot_stop  = false;
-	size_t                  m_snapshot_bytes = 0;
-	std::thread             m_snapshot_thread;
 	// Takes a finished background compile into the pipeline; false while it still runs.
 	bool FinishPending(Pipeline& pipeline);
 	// Waits for a background compile while this frame's budget lasts.

@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/crashNote.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/guestWatch.h"
@@ -41,6 +42,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -873,6 +875,17 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		// KYTY_NO_CLEAN_WRITE_EMULATION=1, or KYTY_BISECT's writes:off, takes the old way.
 		static const bool emulate_clean_writes =
 		    std::getenv("KYTY_NO_CLEAN_WRITE_EMULATION") == nullptr;
+		// Round 135: the reads and stores below that go to the GPU thread are counted by
+		// instruction (BufferCache::ReadMemory).
+		struct FaultPcScope {
+			explicit FaultPcScope(uint64_t pc)
+			    : previous(std::exchange(Common::PerfStats::t_fault_pc, pc)) {}
+			~FaultPcScope() { Common::PerfStats::t_fault_pc = previous; }
+			FaultPcScope(const FaultPcScope&)            = delete;
+			FaultPcScope& operator=(const FaultPcScope&) = delete;
+			uint64_t      previous;
+		};
+		const FaultPcScope fault_pc(info->exception_address);
 		if (access == GpuAccess::Write && emulate_clean_writes &&
 		    !Libs::Graphics::GuestGpu::IsGpuThread() && !Libs::Graphics::Bisect::CleanWritesOff() &&
 		    Libs::LibKernel::Memory::IsGpuWrittenPage(info->access_violation_vaddr)) {
@@ -920,6 +933,15 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		// in the emulator's own code is found from its code bytes and the map file.
 		std::string report = "--- Guest fault context ---\n";
 		report += fmt::format("thread: {}\n", thread_name);
+		// Round 134: a host thread's name, and what it was doing when that is noted: a crash in
+		// the graphics driver while it compiled a pipeline names the pipeline.
+		if (Libs::LibKernel::PthreadSelfOrNull() == nullptr) {
+			report += fmt::format("host thread: {}\n", Common::PerfStats::ThreadNameOf(
+			                                               Common::PerfStats::CurrentOsThreadId()));
+		}
+		if (const char* note = Common::CrashNote(); note[0] != '\0') {
+			report += fmt::format("doing: {}\n", note);
+		}
 		report += fmt::format("rax={:016x} rbx={:016x} rcx={:016x} rdx={:016x}\n"
 		                      "rsi={:016x} rdi={:016x} rbp={:016x} rsp={:016x}\n"
 		                      "r8 ={:016x} r9 ={:016x} r10={:016x} r11={:016x}\n"
@@ -969,6 +991,41 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			if (!frames.empty()) {
 				report +=
 				    "frames (each return address <- the 32 code bytes before it):" + frames + "\n";
+			}
+		}
+		// Round 132: what the registers holding guest addresses point at: 32 bytes there (read
+		// through the backing store, which no protection stops), whether that page holds bytes
+		// the emulator counts as GPU-written, and the emulator's own writes there in the last 10 s
+		// (downloads, fast readbacks, the GPU thread's stores). A null pointer the game read from
+		// its own memory may be one the emulator put there.
+		{
+			const std::pair<const char*, uint64_t> registers[] = {
+			    {"rax", info->rax}, {"rbx", info->rbx}, {"rcx", info->rcx}, {"rdx", info->rdx},
+			    {"rsi", info->rsi}, {"rdi", info->rdi}, {"rbp", info->rbp}, {"r8", info->r8},
+			    {"r9", info->r9},   {"r10", info->r10}, {"r11", info->r11}, {"r12", info->r12},
+			    {"r13", info->r13}, {"r14", info->r14}, {"r15", info->r15}};
+			std::string memory;
+			for (const auto& [name, value]: registers) {
+				const auto at = value & ~uint64_t {7};
+				if (at < 0x100000u) {
+					continue;
+				}
+				std::array<uint8_t, 32> bytes {};
+				if (!Libs::LibKernel::Memory::TryReadBacking(at, bytes.data(), bytes.size())) {
+					continue;
+				}
+				memory += fmt::format("\n {} {:016x}:", name, at);
+				for (const auto byte: bytes) {
+					memory += fmt::format(" {:02x}", byte);
+				}
+				// Round 133: the GPU's view of the bytes themselves, not only of their page.
+				memory += fmt::format(
+				    " | GPU: {} | emulator writes: {}",
+				    Libs::LibKernel::Memory::DescribeGpuBytes(at, bytes.size()),
+				    Libs::LibKernel::Memory::DescribeJournal(at, bytes.size(), 10000, 6));
+			}
+			if (!memory.empty()) {
+				report += "memory at the registers' addresses:" + memory + "\n";
 			}
 		}
 		std::fputs(report.c_str(), stdout);
