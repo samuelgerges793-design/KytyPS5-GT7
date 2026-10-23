@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <fmt/format.h>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -273,6 +274,31 @@ std::string Percent(uint64_t part, uint64_t whole) {
 	                              : 100.0 * static_cast<double>(part) / static_cast<double>(whole));
 }
 
+// The time between presents, for the frame-time figures of the Perf line (stutter that an average
+// fps hides). Presents come from one thread at a time; the mutex covers the report's take.
+std::mutex            g_frame_mutex;
+std::vector<uint32_t> g_frame_us;
+uint64_t              g_last_present_ns = 0;
+
+// "frames: longest X ms, 1% low Y fps, Z over twice the median" for the last report's frames.
+std::string FrameTimeText() {
+	std::vector<uint32_t> frames;
+	{
+		std::scoped_lock lock(g_frame_mutex);
+		frames.swap(g_frame_us);
+	}
+	if (frames.size() < 4) {
+		return {};
+	}
+	std::sort(frames.begin(), frames.end());
+	const auto median  = frames[frames.size() / 2];
+	const auto slowest = frames[std::min(frames.size() - 1, frames.size() * 99 / 100)];
+	const auto over    = static_cast<size_t>(
+        frames.end() - std::upper_bound(frames.begin(), frames.end(), median * 2u));
+	return fmt::format(" | frames: longest {:.1f} ms, 1% low {:.1f} fps, {} over twice the median",
+	                   frames.back() / 1000.0, slowest == 0 ? 0.0 : 1e6 / slowest, over);
+}
+
 void Report(double seconds, std::unordered_map<uint32_t, uint64_t>& last_cpu) {
 	auto&      c    = g_counters;
 	const auto take = [](std::atomic<uint64_t>& value) {
@@ -306,7 +332,7 @@ void Report(double seconds, std::unordered_map<uint32_t, uint64_t>& last_cpu) {
 	    "Perf: {:.1f} s, {:.1f} fps{} | GPU thread: busy {} (host GPU {}), idle {}, blocked {} | "
 	    "{} draws, {} dispatches a frame, {:.1f} us each | faults {:.0f}/s ({:.0f} reads, "
 	    "{:.0f} emulated), {:.0f} ms/s in handlers, {:.0f}/s of 1 ms or more, longest {:.1f} ms "
-	    "| downloads {:.0f}/s, {:.1f} MB/s{}\n",
+	    "| downloads {:.0f}/s, {:.1f} MB/s{}{}\n",
 	    seconds, static_cast<double>(presents) / seconds, configuration, Percent(busy, interval),
 	    Percent(host_gpu, interval), Percent(idle, interval), Percent(blocked, interval),
 	    draws / frames, dispatch / frames,
@@ -315,7 +341,7 @@ void Report(double seconds, std::unordered_map<uint32_t, uint64_t>& last_cpu) {
 	    static_cast<double>(emulated) / seconds, static_cast<double>(fault_ns) / 1e6 / seconds,
 	    static_cast<double>(longs) / seconds, static_cast<double>(longest) / 1e6,
 	    static_cast<double>(loads) / seconds, static_cast<double>(bytes) / 1e6 / seconds,
-	    MemoryText()));
+	    FrameTimeText(), MemoryText()));
 
 	// The host GPU's queue, and what game-thread accesses to GPU-written memory wait for.
 	{
@@ -486,7 +512,15 @@ void AddDispatchSlow() {
 
 void AddPresentSlow() {
 	g_counters.presents.fetch_add(1, std::memory_order_relaxed);
+	const auto       now = NowNs();
+	std::scoped_lock lock(g_frame_mutex);
+	if (g_last_present_ns != 0 && g_frame_us.size() < 4096) {
+		g_frame_us.push_back(static_cast<uint32_t>(std::min<uint64_t>(
+		    (now - g_last_present_ns) / 1000u, std::numeric_limits<uint32_t>::max())));
+	}
+	g_last_present_ns = now;
 }
+
 
 void AddDownloadSlow(uint64_t bytes) {
 	g_counters.downloads.fetch_add(1, std::memory_order_relaxed);
