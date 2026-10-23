@@ -418,9 +418,13 @@ private:
 	[[nodiscard]] bool       SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size,
 	                                           bool is_written, bool is_texel_buffer);
 	// Records the copies of an upload UploadCopies staged from `source` into `buffer`, with their
-	// barriers (and the metadata watches' notes of the bytes).
+	// barriers (and the metadata watches' notes of the bytes). Without `barriers` the caller has
+	// recorded UploadBatchBarrier(true) before them and records UploadBatchBarrier(false) after
+	// the last upload of its batch, whose copies write bytes no other copy of it writes.
 	void RecordUpload(Buffer& buffer, std::span<const vk::BufferCopy> copies, uint64_t total_size,
-	                  vk::Buffer source);
+	                  vk::Buffer source, bool barriers = true);
+	// The barrier before (`before`) or after a batch of uploads, for all of them at once.
+	void UploadBatchBarrier(bool before);
 	[[nodiscard]] vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
 	                                      uint64_t total_size);
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);

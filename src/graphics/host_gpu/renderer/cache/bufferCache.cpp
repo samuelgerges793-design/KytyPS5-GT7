@@ -2064,7 +2064,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 }
 
 void BufferCache::RecordUpload(Buffer& buffer, std::span<const vk::BufferCopy> copies,
-                               uint64_t total_size, vk::Buffer source) {
+                               uint64_t total_size, vk::Buffer source, bool barriers) {
 	if (m_metadata_watch_count.load(std::memory_order_relaxed) != 0) {
 		// Bytes the CPU wrote, uploaded over what a fast-clear check left there.
 		std::unique_lock lock(m_dirty_ranges_mutex);
@@ -2076,6 +2076,11 @@ void BufferCache::RecordUpload(Buffer& buffer, std::span<const vk::BufferCopy> c
 	m_scheduler.NoteTransfer(StallWatch::Transfer::BufferUpload, total_size);
 	auto& command = m_scheduler.Current();
 	command.EndRendering();
+	if (!barriers) {
+		command.Recorder().copyBuffer(source, buffer.Handle(), static_cast<uint32_t>(copies.size()),
+		                              copies.data());
+		return;
+	}
 	const auto              native = command.Recorder();
 	vk::BufferMemoryBarrier before {};
 	before.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite |
@@ -2096,6 +2101,27 @@ void BufferCache::RecordUpload(Buffer& buffer, std::span<const vk::BufferCopy> c
 	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
 	                       vk::PipelineStageFlagBits::eAllCommands,
 	                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &after, 0, nullptr);
+}
+
+void BufferCache::UploadBatchBarrier(bool before) {
+	auto& command = m_scheduler.Current();
+	command.EndRendering();
+	vk::MemoryBarrier barrier {};
+	if (before) {
+		barrier.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite |
+		                        vk::AccessFlagBits::eTransferRead |
+		                        vk::AccessFlagBits::eTransferWrite;
+		barrier.dstAccessMask = vk::AccessFlagBits::eTransferWrite;
+		command.Recorder().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+		                                   vk::PipelineStageFlagBits::eTransfer, {}, 1, &barrier, 0,
+		                                   nullptr, 0, nullptr);
+	} else {
+		barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+		barrier.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+		command.Recorder().pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+		                                   vk::PipelineStageFlagBits::eAllCommands, {}, 1, &barrier,
+		                                   0, nullptr, 0, nullptr);
+	}
 }
 
 // Reads guest memory for an upload. The guest can unmap memory a cached buffer still covers: AMM
@@ -3480,6 +3506,12 @@ uint64_t BufferCache::SynchronizeBdaPending(const RangeSet& mapped) {
 	// Round 80: the spans of a region's buffers write-protect their pages again in one change
 	// (MemoryTracker::TakeCpuDirtySpans); KYTY_BISECT's bdaprotect:old syncs each span on its own.
 	const bool                         together = !by_run && !Bisect::BdaProtectOld();
+	// KYTY_BISECT's uploads:batched (KYTY_UPLOAD_BATCH=1 for the whole run): the walk's uploads
+	// share one barrier before and one after them. Each with its own pair, a walk drained the GPU
+	// twice an upload: ~33 uploads a walk, ~1,200 drains a frame in a race (2026-10-23), with the
+	// host GPU's command buffers at 0.25 ms each and its clock low (about 60 W of 325).
+	const bool batched    = together && Bisect::UploadBatch();
+	bool       batch_open = false;
 	thread_local std::vector<BufferId> span_buffers;
 	thread_local std::vector<std::pair<uint64_t, uint64_t>> spans;
 	thread_local std::vector<std::vector<vk::BufferCopy>>   span_copies;
@@ -3558,7 +3590,11 @@ uint64_t BufferCache::SynchronizeBdaPending(const RangeSet& mapped) {
 			}
 			const auto source = UploadCopies(buffer, span_copies[i], totals[i]);
 			if (source) {
-				RecordUpload(buffer, span_copies[i], totals[i], source);
+				if (batched && !batch_open) {
+					UploadBatchBarrier(true);
+					batch_open = true;
+				}
+				RecordUpload(buffer, span_copies[i], totals[i], source, !batched);
 			}
 		}
 	};
@@ -3570,6 +3606,9 @@ uint64_t BufferCache::SynchronizeBdaPending(const RangeSet& mapped) {
 			sync_runs();
 		});
 	});
+	if (batch_open) {
+		UploadBatchBarrier(false);
+	}
 	return regions;
 }
 

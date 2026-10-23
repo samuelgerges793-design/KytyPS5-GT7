@@ -126,6 +126,7 @@ struct Step {
 	bool              readwait_writer = false; // readwait:writer
 	bool              barriers_global = false; // barriers:global
 	bool              protect_excl    = false; // protect:exclusive
+	bool              upload_batch    = false; // uploads:batched (2026-10-23)
 	std::string       cpu_set;          // empty: as at the start
 	std::string       name;             // for the screen and the picture's file name
 	std::string       text;             // name and actions, for the log
@@ -442,6 +443,10 @@ bool ParseAction(std::string_view action, Step& step) {
 	}
 	if (action == "protect:exclusive") {
 		step.protect_excl = true;
+		return true;
+	}
+	if (action == "uploads:batched") {
+		step.upload_batch = true;
 		return true;
 	}
 	if (action == "memsync:sync") {
@@ -1239,6 +1244,15 @@ bool ReadWaitWriter() {
 bool GlobalPm4Barriers() {
 	const auto* step = Current();
 	return step != nullptr && step->barriers_global;
+}
+
+bool UploadBatch() {
+	static const bool always = [] {
+		const char* value = std::getenv("KYTY_UPLOAD_BATCH");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	const auto* step = Current();
+	return always || (step != nullptr && step->upload_batch);
 }
 
 bool PhaseTimingAll() {

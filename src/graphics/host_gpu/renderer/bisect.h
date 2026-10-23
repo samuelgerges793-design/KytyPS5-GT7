@@ -267,6 +267,10 @@
 //                as before round 135 (KYTY_PM4_BARRIERS=global for the whole run)
 //   protect:exclusive the page tracker's protections take the address space's lock exclusively,
 //                as before round 135 (KYTY_PROTECT_LOCK=exclusive for the whole run)
+// and, 2026-10-23 (off by default):
+//   uploads:batched the uploads of a walk for shaders that read memory through addresses share
+//                one barrier before and one after them, instead of a pair each
+//                (KYTY_UPLOAD_BATCH=1 for the whole run; BufferCache::SynchronizeBdaPending)
 // KYTY_BISECT_AB=1: while a step is on, it is turned off and on again at each Perf line (every
 // 2 s), so its lines and the lines without it ("<name> base") alternate, and each can be compared
 // with the ones next to it, made on nearly the same frames.
@@ -404,6 +408,8 @@ void RequestPicture(const std::string& name);
 [[nodiscard]] bool CleanPageOld();
 [[nodiscard]] bool ReadWaitWriter();
 [[nodiscard]] bool GlobalPm4Barriers();
+// GPU thread: uploads:batched (2026-10-23).
+[[nodiscard]] bool UploadBatch();
 // GPU thread: gbuffer:sync; depthread:old (round 91).
 [[nodiscard]] bool GbufferSync();
 [[nodiscard]] bool DepthReadOld();

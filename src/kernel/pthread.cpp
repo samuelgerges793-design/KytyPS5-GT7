@@ -3309,6 +3309,10 @@ int KYTY_SYSV_ABI PthreadCreate(Pthread* thread, const PthreadAttr* attr,
 		attr = g_pthread_context->GetDefaultAttr();
 	}
 
+	// The caller's logging of its calls goes back to what it was: turning it on here made every
+	// thread that ever created one log all its calls (GT7's "Updat" thread ~900 a second, three
+	// quarters of the calls in a 540 MB log of a 20-minute race, 2026-10-23).
+	const bool print_name = PRINT_NAME_ENABLED;
 	PRINT_NAME_ENABLE(false);
 
 	auto* created_thread = pthread_pool->Create();
@@ -3358,7 +3362,7 @@ int KYTY_SYSV_ABI PthreadCreate(Pthread* thread, const PthreadAttr* attr,
 
 	PthreadAttrDbgPrint(&created_thread->attr);
 
-	PRINT_NAME_ENABLE(true);
+	PRINT_NAME_ENABLE(print_name);
 
 	if (result < 0) {
 		return result;
