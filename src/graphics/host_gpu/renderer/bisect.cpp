@@ -129,6 +129,7 @@ struct Step {
 	bool              upload_batch    = false; // uploads:batched (2026-10-23)
 	bool              upload_each     = false; // uploads:each
 	bool              guest_barriers  = false; // barriers:guest
+	bool              own_barriers    = false; // barriers:own
 	std::string       cpu_set;          // empty: as at the start
 	std::string       name;             // for the screen and the picture's file name
 	std::string       text;             // name and actions, for the log
@@ -457,6 +458,10 @@ bool ParseAction(std::string_view action, Step& step) {
 	}
 	if (action == "barriers:guest") {
 		step.guest_barriers = true;
+		return true;
+	}
+	if (action == "barriers:own") {
+		step.own_barriers = true;
 		return true;
 	}
 	if (action == "memsync:sync") {
@@ -1257,8 +1262,18 @@ bool GlobalPm4Barriers() {
 }
 
 bool GuestBarriers() {
+	// On unless KYTY_GUEST_BARRIERS=0 (or F8's barriers:own, for a step): in a race A/B on
+	// 2026-10-24 the host GPU's dispatches went from 14-18 us each to 4-5 us (its fit), its busy
+	// time from 63-81% to 49-73%, and the race from 19.0 to 20.3 fps.
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_GUEST_BARRIERS");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
 	const auto* step = Current();
-	return step != nullptr && step->guest_barriers;
+	if (step != nullptr && step->guest_barriers) {
+		return true;
+	}
+	return on && !(step != nullptr && step->own_barriers);
 }
 
 bool UploadBatch() {

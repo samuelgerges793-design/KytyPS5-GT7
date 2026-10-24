@@ -275,7 +275,10 @@
 //                (KYTY_UPLOAD_BATCH=0 for the whole run)
 //   barriers:guest dispatches go without the barrier before them (for their storage writes) and
 //                the one after them; the guest's PM4 partial flushes, cache actions, RELEASE_MEM
-//                and suspend points record full barriers instead, as barriers:global does
+//                and suspend points record full barriers instead, as barriers:global does (on by
+//                default since its A/B on 2026-10-24)
+//   barriers:own  each dispatch records its own two barriers again, as before
+//                (KYTY_GUEST_BARRIERS=0 for the whole run)
 // KYTY_BISECT_AB=1: while a step is on, it is turned off and on again at each Perf line (every
 // 2 s), so its lines and the lines without it ("<name> base") alternate, and each can be compared
 // with the ones next to it, made on nearly the same frames.
@@ -413,7 +416,7 @@ void RequestPicture(const std::string& name);
 [[nodiscard]] bool CleanPageOld();
 [[nodiscard]] bool ReadWaitWriter();
 [[nodiscard]] bool GlobalPm4Barriers();
-// GPU thread: uploads:batched, uploads:each, barriers:guest (2026-10-23).
+// GPU thread: uploads:batched, uploads:each, barriers:guest, barriers:own (2026-10-23/24).
 [[nodiscard]] bool UploadBatch();
 [[nodiscard]] bool GuestBarriers();
 // GPU thread: gbuffer:sync; depthread:old (round 91).
