@@ -3,6 +3,7 @@
 #include "common/logging/log.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cinttypes>
 #include <cstdlib>
@@ -77,19 +78,7 @@ void Report(State& s) {
 	const auto seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - s.begin)
 	                         .count();
 	const uint32_t frames = std::max<uint32_t>(s.frame, 1u);
-	const uint32_t hot_at = std::max<uint32_t>(2u, frames * 3u / 4u);
-	struct Hot {
-		uint64_t page;
-		const Page* info;
-	};
-	std::vector<Hot> hot;
-	uint64_t         walked        = 0;
-	uint64_t         hot_bytes     = 0;
-	uint64_t         hot_bound     = 0;
-	uint64_t         hot_uploaded  = 0;
-	uint64_t         hot_written   = 0;
-	uint64_t         hot_in_giant  = 0;
-	const auto       in_giant = [&](uint64_t page) {
+	const auto     in_giant = [&](uint64_t page) {
         const auto address = page << PageBits;
         auto       it      = s.giant.upper_bound(address);
         if (it == s.giant.begin()) {
@@ -98,35 +87,63 @@ void Report(State& s) {
         --it;
         return it->second > address;
 	};
+	// The pages the walks uploaded, by the share of frames they uploaded them in: below 10%, 10
+	// to 40%, 40 to 75% (a ring the game writes every other frame lands here), 75% or more.
+	struct Bucket {
+		const char* name;
+		uint64_t    pages = 0, bytes = 0, bound = 0, uploaded = 0, written = 0, giant = 0;
+		uint64_t    clean_pages = 0, clean_bytes = 0; // neither bound, written nor in a giant one
+	};
+	std::array<Bucket, 4> buckets {Bucket {"below 10%"}, Bucket {"10-40%"}, Bucket {"40-75%"},
+	                               Bucket {"75% or more"}};
+	struct Hot {
+		uint64_t    page;
+		const Page* info;
+	};
+	std::vector<Hot> hot; // 40% or more
 	for (const auto& [page, info]: s.pages) {
 		if (info.walk_frames == 0) {
 			continue;
 		}
-		walked++;
-		if (info.walk_frames < hot_at) {
-			continue;
+		const auto share = static_cast<double>(info.walk_frames) / static_cast<double>(frames);
+		auto&      bucket = buckets[share < 0.1 ? 0 : share < 0.4 ? 1 : share < 0.75 ? 2 : 3];
+		const bool giant  = in_giant(page);
+		bucket.pages++;
+		bucket.bytes += info.walk_bytes;
+		bucket.bound += info.bind_frames != 0 ? 1u : 0u;
+		bucket.uploaded += info.bind_upload_frames != 0 ? 1u : 0u;
+		bucket.written += info.write_frames != 0 ? 1u : 0u;
+		bucket.giant += giant ? 1u : 0u;
+		if (info.bind_frames == 0 && info.write_frames == 0 && !giant) {
+			bucket.clean_pages++;
+			bucket.clean_bytes += info.walk_bytes;
 		}
-		hot.push_back({page, &info});
-		hot_bytes += info.walk_bytes;
-		hot_bound += info.bind_frames != 0 ? 1u : 0u;
-		hot_uploaded += info.bind_upload_frames != 0 ? 1u : 0u;
-		hot_written += info.write_frames != 0 ? 1u : 0u;
-		hot_in_giant += in_giant(page) ? 1u : 0u;
+		if (share >= 0.4) {
+			hot.push_back({page, &info});
+		}
+	}
+	std::string text;
+	for (const auto& b: buckets) {
+		text += fmt::format("; {} of frames: {} pages ({}), {:.0f}% of the bytes, {} bound ({} "
+		                    "uploaded by bindings), {} GPU-written, {} in giant bindings, {} "
+		                    "pages ({:.0f}% of the bytes) none of these",
+		                    b.name, b.pages, Megabytes(b.pages * PageSize),
+		                    s.walk_bytes == 0 ? 0.0
+		                                      : 100.0 * static_cast<double>(b.bytes) /
+		                                            static_cast<double>(s.walk_bytes),
+		                    b.bound, b.uploaded, b.written, b.giant, b.clean_pages,
+		                    s.walk_bytes == 0 ? 0.0
+		                                      : 100.0 * static_cast<double>(b.clean_bytes) /
+		                                            static_cast<double>(s.walk_bytes));
 	}
 	LOGF("Host pages (%.1f s, %u frames): the walks uploaded %s in %" PRIu64
-	     " uploads (%s a frame) over %" PRIu64 " pages of 16 KB; hot (uploaded in %u frames or "
-	     "more): %zu pages (%s of the game's memory), %.0f%% of the walks' bytes; of the hot, %" PRIu64
-	     " under buffer bindings (%" PRIu64 " uploaded by them), %" PRIu64 " GPU-written through "
-	     "them, %" PRIu64 " under bindings of 4 MB or more; %" PRIu64 " bindings, %" PRIu64
-	     " GPU writes\n",
+	     " uploads (%s a frame) over %zu pages of 16 KB%s; %" PRIu64 " bindings, %" PRIu64
+	     " GPU writes
+",
 	     seconds, s.frame, Megabytes(s.walk_bytes).c_str(), s.walk_uploads,
-	     Megabytes(s.walk_bytes / frames).c_str(), walked, hot_at, hot.size(),
-	     Megabytes(hot.size() * PageSize).c_str(),
-	     s.walk_bytes == 0 ? 0.0
-	                       : 100.0 * static_cast<double>(hot_bytes) /
-	                             static_cast<double>(s.walk_bytes),
-	     hot_bound, hot_uploaded, hot_written, hot_in_giant, s.bindings, s.gpu_writes);
-	// The largest runs of hot pages, by the bytes the walks uploaded in them.
+	     Megabytes(s.walk_bytes / frames).c_str(), s.pages.size(), text.c_str(), s.bindings,
+	     s.gpu_writes);
+	// The largest runs of pages uploaded in 40% of the frames or more, by the walks' bytes.
 	std::ranges::sort(hot, {}, &Hot::page);
 	struct Run {
 		uint64_t first = 0;
@@ -148,16 +165,18 @@ void Report(State& s) {
 		run.giant    = run.giant || in_giant(h.page);
 	}
 	std::ranges::sort(runs, std::greater<> {}, &Run::bytes);
-	std::string text;
+	text.clear();
 	for (size_t i = 0; i < std::min<size_t>(runs.size(), 12); i++) {
 		const auto& run = runs[i];
-		text += fmt::format("{}0x{:x}+{} KB ({} a frame{}{}{}{})", i == 0 ? "" : ", ",
+		text += fmt::format("{}0x{:x}+{} KB ({} KB a frame{}{}{}{})", i == 0 ? "" : ", ",
 		                    run.first << PageBits, (run.count * PageSize) >> 10u,
-		                    Megabytes(run.bytes / frames), run.bound ? ", bound" : "",
+		                    (run.bytes / frames) >> 10u, run.bound ? ", bound" : "",
 		                    run.uploaded ? ", uploaded by bindings" : "",
 		                    run.written ? ", GPU-written" : "", run.giant ? ", in a giant binding" : "");
 	}
-	LOGF("Host pages: %zu runs of hot pages; the largest: %s\n", runs.size(), text.c_str());
+	LOGF("Host pages: %zu runs of pages uploaded in 40%% of the frames or more; the largest: %s
+",
+	     runs.size(), text.c_str());
 	s.pages.clear();
 	s.giant.clear();
 	s.frame        = 0;
