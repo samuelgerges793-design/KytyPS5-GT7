@@ -11,6 +11,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/bisect.h"
 #include "graphics/host_gpu/renderer/cache/hostImportProbe.h"
+#include "graphics/host_gpu/renderer/cache/hostPageStats.h"
 #include "graphics/host_gpu/renderer/cache/readbackQueue.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/commandRecorder.h"
@@ -2023,6 +2024,9 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	if (!is_written && !is_texel_buffer && g_tracker_skip_clean && g_tracker_bitmap &&
 	    m_memory_tracker.IsRangeCpuCleanHint(vaddr, size)) {
 		RecordSync(size, false, false, 0.0);
+		if (HostPageStats::Enabled()) {
+			HostPageStats::NoteBinding(vaddr, size, false, false);
+		}
 		return false;
 	}
 	// Timing every call cost ~2 % of the GPU thread (two performance-counter reads); SyncStats
@@ -2053,6 +2057,9 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		    });
 	}
 	RecordSync(size, is_written, static_cast<bool>(source), timed ? walk_timer.GetTimeS() : 0.0);
+	if (HostPageStats::Enabled()) {
+		HostPageStats::NoteBinding(vaddr, size, is_written, static_cast<bool>(source));
+	}
 	if (source) {
 		RecordUpload(buffer, copies, total_size, source);
 	}
@@ -2791,6 +2798,9 @@ void BufferCache::WritesRecorded(bool address_writes, uint64_t shader) {
 
 void BufferCache::MarkGpuWritten(uint64_t vaddr, uint64_t size, bool tracked) {
 	KYTY_PROFILER_BLOCK("Obtain::MarkWritten");
+	if (HostPageStats::Enabled()) {
+		HostPageStats::NoteGpuWrite(vaddr, size);
+	}
 	{
 		std::unique_lock lock(m_dirty_ranges_mutex);
 		const auto first = Common::AlignDown(vaddr, WriteBitmapPage);
@@ -3589,6 +3599,11 @@ uint64_t BufferCache::SynchronizeBdaPending(const RangeSet& mapped) {
 				continue;
 			}
 			const auto source = UploadCopies(buffer, span_copies[i], totals[i]);
+			if (source && HostPageStats::Enabled()) {
+				for (const auto& copy: span_copies[i]) {
+					HostPageStats::NoteWalkUpload(buffer.CpuAddress() + copy.dstOffset, copy.size);
+				}
+			}
 			if (source) {
 				if (batched && !batch_open) {
 					UploadBatchBarrier(true);

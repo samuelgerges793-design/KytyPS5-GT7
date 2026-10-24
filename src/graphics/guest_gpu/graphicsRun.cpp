@@ -15,6 +15,7 @@
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/gpuPhases.h"
 #include "graphics/host_gpu/renderer/bisect.h"
+#include "graphics/host_gpu/renderer/cache/hostPageStats.h"
 #include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/drawPrep.h"
 #include "graphics/host_gpu/renderer/frameGraph.h"
@@ -1066,6 +1067,9 @@ bool GuestGpu::Process(Submission& submission) {
 			break;
 		case SubmissionType::SuspendPoint:
 			FrameGraph::OnFrameBoundary(m_renderer.GetBufferCache());
+			if (HostPageStats::Enabled()) {
+				HostPageStats::NoteFrame();
+			}
 			m_renderer.GetTextureCache().TraceFrameEnd();
 			if (GlobalPm4Barriers()) {
 				cp.EmitGlobalBarrier();
