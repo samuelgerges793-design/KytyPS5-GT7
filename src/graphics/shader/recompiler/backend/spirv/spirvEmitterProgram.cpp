@@ -245,18 +245,17 @@ void Invoke(Return (*emit)(Context&, Args...), ValueEmitContext& ctx, const IR::
 }
 
 void EmitDirectInstruction(ValueEmitContext& ctx, const IR::Inst& inst) {
-	using Op = IR::ValueOpcode;
+	using Op      = IR::ValueOpcode;
 	const auto op = inst.GetOpcode();
 	if (ctx.half != 0 &&
 	    (op == Op::Ballot || op == Op::ReadFirstLane || op == Op::ReadConstBuffer ||
 	     (op == Op::LoadAddressU32 && ctx.Memory(inst).kind == IR::ResourceKind::ScalarAddress))) {
-		// Whole-wave results, and SMEM loads (SGPR operands, no EXEC), are the same in both
-		// emulated halves (SMEM: upstream 8cc5f536).
+		// Whole-wave results and SMEM loads (SGPR operands, no EXEC) are identical in both halves.
 		ctx.Define(inst, ctx.other_half->Result(inst));
 		return;
 	}
 	// Write bitmap: storage-buffer element pointers made for this instruction mark their pages.
-	const auto access = IR::BufferAccessOf(op);
+	const auto access = IR::BufferAccessOf(inst.GetOpcode());
 	struct WriteScope {
 		EmitterState& state;
 		~WriteScope() { state.emitting_write = false; }
@@ -349,6 +348,7 @@ void EmitBlock(ValueEmitContext& ctx, const IR::Block* block, EmitInstruction&& 
 			ctx.state.lane_half = half;
 			if (half == 0 || (inst.GetOpcode() != IR::ValueOpcode::Barrier &&
 			                  inst.GetOpcode() != IR::ValueOpcode::StoreCompletion &&
+			                  inst.GetOpcode() != IR::ValueOpcode::DataCacheInvalidate &&
 			                  inst.GetOpcode() != IR::ValueOpcode::MeshAllocate)) {
 				emit_instruction(lane, inst);
 			}
@@ -841,8 +841,8 @@ uint32_t ValueEmitContext::FirstLane(uint32_t ballot) {
 	}
 	const auto high_first = first(1).second;
 	const auto high_lane  = EmitGlsl<GLSLstd450SMax, IR::Type::U32>(
-	    state, EmitBinaryU32(state, spv::OpBitwiseOr, high_first, ConstantU32(state, 32)),
-	    ConstantU32(state, 0));
+        state, EmitBinaryU32(state, spv::OpBitwiseOr, high_first, ConstantU32(state, 32)),
+        ConstantU32(state, 0));
 	return Select(state, TypeU32(state),
 	              Binary(state, spv::OpINotEqual, TypeBool(state), low, ConstantU32(state, 0)),
 	              low_first, high_lane);

@@ -60,6 +60,82 @@ update everything is compiled once more.
 To report a problem, open an issue on this repository with the **Bug report** form (attach the
 zipped `_kyty.txt` log).
 
+## What's new (October 24, 2026, second build)
+
+No shaders are compiled again after this update.
+
+- **No more crash at a race start with a vblank frequency of 120**
+  ([issue 22](https://github.com/usa-ratt/KytyPS5-GT7/issues/22)). With 120 set in the launcher,
+  the game offers its 120 Hz option; with it on, the game switches its output picture to
+  2240x1260 when a race starts, in a compressed layout the emulator did not accept yet ("unsupported
+  or invalid video-out surface attributes"). It does now. The 120 Hz mode doesn't raise the frame
+  rate in the emulator (about the same as at 60 Hz in a test), so 60 stays the recommended
+  setting.
+
+## What's new (October 24, 2026)
+
+No shaders are compiled again after this update.
+
+- **No more long freeze or black screen at the start of a race while shaders compile.** On a
+  fresh shader cache (the first race after an update that resets shaders, a new track, a new car)
+  the screen could stay black after the countdown for minutes, or freeze for about a minute before
+  it. Three causes, all fixed:
+  - Some draws can't be skipped, so the emulator stops and waits for their pipeline. Since the
+    eighth build the compile workers took old requests only on two threads, and while the emulator
+    waited nothing new was asked for, so the pipeline it waited for sat behind hundreds of others
+    (190 s for one pipeline in a test). The pipeline the emulator waits for is now compiled next.
+  - While the emulator waits, every compile worker now helps with the queue (the game is stopped
+    then anyway), instead of 2 of them.
+  - The reflection cube (the picture of the surroundings the cars reflect) is drawn again every
+    frame, so its draws may now be skipped while they compile from its very first frame. Before,
+    the race start compiled them one by one (33 in a row, 26 s, in a test). On a fresh cache the
+    reflections can miss some scenery for a few seconds at the start instead.
+- **AMD graphics cards:** a test setting for the crash at the GT logo
+  ([issue 21](https://github.com/usa-ratt/KytyPS5-GT7/issues/21)): `KYTY_PS_BARYCENTRICS=0`
+  leaves out the barycentrics that the pixel shader of the crashing pipeline asks for
+  (`KYTY_PS_BARYCENTRICS=mesh` only next to mesh shaders). It changes nothing without the setting.
+
+## What's new (October 23, 2026, eighth build)
+
+The shaders are compiled again once after this update (the shader translator changed): the first
+menu and the first race take longer than usual.
+
+- **The thin line up the sky is gone, and the track is one shade on both sides of it.** The sky
+  and the reflections come from cube maps (six square faces). The emulator samples each face as a
+  flat picture, and with the game's "wrap" setting the filtering at a face's edge blended in the
+  opposite edge of the same face: a thin line along each face edge, and a step in the track's
+  reflection. The console ignores that setting for cube maps; the emulator now keeps each face's
+  filtering inside the face (`KYTY_CUBE_EDGE_CLAMP=0` turns it off).
+- **Fixes from Franseven's review of the shader translator** (thank you), several ported from
+  mainline (nmzik, Mr. Big Britches, Andre Michi, Nawid3333): NaN and denormal handling, branches
+  of wave64 shaders on 32-lane cards with missing lanes, V_READFIRSTLANE with no active lane,
+  saturate and float-to-integer clamping, bit-field inserts in descriptors, cube coordinates,
+  more texture formats sampled (draws using formats 30 and 32 are no longer skipped), textures
+  with an invalid mip range read as empty instead of skipping the draw, and the same SPIR-V on
+  every run.
+- **Grass after a race, then a Time Trial, is right** (Franseven): an image written back to
+  memory now makes the buffers over the same memory upload it again.
+- **Cards and tools without mixed-sample support** (RenderDoc; Intel Arc too, most likely) no
+  longer end the emulator at the start of a race (Franseven): those draws render their colour at
+  the depth's sample count and resolve it.
+- **Objects that were still compiling no longer stay missing** (Franseven): a draw skipped while
+  its pipeline compiles counts as visible to the game's visibility tests, so the game keeps
+  drawing it. Pipeline compiles now go to what is on screen first, and the backlog runs on two
+  low-priority threads instead of slowing the game.
+- `KYTY_PIPELINE_QUICK=1` (off by default) draws a new object at once with an unoptimized
+  pipeline while the optimized one compiles: no invisible cars on a fresh cache, at some cost in
+  frame rate until the optimized ones are in.
+
+## What's new (October 23, 2026, seventh build)
+
+No shaders are compiled again after this update.
+
+- **Track maps on the layout selection screen are right.** When the list scrolled, a slot could
+  show two layouts' maps on top of each other, or none. The game draws every map into the same
+  small picture, one after another, and clears it before each one; the emulator checked such a
+  clear only once per batch of graphics work, so when two maps fell in the same batch the
+  second clear was skipped. It is now checked again whenever the game clears the picture again.
+
 ## What's new (October 23, 2026, sixth build)
 
 No shaders are compiled again after this update.
@@ -375,7 +451,9 @@ Graphics and shaders:
   camera angle, so watching the same replay twice can give green once and not the other time.
 - Tokyo at night: some shadows on tunnel ceilings and walls move with the camera.
 - **AMD graphics cards:** the game crashes at the GT logo, inside the AMD driver's shader compiler
-  ([issue 12](https://github.com/usa-ratt/KytyPS5-GT7/issues/12)). Being looked into.
+  ([issue 12](https://github.com/usa-ratt/KytyPS5-GT7/issues/12),
+  [issue 21](https://github.com/usa-ratt/KytyPS5-GT7/issues/21)). Being looked into; this build
+  has a test setting for it (see What's new).
 - **Scapes:** the controls stop working after Olivier offers the drift photography tutorial
   ([issue 19](https://github.com/usa-ratt/KytyPS5-GT7/issues/19)). The tutorial waits for the
   game's online servers, which the emulator has no stand-in for, so the Menu Book "Take a Photo of

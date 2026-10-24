@@ -1720,7 +1720,47 @@ struct PendingGraphicsPipeline {
 	// Round 134: compiled (not found by a lookup alone): new in the driver cache, for a save
 	// during play (set before done).
 	bool compiled = false;
+	// Built first without driver optimization (set before quick_ready): its draws use it while the
+	// optimized one compiles, instead of being skipped for seconds.
+	vk::Pipeline      quick = nullptr;
+	std::atomic<bool> quick_ready {false};
+	// The last time a draw asked for it (AskClockMs): the workers compile the most recently
+	// asked first. LIFO by submit starved a pipeline drawn every frame since the start (the
+	// player's car stayed transparent in a race) behind the new ones each frame brought.
+	mutable std::atomic<uint64_t> asked {0};
 };
+
+static uint64_t AskClockMs() {
+	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+	                                 std::chrono::steady_clock::now().time_since_epoch())
+	                                 .count());
+}
+
+// KYTY_PIPELINE_BACKGROUND_THREADS (2): compile workers that may take jobs no draw asked for in
+// the last 2 s, and the optimized compiles of pipelines drawn unoptimized meanwhile.
+static const uint32_t g_pipeline_background = [] {
+	const char* value = std::getenv("KYTY_PIPELINE_BACKGROUND_THREADS");
+	return value != nullptr && *value != '\0'
+	           ? std::max<uint32_t>(1u, static_cast<uint32_t>(std::strtoul(value, nullptr, 10)))
+	           : 2u;
+}();
+
+// KYTY_PIPELINE_QUICK=1 (round 141, from Franseven; off by default): a missing pipeline is first
+// built without driver optimization and drawn at once, the optimized one swapped in later. A new
+// car otherwise shows transparent until its compile is done (1280 compiles of 1.8 s median, up to
+// 10.7 s, on 8 workers), but the unoptimized pipelines can cost frame rate until they are
+// replaced, and only the background workers make the optimized ones. Off: draws are skipped
+// until the optimized pipeline is compiled, as before.
+static bool PipelineQuick() {
+	static const bool on = [] {
+		const char* value   = std::getenv("KYTY_PIPELINE_QUICK");
+		const bool  enabled = value != nullptr && value[0] == '1';
+		LOGF("Pipelines: unoptimized pipelines first %s (KYTY_PIPELINE_QUICK)\n",
+		     enabled ? "on" : "off");
+		return enabled;
+	}();
+	return on;
+}
 
 // Round 130: a lookup's answer other than found or not found (the driver cannot answer), for the
 // GPU thread to stop asking (0: none yet).
@@ -1826,10 +1866,10 @@ public:
 	// the compiles of a new track, which take about a second each.
 	PipelineCompiler(uint32_t threads, uint32_t lookup_threads) {
 		for (uint32_t i = 0; i < threads; i++) {
-			m_threads.emplace_back([this] { Run(false); });
+			m_threads.emplace_back([this, i] { Run(false, i); });
 		}
 		for (uint32_t i = 0; i < lookup_threads; i++) {
-			m_threads.emplace_back([this] { Run(true); });
+			m_threads.emplace_back([this] { Run(true, 0); });
 		}
 		m_lookup_threads = lookup_threads;
 	}
@@ -1841,6 +1881,7 @@ public:
 
 	void Submit(std::shared_ptr<PendingGraphicsPipeline> job) {
 		const bool lookup = job->looking_up.load(std::memory_order_relaxed);
+		job->asked.store(AskClockMs(), std::memory_order_relaxed);
 		{
 			std::lock_guard lock(m_mutex);
 			(lookup ? m_lookups : m_queue).push_back(std::move(job));
@@ -1851,17 +1892,21 @@ public:
 		m_work.notify_one();
 	}
 
-	// Moves a job still in the queue to its front: a draw that may not be skipped waits for it,
-	// and with a cold driver cache thousands of compiles can be queued ahead of it.
-	void Promote(const PendingGraphicsPipeline& job) {
-		std::lock_guard lock(m_mutex);
-		const auto queued = std::ranges::find_if(
-		    m_queue, [&job](const auto& entry) { return entry.get() == &job; });
-		if (queued != m_queue.end() && queued != m_queue.begin()) {
-			auto entry = std::move(*queued);
-			m_queue.erase(queued);
-			m_queue.push_front(std::move(entry));
+	// Round 144: a draw that may not be skipped waits for this job, so it counts as asked for now
+	// and the next free worker takes it. Nothing else asks while the GPU thread waits: after 2 s
+	// every queued job was background work, which only the background workers took, the oldest
+	// and the newest first, and a race start on a cold cache waited 190 s for one pipeline.
+	// Round 145: `stalled` (the GPU thread waited 100 ms already) lets every worker take the
+	// background work for the next 500 ms. The game is stopped meanwhile, so the cores are free,
+	// and the next draws that may not be skipped find their pipelines done: one race start waited
+	// for 51 in a row, 49 s, with 13 of the 16 workers idle.
+	void Ask(const PendingGraphicsPipeline& job, bool stalled) {
+		const auto now = AskClockMs();
+		job.asked.store(now, std::memory_order_relaxed);
+		if (stalled) {
+			m_stalled_until.store(now + 500, std::memory_order_relaxed);
 		}
+		m_work.notify_all();
 	}
 
 	// Waits up to the budget; true when the job is done.
@@ -1882,6 +1927,7 @@ public:
 			m_stopped = true;
 			m_queue.clear();
 			m_lookups.clear();
+			m_optimize.clear();
 		}
 		m_work.notify_all();
 		m_lookup_work.notify_all();
@@ -1897,8 +1943,52 @@ public:
 	}
 
 private:
-	void Run(bool lookups_only) {
+	// Under m_mutex: the next job for compile worker `index`, if it may take one now.
+	// Lookups first: each takes milliseconds, a compile about a second. Then the compile a draw
+	// asked for last: the scene on screen (a scene stayed in showed its objects only after the
+	// backlog of the last one). Worker 0 takes the oldest instead: a car seen for a moment left
+	// its compiles queued behind each new frame's, and they never ran, not even when it came back.
+	// Jobs no draw asked for in the last 2 s and the optimized compiles of pipelines drawn
+	// unoptimized run on the first g_pipeline_background workers only: 8 compiles behind the
+	// scene took the cores the game shares, and it ran slower until a restart. While the GPU
+	// thread is stalled on a compile, every worker takes them (round 145, Ask).
+	bool Pick(uint32_t index, std::shared_ptr<PendingGraphicsPipeline>& job, bool& lookup) {
+		lookup = !m_lookups.empty();
+		if (lookup) {
+			job = std::move(m_lookups.front());
+			m_lookups.pop_front();
+			return true;
+		}
+		const bool background = index < g_pipeline_background ||
+		                        AskClockMs() < m_stalled_until.load(std::memory_order_relaxed);
+		if (!m_queue.empty()) {
+			// ponytail: a linear scan; a heap if the queue grows to many thousands.
+			auto pick = index == 0
+			                ? m_queue.begin()
+			                : std::max_element(m_queue.begin(), m_queue.end(),
+			                                   [](const auto& a, const auto& b) {
+				                                   return a->asked.load(std::memory_order_relaxed) <
+				                                          b->asked.load(std::memory_order_relaxed);
+			                                   });
+			if (background ||
+			    AskClockMs() - (*pick)->asked.load(std::memory_order_relaxed) < 2000) {
+				job = std::move(*pick);
+				m_queue.erase(pick);
+				return true;
+			}
+		}
+		if (background && !m_optimize.empty()) {
+			job = std::move(m_optimize.back());
+			m_optimize.pop_back();
+			return true;
+		}
+		return false;
+	}
+
+	void Run(bool lookups_only, uint32_t index) {
 		KYTY_PROFILER_THREAD(lookups_only ? "PipelineLookup" : "PipelineCompiler");
+		// Below the guest's threads: more workers then cost the game nothing it needs.
+		Common::LowerThreadPriority();
 		for (;;) {
 			std::shared_ptr<PendingGraphicsPipeline> job;
 			bool                                     lookup = false;
@@ -1906,19 +1996,21 @@ private:
 				std::unique_lock lock(m_mutex);
 				if (lookups_only) {
 					m_lookup_work.wait(lock, [this] { return m_stopped || !m_lookups.empty(); });
+					if (m_stopped) {
+						return;
+					}
+					lookup = true;
+					job    = std::move(m_lookups.front());
+					m_lookups.pop_front();
 				} else {
-					m_work.wait(lock, [this] {
-						return m_stopped || !m_lookups.empty() || !m_queue.empty();
-					});
+					// A job turns background with time alone: look again every 200 ms.
+					while (!m_stopped && !Pick(index, job, lookup)) {
+						m_work.wait_for(lock, std::chrono::milliseconds(200));
+					}
+					if (m_stopped) {
+						return;
+					}
 				}
-				if (m_stopped) {
-					return;
-				}
-				// Lookups first: each takes milliseconds, a compile about a second.
-				lookup     = !m_lookups.empty();
-				auto& from = lookup ? m_lookups : m_queue;
-				job        = std::move(from.front());
-				from.pop_front();
 			}
 			if (lookup) {
 				bool found = false;
@@ -1951,6 +2043,25 @@ private:
 				m_work.notify_one();
 				continue;
 			}
+			// A job with full cache files to look in first may find it there in milliseconds.
+			if (PipelineQuick() && job->older.empty() &&
+			    !job->quick_ready.load(std::memory_order_relaxed)) {
+				// Not into the saved cache: only the optimized pipeline is kept.
+				if (CreateGraphicsPipeline(*job->build, nullptr, &job->quick, false, true) !=
+				        vk::Result::eSuccess &&
+				    job->quick != nullptr) {
+					job->build->device.destroyPipeline(job->quick, nullptr);
+					job->quick = nullptr;
+				}
+				if (job->quick != nullptr) {
+					job->quick_ready.store(true, std::memory_order_release);
+					std::lock_guard lock(m_mutex);
+					if (!m_stopped) {
+						m_optimize.push_back(std::move(job));
+						continue;
+					}
+				}
+			}
 			{
 				Profiler::Phases zone;
 				zone.SetText("VS 0x%016" PRIx64 " PS 0x%016" PRIx64, job->vs_hash, job->ps_hash);
@@ -1976,8 +2087,11 @@ private:
 	std::condition_variable                              m_done;
 	std::deque<std::shared_ptr<PendingGraphicsPipeline>> m_queue;
 	std::deque<std::shared_ptr<PendingGraphicsPipeline>> m_lookups;
+	std::deque<std::shared_ptr<PendingGraphicsPipeline>> m_optimize;
 	std::vector<std::thread>                             m_threads;
 	uint32_t                                             m_lookup_threads = 0;
+	// Round 145: until this AskClockMs, every worker may take background work (Ask).
+	std::atomic<uint64_t>                                m_stalled_until {0};
 	bool                                                 m_stopped        = false;
 };
 
@@ -2045,6 +2159,7 @@ public:
 private:
 	void Run() {
 		KYTY_PROFILER_THREAD("ShaderTranslator");
+		Common::LowerThreadPriority();
 		for (;;) {
 			std::shared_ptr<TranslationJob> job;
 			{
@@ -2053,8 +2168,9 @@ private:
 				if (m_queue.empty()) {
 					return;
 				}
-				job = std::move(m_queue.front());
-				m_queue.pop_front();
+				// Newest first, as the pipeline compiles: the scene on screen before the backlog.
+				job = std::move(m_queue.back());
+				m_queue.pop_back();
 			}
 			job->result = ShaderRecompiler::TranslateProgram(job->code, job->options);
 			if (job->result.unsupported) {
@@ -3229,13 +3345,14 @@ struct PipelineCache::ProgramCache {
 			LoadCallTargets();
 		}
 		if (g_async_translation) {
-			// KYTY_TRANSLATION_THREADS=<n> (default a quarter of the processors, 2 to 8, since
-			// round 86; an eighth, 2 to 4, before; 2 before round 70). They work only while new
+			// KYTY_TRANSLATION_THREADS=<n> (default a third of the processors, 2 to 12, at below
+			// normal priority; a quarter, 2 to 8, since round 86; an eighth, 2 to 4, before; 2
+			// before round 70). They work only while new
 			// shaders are translated, a first run's long stretch of skipped draws.
 			const char* value   = std::getenv("KYTY_TRANSLATION_THREADS");
 			const auto  threads = std::max<uint32_t>(
                 value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10))
-                                 : std::clamp(std::thread::hardware_concurrency() / 4u, 2u, 8u),
+                                 : std::clamp(std::thread::hardware_concurrency() / 3u, 2u, 12u),
 			    1u);
 			translators = std::make_unique<TranslationWorkers>(threads);
 			PipelineCacheLog("Shader translation: graphics shaders of 3D draws on {} worker threads",
@@ -4190,17 +4307,18 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 	    !EqaaPerSampleShading();
 	InitializeDriverCache();
 	if (g_async_pipelines) {
-		// KYTY_PIPELINE_THREADS=<n>; by default a third of the processors, 2 to 10 (4 at most
-		// before round 70). A race brings hundreds of new pipelines at once (other cars, lap 2),
-		// each pixel shader of 150,000-230,000 SPIR-V words taking the driver about a second, and
-		// their draws are skipped until they are done: with 4 threads the track and the cars
-		// vanished for ten seconds while the process used 4 of 32 processors.
+		// KYTY_PIPELINE_THREADS=<n>; by default half the processors, 2 to 16, at below normal
+		// priority (a third, 2 to 10, before; 4 at most before round 70). A race brings hundreds of
+		// new pipelines at once (other cars, lap 2), each pixel shader of 150,000-230,000 SPIR-V
+		// words taking the driver about a second, and their draws are skipped until they are done:
+		// with 4 threads the track and the cars vanished for ten seconds while the process used 4
+		// of 32 processors.
 		const char* value = std::getenv("KYTY_PIPELINE_THREADS");
 		const auto  threads =
             value != nullptr && *value != '\0'
 		         ? std::clamp<uint32_t>(static_cast<uint32_t>(std::strtoul(value, nullptr, 10)), 1u,
 		                                32u)
-		         : std::clamp(std::thread::hardware_concurrency() / 3u, 2u, 10u);
+		         : std::clamp(std::thread::hardware_concurrency() / 2u, 2u, 16u);
 		m_probe = g_pipeline_probe && graphics.pipeline_cache_control_enabled;
 		// Round 130: KYTY_PIPELINE_LOOKUP_THREADS=<n> threads more only look new pipelines up in
 		// the driver's caches (by default an eighth of the processors, 2 to 4; 0: the GPU
@@ -4275,6 +4393,9 @@ PipelineCache::~PipelineCache() {
 			m_graphics.device.destroyDescriptorSetLayout(pipeline->descriptor_set_layout, nullptr);
 		}
 	};
+	for (const auto quick: m_quick_retired) {
+		m_graphics.device.destroyPipeline(quick, nullptr);
+	}
 	destroy(m_graphics_pipelines);
 	destroy(m_compute_pipelines);
 	destroy(m_compute_waiting);
@@ -4704,8 +4825,8 @@ bool SmallColorTargetDraw(const HW::Context& context) {
 // time, several times every 10 s, all race long (2026-10-18, warm86: up to 38 s of 42). A draw
 // into such a target may be skipped while its shaders translate or its pipeline compiles: it
 // misses a frame or a few, not a picture drawn once. Such a target is a reflection cube (learned
-// by renderDraw.cpp) the game has drawn in two frames or more, or one drawn in at least three of
-// six frames in a row at some time, when the draw tests against a depth target bound with it,
+// by renderDraw.cpp; drawn in two frames or more until round 146), or one drawn in at least three
+// of six frames in a row at some time, when the draw tests against a depth target bound with it,
 // with a test that can fail or a depth write (a 3D pass: the depth test enable alone is not
 // enough, the lost glyphs above had it set). The second holds until the target goes unused for
 // 32 frames; the cube's count is kept for good (round 88): the race start had none of the frames
@@ -4832,7 +4953,11 @@ bool RedrawnTargetDraw(const HW::Context& context) {
 		return false;
 	}
 	if (ReflectionCubeDraw(context)) {
-		return frames.frames >= 2;
+		// Round 146: from its first frame. A race start can draw its cube for the first time in
+		// the session: on a cold cache (a new car or track after a shader reset) its draws
+		// compiled 33 pipelines on the GPU thread, 26 s of a 51 s freeze before the countdown.
+		// The cube is drawn again the next frame.
+		return true;
 	}
 	return (frames.steady && DepthTestedDraw(context)) || GbufferPassDraw(context);
 }
@@ -4846,6 +4971,33 @@ void NoteReflectionCubeTarget(uint64_t address) {
 		return;
 	}
 	g_reflection_cubes[g_reflection_cube_count++] = address;
+}
+
+// Round 143: KYTY_PS_BARYCENTRICS=0 leaves a pixel shader's raw barycentric registers (the I/J
+// VGPRs the hardware fills) unset, so they read as 0 and the shader declares no gl_BaryCoordKHR
+// for them; "mesh" does it only for pixel shaders drawn with a mesh shader. Interpolated inputs
+// do not need these registers (V_INTERP_P2 reads the attribute itself); shaders that interpolate
+// by hand from them come out flat. A test for drivers whose shader compiler fails on
+// barycentrics: an AMD driver crashes building the first mesh pipeline (issue 21).
+enum class RawBarycentrics : uint8_t { Keep, Mesh, Off };
+
+static RawBarycentrics RawBarycentricsMode() {
+	static const RawBarycentrics mode = [] {
+		const char*     value  = std::getenv("KYTY_PS_BARYCENTRICS");
+		RawBarycentrics result = RawBarycentrics::Keep;
+		if (value != nullptr && std::strcmp(value, "0") == 0) {
+			result = RawBarycentrics::Off;
+		} else if (value != nullptr && std::strcmp(value, "mesh") == 0) {
+			result = RawBarycentrics::Mesh;
+		}
+		const char* text = result == RawBarycentrics::Off    ? "read as 0 in every pixel shader"
+		                   : result == RawBarycentrics::Mesh ? "read as 0 with mesh shaders"
+		                                                     : "from the host's barycentrics";
+		::printf("Pixel shaders: raw barycentric registers %s (KYTY_PS_BARYCENTRICS)\n", text);
+		LOGF("Pixel shaders: raw barycentric registers %s (KYTY_PS_BARYCENTRICS)\n", text);
+		return result;
+	}();
+	return mode;
 }
 
 bool PipelineCache::DescribeGraphicsStages(
@@ -4928,6 +5080,12 @@ bool PipelineCache::DescribeGraphicsStages(
 			LOGF("Half-float stores: %s\n", mode);
 		});
 		pixel_params = PrepareProgram(pixel_regs, sh, target_export_mapping, pixel_info);
+		if (const auto raw = RawBarycentricsMode();
+		    raw == RawBarycentrics::Off || (raw == RawBarycentrics::Mesh && mesh_active)) {
+			// Part of the program key: the default keeps its translations.
+			pixel_info.ps_perspective_center_vgpr   = UINT32_MAX;
+			pixel_info.ps_perspective_centroid_vgpr = UINT32_MAX;
+		}
 		// SPI_SHADER_COL_FORMAT describes export packing, not the attachment numeric type.
 		// In particular, 32-bit exports can carry raw integer material data.
 		for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
@@ -5487,6 +5645,11 @@ bool PipelineCache::FinishPending(Pipeline& pipeline) {
 	auto& job = *pipeline.pending;
 	if (!job.done.load(std::memory_order_acquire)) {
 		if (m_compiler != nullptr && !m_compiler->Stopped()) {
+			// The unoptimized pipeline meanwhile; `pending` stays until the optimized one.
+			if (job.quick_ready.load(std::memory_order_acquire)) {
+				pipeline.pipeline = job.quick;
+				return true;
+			}
 			return false;
 		}
 		// The workers stopped before this job started: compile it here.
@@ -5510,6 +5673,12 @@ bool PipelineCache::FinishPending(Pipeline& pipeline) {
 	}
 	pipeline.pipeline   = job.pipeline;
 	const bool compiled = job.compiled;
+	if (job.quick != nullptr) {
+		// ponytail: kept until shutdown, command buffers in flight may still use it; destroy it
+		// after a frame fence if the driver memory of thousands of pipelines starts to matter.
+		m_quick_retired.push_back(job.quick);
+		job.quick = nullptr;
+	}
 	pipeline.pending.reset();
 	// Round 134: a new pipeline in the driver cache, kept by a save during play.
 	if (compiled) {
@@ -5653,22 +5822,42 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 			using MixedSamples       = GraphicContext::MixedAttachmentSamples;
 			const auto     mixed     = m_graphics.mixed_attachment_samples;
 			const uint32_t color_samples = attachment_samples;
-			const bool     allowed   = mixed == MixedSamples::Amd ||
-			                     (mixed == MixedSamples::Nv && color_samples < depth_samples);
-			if (!allowed) {
-				EXIT("mixed color/depth sample counts are unsupported on this GPU: color %u, "
-				     "depth %u (needs VK_AMD_mixed_attachment_samples, or "
-				     "VK_NV_framebuffer_mixed_samples with color <= depth)\n",
-				     color_samples, depth_samples);
-			}
-			rendering.color_samples = color_samples;
-			rendering.depth_samples = depth_samples;
-			attachment_samples      = std::max(color_samples, depth_samples);
-			static std::atomic_bool logged = false;
-			if (!logged.exchange(true, std::memory_order_relaxed)) {
-				LOGF("Pipeline: mixed attachment samples (%s): color %u, depth %u, raster %u\n",
-				     mixed == MixedSamples::Amd ? "AMD" : "NV", color_samples, depth_samples,
-				     attachment_samples);
+			uint32_t       resolvable_samples = 0;
+			if (m_graphics.AcceptsMixedSamples(color_samples, depth_samples)) {
+				rendering.color_samples        = color_samples;
+				rendering.depth_samples        = depth_samples;
+				attachment_samples             = std::max(color_samples, depth_samples);
+				static std::atomic_bool logged = false;
+				if (!logged.exchange(true, std::memory_order_relaxed)) {
+					LOGF("Pipeline: mixed attachment samples (%s): color %u, depth %u, raster %u\n",
+					     mixed == MixedSamples::Amd ? "AMD" : "NV", color_samples, depth_samples,
+					     attachment_samples);
+				}
+			} else if (MsColorTargetsResolvable(colors, resolvable_samples) &&
+			           EmulatesColorAtDepthSamples(false, resolvable_samples, depth_samples)) {
+				// The color is 1-sample and the depth is not: render the color into a temporary
+				// image at the depth sample count and resolve it (renderDraw.cpp). Every
+				// attachment then shares one sample count, so depth stays attached.
+				attachment_samples             = depth_samples;
+				static std::atomic_bool logged = false;
+				if (!logged.exchange(true, std::memory_order_relaxed)) {
+					LOGF("Pipeline: emulated EQAA: color %u rendered at %u samples and resolved\n",
+					     color_samples, depth_samples);
+				}
+			} else {
+				// ponytail: no mixed-sample extension on the host (RenderDoc hides
+				// VK_NV_framebuffer_mixed_samples). Vulkan needs one sample count for all
+				// attachments, so render this draw without depth instead of ending the emulator.
+				// Ceiling: no depth test/write for these draws; renderDraw.cpp drops the
+				// attachment to match.
+				rendering.depth_format         = vk::Format::eUndefined;
+				rendering.stencil_format       = vk::Format::eUndefined;
+				static std::atomic_bool warned = false;
+				if (!warned.exchange(true, std::memory_order_relaxed)) {
+					LOGF("Pipeline: no mixed-sample support: rendering color %u / depth %u draws "
+					     "without depth\n",
+					     color_samples, depth_samples);
+				}
 			}
 		}
 	}
@@ -5758,6 +5947,7 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 	}
 
 	const auto skip_draw = [&](const PendingGraphicsPipeline& job) -> Pipeline* {
+		job.asked.store(AskClockMs(), std::memory_order_relaxed);
 		if (job.looking_up.load(std::memory_order_acquire)) {
 			// Round 130: its lookup is not done yet (milliseconds).
 			GpuPhases::Count(GpuPhases::Phase::PipelineLookupSkip, 1);
@@ -5799,9 +5989,9 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 				return skip_draw(*found.pending);
 			}
 			// A draw that may not be skipped waits for the compile another draw of the same
-			// pipeline sent to the background (round 87: more of those are sent now). Its job goes
-			// first: behind a cold driver cache's queue the wait took minutes, with the game
-			// frozen. Except for GetGraphicsPipeline's draws, the waits for one pipeline end
+			// pipeline sent to the background (round 87: more of those are sent now), asking for it
+			// (rounds 144 and 145, PipelineCompiler::Ask). Except for GetGraphicsPipeline's draws,
+			// the waits for one pipeline end
 			// KYTY_PIPELINE_MUST_WAIT_MS (default 10 s) after the first of them began, and its
 			// draws are skipped after that until it is ready: with a budget per draw, a run of
 			// draws into the same pipeline waited that long each and froze the game as before.
@@ -5816,8 +6006,9 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 				}
 			}
 			const GpuPhases::Scope wait_phase(GpuPhases::Phase::PipelineWait);
-			m_compiler->Promote(job);
+			bool                   stalled = false;
 			while (!FinishPending(found)) {
+				m_compiler->Ask(job, stalled);
 				auto budget = std::chrono::milliseconds(100);
 				if (defer != PipelineDefer::Never) {
 					const auto left = g_pipeline_must_wait -
@@ -5839,6 +6030,7 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 					budget = std::min(budget, std::chrono::ceil<std::chrono::milliseconds>(left));
 				}
 				(void)m_compiler->Wait(job, budget);
+				stalled = true;
 			}
 		}
 		return &found;
