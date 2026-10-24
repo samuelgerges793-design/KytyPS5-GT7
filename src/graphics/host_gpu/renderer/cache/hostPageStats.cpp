@@ -138,8 +138,7 @@ void Report(State& s) {
 	}
 	LOGF("Host pages (%.1f s, %u frames): the walks uploaded %s in %" PRIu64
 	     " uploads (%s a frame) over %zu pages of 16 KB%s; %" PRIu64 " bindings, %" PRIu64
-	     " GPU writes
-",
+	     " GPU writes\n",
 	     seconds, s.frame, Megabytes(s.walk_bytes).c_str(), s.walk_uploads,
 	     Megabytes(s.walk_bytes / frames).c_str(), s.pages.size(), text.c_str(), s.bindings,
 	     s.gpu_writes);
@@ -174,8 +173,7 @@ void Report(State& s) {
 		                    run.uploaded ? ", uploaded by bindings" : "",
 		                    run.written ? ", GPU-written" : "", run.giant ? ", in a giant binding" : "");
 	}
-	LOGF("Host pages: %zu runs of pages uploaded in 40%% of the frames or more; the largest: %s
-",
+	LOGF("Host pages: %zu runs of pages uploaded in 40%% of the frames or more; the largest: %s\n",
 	     runs.size(), text.c_str());
 	s.pages.clear();
 	s.giant.clear();
