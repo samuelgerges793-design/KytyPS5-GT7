@@ -135,6 +135,10 @@ void AppendInputKey(ByteWriter& key, const ShaderVertexInputInfo& info);
 void AppendInputKey(ByteWriter& key, const ShaderPixelInputInfo& info);
 void AppendInputKey(ByteWriter& key, const ShaderComputeInputInfo& info);
 void AppendSpecialization(ByteWriter& key, const ShaderRecompiler::IR::ResourceSpecialization& value);
+// AppendSpecialization's bytes read back (the pipeline warm-up's records keep them); false when
+// they are not exactly one specialization.
+[[nodiscard]] bool ReadSpecialization(std::span<const uint8_t>                      bytes,
+                                      ShaderRecompiler::IR::ResourceSpecialization& value);
 
 struct SourceRecord {
 	bool                             unsupported = false;

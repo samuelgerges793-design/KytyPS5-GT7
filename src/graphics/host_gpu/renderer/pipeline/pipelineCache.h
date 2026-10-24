@@ -135,6 +135,9 @@ struct ShaderProgram {
 	vk::ShaderModule normalized_module   = nullptr;
 	uint64_t         normalized_id       = 0;
 	bool             normalized_samplers = false;
+	// The pipeline warm-up's id of the permutation (the hash of its shader disk cache key without
+	// the session key; 0 for compute and without the disk cache): pipelines are recorded by it.
+	uint64_t replay = 0;
 
 	explicit operator bool() const { return id != 0 && module != nullptr; }
 };
@@ -502,6 +505,25 @@ private:
 	uint64_t                                                m_deferred_draws = 0;
 	// When the pipeline and program counts were last logged (TryGetGraphicsPipeline).
 	std::chrono::steady_clock::time_point                   m_counts_logged {};
+	// The pipeline warm-up (pipelineCache.cpp, PipelineCache::Warmup; KYTY_PIPELINE_WARMUP): the
+	// title's graphics pipelines are recorded as they are made, and when a run's shaders would all
+	// translate again (another recompiler or driver), the recorded ones are made again on worker
+	// threads from its first draw on, the game going on meanwhile.
+	struct Warmup;
+	std::unique_ptr<Warmup> m_warmup;
+	bool                    m_warmup_started = false;
+	void                    StartWarmup();
+	void                    RunWarmupWorker();
+	void RecordWarmup(const PipelineRenderingState&          rendering,
+	                  const PipelineVertexInputState&        vertex_input,
+	                  const PipelineStaticParameters&        static_params,
+	                  std::span<const ShaderVertexInputInfo> vertex_info,
+	                  const ShaderPixelInputInfo* ps_input_info, const GraphicsPrograms& programs);
+	// Stops the workers, waiting up to `wait`: how many still compile then (they keep the
+	// driver caches in use).
+	size_t StopWarmup(std::chrono::milliseconds wait);
+	// The warm-up's saves of the driver cache, on its own thread (as MaybeSaveDuringPlay's).
+	void SaveDriverCacheForWarmup();
 	// Round 87: whether a new pipeline is first looked up in the driver's caches alone
 	// (pipelineCreationCacheControl; KYTY_PIPELINE_PROBE=0 turns it off), and what is left of
 	// this frame's time for waits on background compiles (KYTY_PIPELINE_FRAME_WAIT_MS).
