@@ -732,6 +732,17 @@ static bool HostPagesBindings() {
 	return bindings;
 }
 
+// KYTY_HOST_PAGES_IMPORT_ONLY=1, a test: the chunks are imported as for host pages, but no page
+// becomes one, so nothing reads the imports. Round 15 lost the device with 40 host pages and
+// 121 MB of imports: whether the imports alone do it.
+static bool HostPagesImportOnly() {
+	static const bool only = [] {
+		const char* value = std::getenv("KYTY_HOST_PAGES_IMPORT_ONLY");
+		return value != nullptr && value[0] == '1';
+	}();
+	return only;
+}
+
 bool BufferCache::HostPagesEnabled() {
 	static const bool on = [] {
 		const char* value = std::getenv("KYTY_HOST_PAGES");
@@ -1049,6 +1060,9 @@ bool BufferCache::PromoteHostRun(uint64_t begin, uint64_t end) {
 		                                                       .buffer = std::move(buffer)})
 		             .first;
 		m_host_counts.imported_bytes += chunk_end - chunk_begin;
+	}
+	if (HostPagesImportOnly()) {
+		return false;
 	}
 	m_memory_tracker.UntrackMemory(begin, size);
 	m_host_ranges.emplace(begin, end);
