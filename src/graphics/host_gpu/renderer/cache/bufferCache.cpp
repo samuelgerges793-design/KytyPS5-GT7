@@ -695,8 +695,13 @@ constexpr size_t   HostMaxChunks    = 2048;
 } // namespace
 
 // KYTY_HOST_PAGES_KEEP=0: a chunk given back is destroyed once the GPU is done with it, instead
-// of kept until the end. KYTY_HOST_PAGES_WRITES=0: only pages the GPU did not write through a
-// binding in the window become host pages, and a written binding over them gives them back.
+// of kept until the end. Only pages the GPU did not write through a binding in the window become
+// host pages, and a written binding over them gives them back, unless KYTY_HOST_PAGES_WRITES=1:
+// with those pages too the device was lost 1-3 s into each race (2026-10-25). The likely cause:
+// GPU writes through bindings are then never marked, and the emulator's own reads of such bytes
+// (indirect arguments, resource tables the GPU writes) took guest memory at recording, before
+// the GPU wrote them, where a mark makes them wait for the GPU or copy them there. Pages the GPU
+// writes through addresses alone (not marked either way) are host pages in both modes.
 static bool HostPagesKeep() {
 	static const bool keep = [] {
 		const char* value = std::getenv("KYTY_HOST_PAGES_KEEP");
@@ -708,7 +713,7 @@ static bool HostPagesKeep() {
 static bool HostPagesWrites() {
 	static const bool writes = [] {
 		const char* value = std::getenv("KYTY_HOST_PAGES_WRITES");
-		return value == nullptr || value[0] != '0';
+		return value != nullptr && value[0] == '1';
 	}();
 	return writes;
 }
