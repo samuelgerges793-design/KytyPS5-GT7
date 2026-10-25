@@ -718,6 +718,20 @@ static bool HostPagesWrites() {
 	return writes;
 }
 
+// KYTY_HOST_PAGES_BINDINGS=1: a binding wholly inside a run binds the chunk. Off by default (2026-10-25):
+// host pages then serve the address-reading shaders alone, and a binding over them gives them back
+// (copied again). With bindings served (4,700-6,500 every 10 s), a race at Lago Maggiore lost the
+// device after 2.5 min, likely a binding the GPU read where it lies (indirect arguments, vertices)
+// that the game rewrote while it ran, which a copy made at recording never showed; a time trial
+// with almost none served ran on.
+static bool HostPagesBindings() {
+	static const bool bindings = [] {
+		const char* value = std::getenv("KYTY_HOST_PAGES_BINDINGS");
+		return value != nullptr && value[0] == '1';
+	}();
+	return bindings;
+}
+
 bool BufferCache::HostPagesEnabled() {
 	static const bool on = [] {
 		const char* value = std::getenv("KYTY_HOST_PAGES");
@@ -2690,7 +2704,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	}
 	if (HostIntersects(vaddr, size)) {
 		if (auto* host = HostRangeBuffer(vaddr, size);
-		    host != nullptr && (!is_written || HostPagesWrites())) {
+		    host != nullptr && HostPagesBindings() && (!is_written || HostPagesWrites())) {
 			m_host_counts.redirected++;
 			return {host, host->Offset(vaddr)};
 		}
@@ -2733,7 +2747,8 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferWritten(uint64_t vaddr, ui
 		EXIT("BufferCache: invalid written-range buffer request\n");
 	}
 	if (HostIntersects(vaddr, size)) {
-		if (auto* host = HostRangeBuffer(vaddr, size); host != nullptr && HostPagesWrites()) {
+		if (auto* host = HostRangeBuffer(vaddr, size);
+		    host != nullptr && HostPagesBindings() && HostPagesWrites()) {
 			m_host_counts.redirected++;
 			return {host, host->Offset(vaddr)};
 		}
@@ -2801,7 +2816,8 @@ vk::DeviceAddress BufferCache::WriteBitmapAddress() {
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferTracked(uint64_t vaddr, uint64_t size,
                                                               BufferId id) {
 	if (HostIntersects(vaddr, size)) {
-		if (auto* host = HostRangeBuffer(vaddr, size); host != nullptr && HostPagesWrites()) {
+		if (auto* host = HostRangeBuffer(vaddr, size);
+		    host != nullptr && HostPagesBindings() && HostPagesWrites()) {
 			m_host_counts.redirected++;
 			return {host, host->Offset(vaddr)};
 		}
