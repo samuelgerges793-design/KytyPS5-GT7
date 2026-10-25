@@ -500,6 +500,7 @@ private:
 	struct HostCandidate {
 		uint32_t last_frame = UINT32_MAX;
 		uint32_t frames     = 0;
+		bool     written    = false; // the GPU wrote it through a binding in this window
 	};
 	struct HostCounts {
 		uint64_t promoted = 0, demoted = 0, redirected = 0, skipped_bytes = 0, refused = 0;
@@ -508,6 +509,9 @@ private:
 	std::map<uint64_t, HostChunk>                      m_host_chunks;
 	std::unordered_map<uint64_t, HostCandidate>        m_host_candidates;
 	std::unordered_set<uint64_t>                       m_host_refused;
+	// Chunks given back, kept until the end (KYTY_HOST_PAGES_KEEP, default on): a chunk is made at
+	// most once a page, since a page given back is refused from then on.
+	std::vector<std::unique_ptr<Buffer>>               m_host_retired;
 	uint32_t                                           m_host_frame = 0;
 	HostCounts                                         m_host_counts;
 	// One bit a 4 MB region holding host pages (rebuilt when they change): the ~30,000 syncs and

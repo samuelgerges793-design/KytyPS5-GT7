@@ -694,6 +694,25 @@ constexpr uint64_t HostMaxBytes     = uint64_t {256} << 20u;
 constexpr size_t   HostMaxChunks    = 2048;
 } // namespace
 
+// KYTY_HOST_PAGES_KEEP=0: a chunk given back is destroyed once the GPU is done with it, instead
+// of kept until the end. KYTY_HOST_PAGES_WRITES=0: only pages the GPU did not write through a
+// binding in the window become host pages, and a written binding over them gives them back.
+static bool HostPagesKeep() {
+	static const bool keep = [] {
+		const char* value = std::getenv("KYTY_HOST_PAGES_KEEP");
+		return value == nullptr || value[0] != '0';
+	}();
+	return keep;
+}
+
+static bool HostPagesWrites() {
+	static const bool writes = [] {
+		const char* value = std::getenv("KYTY_HOST_PAGES_WRITES");
+		return value == nullptr || value[0] != '0';
+	}();
+	return writes;
+}
+
 bool BufferCache::HostPagesEnabled() {
 	static const bool on = [] {
 		const char* value = std::getenv("KYTY_HOST_PAGES");
@@ -870,8 +889,12 @@ void BufferCache::DemoteHostPages(uint64_t vaddr, uint64_t size, bool refuse) {
 			++chunk;
 			continue;
 		}
-		m_scheduler.DeferOperation(
-		    [owner = std::move(chunk->second.buffer)]() mutable { owner.reset(); });
+		if (HostPagesKeep()) {
+			m_host_retired.push_back(std::move(chunk->second.buffer));
+		} else {
+			m_scheduler.DeferOperation(
+			    [owner = std::move(chunk->second.buffer)]() mutable { owner.reset(); });
+		}
 		chunk = m_host_chunks.erase(chunk);
 	}
 }
@@ -965,7 +988,8 @@ bool BufferCache::PromoteHostRun(uint64_t begin, uint64_t end) {
 void BufferCache::PromoteHostPages() {
 	std::vector<uint64_t> pages;
 	for (const auto& [page, candidate]: m_host_candidates) {
-		if (candidate.frames >= HostNeedFrames && !m_host_refused.contains(page)) {
+		if (candidate.frames >= HostNeedFrames && !m_host_refused.contains(page) &&
+		    (HostPagesWrites() || !candidate.written)) {
 			pages.push_back(page);
 		}
 	}
@@ -2604,7 +2628,8 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		EXIT("BufferCache: buffer request requires a recording command buffer\n");
 	}
 	if (HostIntersects(vaddr, size)) {
-		if (auto* host = HostRangeBuffer(vaddr, size); host != nullptr) {
+		if (auto* host = HostRangeBuffer(vaddr, size);
+		    host != nullptr && (!is_written || HostPagesWrites())) {
 			m_host_counts.redirected++;
 			return {host, host->Offset(vaddr)};
 		}
@@ -2647,7 +2672,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferWritten(uint64_t vaddr, ui
 		EXIT("BufferCache: invalid written-range buffer request\n");
 	}
 	if (HostIntersects(vaddr, size)) {
-		if (auto* host = HostRangeBuffer(vaddr, size); host != nullptr) {
+		if (auto* host = HostRangeBuffer(vaddr, size); host != nullptr && HostPagesWrites()) {
 			m_host_counts.redirected++;
 			return {host, host->Offset(vaddr)};
 		}
@@ -2715,7 +2740,7 @@ vk::DeviceAddress BufferCache::WriteBitmapAddress() {
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferTracked(uint64_t vaddr, uint64_t size,
                                                               BufferId id) {
 	if (HostIntersects(vaddr, size)) {
-		if (auto* host = HostRangeBuffer(vaddr, size); host != nullptr) {
+		if (auto* host = HostRangeBuffer(vaddr, size); host != nullptr && HostPagesWrites()) {
 			m_host_counts.redirected++;
 			return {host, host->Offset(vaddr)};
 		}
@@ -3176,6 +3201,14 @@ void BufferCache::MarkGpuWritten(uint64_t vaddr, uint64_t size, bool tracked) {
 	KYTY_PROFILER_BLOCK("Obtain::MarkWritten");
 	if (HostIntersects(vaddr, size)) {
 		DemoteHostPages(vaddr, size, true);
+	}
+	if (HostPagesEnabled() && !HostPagesWrites() && size <= (uint64_t {4} << 20u)) {
+		for (auto page = vaddr & ~(CACHING_PAGESIZE - 1); page < vaddr + size;
+		     page += CACHING_PAGESIZE) {
+			if (auto it = m_host_candidates.find(page); it != m_host_candidates.end()) {
+				it->second.written = true;
+			}
+		}
 	}
 	if (HostPageStats::Enabled()) {
 		HostPageStats::NoteGpuWrite(vaddr, size);
