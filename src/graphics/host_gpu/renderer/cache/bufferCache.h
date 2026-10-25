@@ -17,12 +17,14 @@
 
 #include <atomic>
 #include <functional>
+#include <chrono>
 #include <map>
 #include <memory>
 #include <shared_mutex>
 #include <span>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -256,6 +258,12 @@ public:
 		return m_fault_manager.UnattributedFaults();
 	}
 	void                            SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
+	// Host pages (KYTY_HOST_PAGES=1, docs/HOST-PAGES-PLAN.md), GPU thread, at each guest frame's
+	// end: the pages the address-reading walks upload in most frames become the game's memory
+	// itself on the GPU (imported), for those walks and for the bindings inside them, and are no
+	// longer tracked, uploaded or protected. A use they cannot serve gives them back.
+	[[nodiscard]] static bool HostPagesEnabled();
+	void                      NoteFrameForHostPages();
 	// GPU thread. A shader that reads guest memory through its page table (DMA) reads a page no
 	// cached buffer covers as zeros, and only records the fault; a dispatch that writes images is
 	// not run again after one (DispatchBufferRecovery). The guest-mapped pages of
@@ -482,6 +490,45 @@ private:
 	Common::LeastRecentlyUsedCache<BufferId, uint64_t> m_lru_cache;
 	BufferMap                                          m_buffers;
 	PageTable                                          m_page_table;
+	// Host pages: their runs (begin -> end, 16 KB pages; each inside one chunk), the chunks of
+	// imported game memory (by begin), the walk uploads counted for the next promotion (by page
+	// address), pages given back or refused (not promoted again), and the counts of the log.
+	struct HostChunk {
+		uint64_t                end = 0;
+		std::unique_ptr<Buffer> buffer;
+	};
+	struct HostCandidate {
+		uint32_t last_frame = UINT32_MAX;
+		uint32_t frames     = 0;
+	};
+	struct HostCounts {
+		uint64_t promoted = 0, demoted = 0, redirected = 0, skipped_bytes = 0, refused = 0;
+	};
+	std::map<uint64_t, uint64_t>                       m_host_ranges;
+	std::map<uint64_t, HostChunk>                      m_host_chunks;
+	std::unordered_map<uint64_t, HostCandidate>        m_host_candidates;
+	std::unordered_set<uint64_t>                       m_host_refused;
+	uint32_t                                           m_host_frame = 0;
+	HostCounts                                         m_host_counts;
+	// One bit a 4 MB region holding host pages (rebuilt when they change): the ~30,000 syncs and
+	// bindings a frame that touch none are answered from it, without the map.
+	std::vector<uint64_t>                              m_host_region_bits;
+	std::vector<size_t>                                m_host_region_words;
+	void                                               RebuildHostRegions();
+	std::chrono::steady_clock::time_point              m_host_logged {};
+	// The chunk buffer when every byte of [vaddr, vaddr + size) is on host pages of one chunk.
+	[[nodiscard]] Buffer* HostRangeBuffer(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] bool    HostIntersects(uint64_t vaddr, uint64_t size) const;
+	// Gives back the host pages of the range: tracked (CPU-dirty, so the next sync uploads them
+	// from guest memory), their BDA entries the cached buffers' again, pending for the next walk.
+	void DemoteHostPages(uint64_t vaddr, uint64_t size, bool refuse);
+	// The BDA entries of the host pages in the range, the chunks' (after a buffer's register).
+	void ApplyHostBda(uint64_t vaddr, uint64_t size);
+	void NoteHostWalkUpload(uint64_t vaddr, uint64_t size);
+	// The walk's CPU-dirty runs without the host pages.
+	void SubtractHostPages(std::vector<std::pair<uint64_t, uint64_t>>& runs);
+	void PromoteHostPages();
+	bool PromoteHostRun(uint64_t begin, uint64_t end);
 	// With a page bitmap (round 80): HasGpuDirtyBytes answers most "no"s without the tree.
 	PagedRangeSet m_gpu_modified_ranges;
 	// Bytes whose download is recorded but not yet in guest memory.

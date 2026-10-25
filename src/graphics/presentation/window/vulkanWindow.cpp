@@ -1349,9 +1349,11 @@ void WindowContext::CreateVulkan() {
 		if (HasExtension(available_extensions, VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME);
 		}
-		// Round 116, KYTY_HOST_IMPORT_PROBE=1 (renderer/cache/hostImportProbe.h).
-		if (const char* probe = std::getenv("KYTY_HOST_IMPORT_PROBE");
-		    probe != nullptr && probe[0] == '1') {
+		// Round 116, KYTY_HOST_IMPORT_PROBE=1 (renderer/cache/hostImportProbe.h); and host pages,
+		// KYTY_HOST_PAGES=1 (docs/HOST-PAGES-PLAN.md).
+		const char* probe      = std::getenv("KYTY_HOST_IMPORT_PROBE");
+		const char* host_pages = std::getenv("KYTY_HOST_PAGES");
+		if ((probe != nullptr && probe[0] == '1') || (host_pages != nullptr && host_pages[0] == '1')) {
 			if (HasExtension(available_extensions, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME)) {
 				device_extensions.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
 				graphic_ctx.external_memory_host_enabled = true;

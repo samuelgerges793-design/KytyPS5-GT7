@@ -6,6 +6,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <span>
 #include <utility>
@@ -46,6 +47,15 @@ public:
 	~Buffer();
 	KYTY_CLASS_NO_COPY(Buffer);
 
+	// Host pages (KYTY_HOST_PAGES, docs/HOST-PAGES-PLAN.md): a buffer whose memory is the game's
+	// own at `host` (its backing, page-aligned), imported (VK_EXT_external_memory_host), for
+	// [cpu_address, cpu_address + size). Null when the driver does not take it.
+	[[nodiscard]] static std::unique_ptr<Buffer> ImportHost(GraphicContext&   graphics,
+	                                                        CommandScheduler& scheduler,
+	                                                        uint64_t cpu_address, uint8_t* host,
+	                                                        uint64_t size);
+	[[nodiscard]] bool IsImported() const noexcept { return m_imported != nullptr; }
+
 	[[nodiscard]] vk::Buffer         Handle() const noexcept { return m_buffer; }
 	[[nodiscard]] uint64_t           Size() const noexcept { return m_size; }
 	[[nodiscard]] std::span<uint8_t> Mapped() const noexcept { return m_mapped; }
@@ -83,6 +93,7 @@ public:
 	size_t lru_id       = 0;
 
 protected:
+	Buffer() = default; // ImportHost's
 	[[nodiscard]] GraphicContext&   Graphics() const noexcept { return *m_graphics; }
 	[[nodiscard]] CommandScheduler& Scheduler() const noexcept { return *m_scheduler; }
 
@@ -98,10 +109,11 @@ private:
 	vk::DeviceAddress             m_device_address = 0;
 	vk::Buffer                    m_buffer     = nullptr;
 	VmaAllocation                 m_allocation = nullptr;
-	uint64_t                      m_size;
+	uint64_t                      m_size     = 0;
 	bool                          m_coherent = false;
 	uint32_t                      m_properties = 0;
 	std::span<uint8_t>            m_mapped;
+	vk::DeviceMemory              m_imported = nullptr; // ImportHost's
 };
 
 class StreamBuffer final: public Buffer {

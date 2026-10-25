@@ -259,9 +259,14 @@ bool GuestGpu::LabelsDeferred() noexcept {
 }
 
 bool GuestGpu::LabelsAtCompletion() {
+	// On with host pages too (KYTY_HOST_PAGES=1) unless KYTY_LABELS_AT_COMPLETION=0: the GPU reads
+	// the game's memory where it lies, and the game must not reuse it before the GPU has run.
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_LABELS_AT_COMPLETION");
-		return value != nullptr && value[0] == '1';
+		if (value != nullptr && *value != '\0') {
+			return value[0] == '1';
+		}
+		return BufferCache::HostPagesEnabled();
 	}();
 	return enabled;
 }
@@ -1070,6 +1075,7 @@ bool GuestGpu::Process(Submission& submission) {
 			if (HostPageStats::Enabled()) {
 				HostPageStats::NoteFrame();
 			}
+			m_renderer.GetBufferCache().NoteFrameForHostPages();
 			m_renderer.GetTextureCache().TraceFrameEnd();
 			if (GlobalPm4Barriers()) {
 				cp.EmitGlobalBarrier();

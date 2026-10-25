@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 
 #include <array>
+#include <bit>
 #include <atomic>
 #include <chrono>
 #include <cinttypes>
@@ -333,8 +334,97 @@ Buffer::~Buffer() {
 			    m_device_address, m_scheduler != nullptr ? m_scheduler->CurrentTick() : 0,
 			    m_scheduler != nullptr ? m_scheduler->GetMasterSemaphore().KnownGpuTick() : 0);
 		}
-		vmaDestroyBuffer(m_graphics->allocator, m_buffer, m_allocation);
+		if (m_imported != nullptr) {
+			m_graphics->device.destroyBuffer(m_buffer, nullptr);
+			m_graphics->device.freeMemory(m_imported, nullptr);
+		} else {
+			vmaDestroyBuffer(m_graphics->allocator, m_buffer, m_allocation);
+		}
 	}
+}
+
+std::unique_ptr<Buffer> Buffer::ImportHost(GraphicContext& graphics, CommandScheduler& scheduler,
+                                           uint64_t cpu_address, uint8_t* host, uint64_t size) {
+	constexpr auto handle_type = vk::ExternalMemoryHandleTypeFlagBits::eHostAllocationEXT;
+	const auto     alignment   = std::max<uint64_t>(graphics.imported_host_pointer_alignment, 1);
+	if (!graphics.external_memory_host_enabled || host == nullptr || size == 0 ||
+	    reinterpret_cast<uint64_t>(host) % alignment != 0 || size % alignment != 0) {
+		return nullptr;
+	}
+	vk::MemoryHostPointerPropertiesEXT pointer {};
+	if (graphics.device.getMemoryHostPointerPropertiesEXT(handle_type, host, &pointer) !=
+	        vk::Result::eSuccess ||
+	    pointer.memoryTypeBits == 0) {
+		return nullptr;
+	}
+	vk::ExternalMemoryBufferCreateInfo external {};
+	external.handleTypes = handle_type;
+	vk::BufferCreateInfo info {};
+	info.pNext = &external;
+	info.size  = size;
+	info.usage = ReadFlags | vk::BufferUsageFlagBits::eTransferDst |
+	             vk::BufferUsageFlagBits::eStorageBuffer |
+	             vk::BufferUsageFlagBits::eUniformTexelBuffer |
+	             vk::BufferUsageFlagBits::eStorageTexelBuffer |
+	             vk::BufferUsageFlagBits::eShaderDeviceAddress;
+	const std::array<uint32_t, 2> families = {graphics.queue_family, graphics.readback_family};
+	if (graphics.readback_family != static_cast<uint32_t>(-1) &&
+	    graphics.readback_family != graphics.queue_family) {
+		info.sharingMode           = vk::SharingMode::eConcurrent;
+		info.queueFamilyIndexCount = static_cast<uint32_t>(families.size());
+		info.pQueueFamilyIndices   = families.data();
+	}
+	vk::Buffer buffer = nullptr;
+	if (graphics.device.createBuffer(&info, nullptr, &buffer) != vk::Result::eSuccess) {
+		return nullptr;
+	}
+	vk::MemoryRequirements requirements {};
+	graphics.device.getBufferMemoryRequirements(buffer, &requirements);
+	const auto types = pointer.memoryTypeBits & requirements.memoryTypeBits;
+	if (types == 0) {
+		graphics.device.destroyBuffer(buffer, nullptr);
+		return nullptr;
+	}
+	vk::ImportMemoryHostPointerInfoEXT import {};
+	import.handleType   = handle_type;
+	import.pHostPointer = host;
+	vk::MemoryAllocateFlagsInfo flags {};
+	flags.flags = vk::MemoryAllocateFlagBits::eDeviceAddress;
+	flags.pNext = &import;
+	vk::MemoryAllocateInfo allocate {};
+	allocate.pNext           = &flags;
+	allocate.allocationSize  = size;
+	allocate.memoryTypeIndex = static_cast<uint32_t>(std::countr_zero(types));
+	vk::DeviceMemory memory  = nullptr;
+	if (graphics.device.allocateMemory(&allocate, nullptr, &memory) != vk::Result::eSuccess) {
+		graphics.device.destroyBuffer(buffer, nullptr);
+		return nullptr;
+	}
+	if (graphics.device.bindBufferMemory(buffer, memory, 0) != vk::Result::eSuccess) {
+		graphics.device.destroyBuffer(buffer, nullptr);
+		graphics.device.freeMemory(memory, nullptr);
+		return nullptr;
+	}
+	std::unique_ptr<Buffer> result(new Buffer());
+	result->m_graphics    = &graphics;
+	result->m_scheduler   = &scheduler;
+	result->m_usage       = MemoryUsage::DeviceLocal;
+	result->m_cpu_address = cpu_address;
+	result->m_size        = size;
+	result->m_buffer      = buffer;
+	result->m_imported    = memory;
+	result->m_coherent    = true;
+	result->m_properties  = static_cast<uint32_t>(
+        graphics.physical_device_memory_properties.memoryTypes[allocate.memoryTypeIndex]
+            .propertyFlags);
+	result->m_mapped = {host, static_cast<size_t>(size)};
+	vk::BufferDeviceAddressInfo address_info {};
+	address_info.buffer       = buffer;
+	result->m_device_address  = graphics.device.getBufferAddress(address_info);
+	if (result->m_device_address == 0) {
+		return nullptr;
+	}
+	return result;
 }
 
 vk::DeviceAddress Buffer::BufferDeviceAddress() const noexcept {

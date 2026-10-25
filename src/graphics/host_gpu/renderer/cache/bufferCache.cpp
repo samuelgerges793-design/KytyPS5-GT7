@@ -34,6 +34,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
+#include <iterator>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -144,6 +145,7 @@ void BufferCache::ChangeRegister(BufferId id) {
 		}
 		WriteDataBuffer(m_bda_pagetable_buffer, table_offset,
 		                addresses.data(), addresses.size() * sizeof(vk::DeviceAddress));
+		ApplyHostBda(buffer.CpuAddress(), buffer.Size());
 	} else {
 		const auto found = m_buffers.find(buffer.CpuAddress());
 		EXIT_IF(found == m_buffers.end() || found->second != id);
@@ -153,6 +155,7 @@ void BufferCache::ChangeRegister(BufferId id) {
 		m_lru_cache.Free(buffer.lru_id);
 		m_bda_pagetable_buffer.Fill(table_offset,
 		                            size_pages * sizeof(vk::DeviceAddress), 0);
+		ApplyHostBda(buffer.CpuAddress(), buffer.Size());
 		buffer.is_deleted = true;
 	}
 }
@@ -649,6 +652,9 @@ void BufferCache::ForgetUnmapped(uint64_t vaddr, uint64_t size) {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		return;
 	}
+	if (HostIntersects(vaddr, size)) {
+		DemoteHostPages(vaddr, size, false);
+	}
 	uint64_t dropped = 0;
 	{
 		std::unique_lock lock(m_dirty_ranges_mutex);
@@ -667,6 +673,352 @@ void BufferCache::ForgetUnmapped(uint64_t vaddr, uint64_t size) {
 		     "+0x%" PRIx64 " dropped\n",
 		     dropped, vaddr, size);
 	}
+}
+
+// Host pages (KYTY_HOST_PAGES=1, docs/HOST-PAGES-PLAN.md, 2026-10-24). The walks for shaders that
+// read memory through addresses uploaded ~36 MB a frame in a race at Lago Maggiore over only
+// ~2,700 pages of 16 KB, most of them also bound and GPU-written through bindings: a CPU<->GPU
+// ping-pong of uploads, write faults and downloads. The pages a walk uploads in 40% of 64 frames
+// or more become host pages: the game's memory itself, imported (Buffer::ImportHost, ~23 GB/s
+// for the GPU on an RTX 4070 Ti SUPER), named by their BDA entries and returned by the bindings
+// wholly inside them. They are left CPU-dirty and writable (MemoryTracker::UntrackMemory): no
+// write faults, no uploads, no GPU-written marks, no downloads. A use they cannot serve (a binding
+// across their edge, a sync or a GPU write through a cached buffer, an unmap) gives them back:
+// tracked again, CPU-dirty, so the next sync uploads them from guest memory, and pending for the
+// next walk. Labels then wait for the GPU (GuestGpu::LabelsAtCompletion): the game must not reuse
+// memory the GPU still reads where it lies.
+namespace {
+constexpr uint32_t HostWindowFrames = 64;
+constexpr uint32_t HostNeedFrames   = 26; // 40% of the window
+constexpr uint64_t HostMaxBytes     = uint64_t {256} << 20u;
+constexpr size_t   HostMaxChunks    = 2048;
+} // namespace
+
+bool BufferCache::HostPagesEnabled() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_HOST_PAGES");
+		const bool  enabled = value != nullptr && value[0] == '1';
+		if (enabled) {
+			LOGF("Host pages: on (KYTY_HOST_PAGES=1): the pages the address-reading walks upload in "
+			     "%u of %u frames or more become the game's memory itself on the GPU\n",
+			     HostNeedFrames, HostWindowFrames);
+		}
+		return enabled;
+	}();
+	return on;
+}
+
+Buffer* BufferCache::HostRangeBuffer(uint64_t vaddr, uint64_t size) {
+	auto range = m_host_ranges.upper_bound(vaddr);
+	if (range == m_host_ranges.begin()) {
+		return nullptr;
+	}
+	--range;
+	if (range->second < vaddr + size || range->second <= vaddr) {
+		return nullptr;
+	}
+	auto chunk = m_host_chunks.upper_bound(vaddr);
+	if (chunk == m_host_chunks.begin()) {
+		return nullptr;
+	}
+	--chunk;
+	return chunk->second.end >= vaddr + size ? chunk->second.buffer.get() : nullptr;
+}
+
+void BufferCache::RebuildHostRegions() {
+	constexpr uint64_t RegionBits = 22;
+	if (m_host_region_bits.empty()) {
+		m_host_region_bits.assign((TRACKER_ADDRESS_SIZE >> RegionBits) / 64, 0);
+	}
+	for (const auto word: m_host_region_words) {
+		m_host_region_bits[word] = 0;
+	}
+	m_host_region_words.clear();
+	for (const auto [begin, end]: m_host_ranges) {
+		for (auto region = begin >> RegionBits; region <= (end - 1) >> RegionBits; region++) {
+			const auto word = static_cast<size_t>(region / 64);
+			if (word >= m_host_region_bits.size()) {
+				break;
+			}
+			if (m_host_region_bits[word] == 0) {
+				m_host_region_words.push_back(word);
+			}
+			m_host_region_bits[word] |= uint64_t {1} << (region % 64);
+		}
+	}
+}
+
+bool BufferCache::HostIntersects(uint64_t vaddr, uint64_t size) const {
+	if (m_host_ranges.empty() || size == 0) {
+		return false;
+	}
+	{
+		constexpr uint64_t RegionBits = 22;
+		const auto         first      = vaddr >> RegionBits;
+		const auto         last       = (vaddr + size - 1) >> RegionBits;
+		if (last - first < 4) {
+			bool any = false;
+			for (auto region = first; region <= last && !any; region++) {
+				const auto word = static_cast<size_t>(region / 64);
+				any = word < m_host_region_bits.size() &&
+				      (m_host_region_bits[word] >> (region % 64) & 1u) != 0;
+			}
+			if (!any) {
+				return false;
+			}
+		}
+	}
+	auto range = m_host_ranges.upper_bound(vaddr);
+	if (range != m_host_ranges.begin() && std::prev(range)->second > vaddr) {
+		return true;
+	}
+	return range != m_host_ranges.end() && range->first < vaddr + size;
+}
+
+void BufferCache::ApplyHostBda(uint64_t vaddr, uint64_t size) {
+	if (m_host_ranges.empty() || size == 0) {
+		return;
+	}
+	const auto end   = vaddr + size;
+	auto       range = m_host_ranges.upper_bound(vaddr);
+	if (range != m_host_ranges.begin()) {
+		--range;
+	}
+	std::vector<vk::DeviceAddress> addresses;
+	for (; range != m_host_ranges.end() && range->first < end; ++range) {
+		const auto begin = std::max(range->first, vaddr & ~(CACHING_PAGESIZE - 1));
+		const auto last  = std::min(range->second, Common::AlignUp(end, CACHING_PAGESIZE));
+		if (begin >= last) {
+			continue;
+		}
+		auto chunk = m_host_chunks.upper_bound(range->first);
+		if (chunk == m_host_chunks.begin()) {
+			continue;
+		}
+		--chunk;
+		const auto base = chunk->second.buffer->BufferDeviceAddress() - chunk->first;
+		addresses.clear();
+		for (auto page = begin; page < last; page += CACHING_PAGESIZE) {
+			addresses.push_back(base + page);
+		}
+		WriteDataBuffer(m_bda_pagetable_buffer, PageIndex(begin) * sizeof(vk::DeviceAddress),
+		                addresses.data(), addresses.size() * sizeof(vk::DeviceAddress));
+	}
+}
+
+void BufferCache::DemoteHostPages(uint64_t vaddr, uint64_t size, bool refuse) {
+	if (m_host_ranges.empty() || size == 0) {
+		return;
+	}
+	const auto first = vaddr & ~(CACHING_PAGESIZE - 1);
+	const auto last  = Common::AlignUp(vaddr + size, CACHING_PAGESIZE);
+	std::vector<std::pair<uint64_t, uint64_t>> demoted;
+	auto range = m_host_ranges.upper_bound(first);
+	if (range != m_host_ranges.begin()) {
+		--range;
+	}
+	while (range != m_host_ranges.end() && range->first < last) {
+		const auto [begin, end] = *range;
+		if (end <= first) {
+			++range;
+			continue;
+		}
+		const auto cut_begin = std::max(begin, first);
+		const auto cut_end   = std::min(end, last);
+		demoted.emplace_back(cut_begin, cut_end);
+		range = m_host_ranges.erase(range);
+		if (begin < cut_begin) {
+			m_host_ranges.emplace(begin, cut_begin);
+		}
+		if (cut_end < end) {
+			range = m_host_ranges.emplace(cut_end, end).first;
+		}
+	}
+	std::vector<vk::DeviceAddress> addresses;
+	for (const auto [begin, end]: demoted) {
+		m_memory_tracker.MarkRegionAsCpuModified(begin, end - begin);
+		m_memory_tracker.MarkBdaPending(begin, end - begin);
+		addresses.clear();
+		for (auto page = begin; page < end; page += CACHING_PAGESIZE) {
+			PageTable::PageRange pages {};
+			vk::DeviceAddress    address = 0;
+			if (PageTable::TryGetPageRange(page, CACHING_PAGESIZE, pages)) {
+				const auto id = m_page_table[pages.first];
+				if (!IsBufferInvalid(id)) {
+					const auto& buffer = m_slot_buffers[id];
+					address = buffer.BufferDeviceAddress() + (page - buffer.CpuAddress());
+				}
+			}
+			addresses.push_back(address);
+			if (refuse) {
+				m_host_refused.insert(page);
+			}
+		}
+		WriteDataBuffer(m_bda_pagetable_buffer, PageIndex(begin) * sizeof(vk::DeviceAddress),
+		                addresses.data(), addresses.size() * sizeof(vk::DeviceAddress));
+		m_host_counts.demoted += (end - begin) / CACHING_PAGESIZE;
+	}
+	RebuildHostRegions();
+	g_cpu_dirty_epoch.fetch_add(1, std::memory_order_release);
+	// Chunks with no host page left go once the GPU is done with them.
+	auto chunk = m_host_chunks.upper_bound(first);
+	if (chunk != m_host_chunks.begin()) {
+		--chunk;
+	}
+	while (chunk != m_host_chunks.end() && chunk->first < last) {
+		if (HostIntersects(chunk->first, chunk->second.end - chunk->first)) {
+			++chunk;
+			continue;
+		}
+		m_scheduler.DeferOperation(
+		    [owner = std::move(chunk->second.buffer)]() mutable { owner.reset(); });
+		chunk = m_host_chunks.erase(chunk);
+	}
+}
+
+void BufferCache::NoteHostWalkUpload(uint64_t vaddr, uint64_t size) {
+	if (size == 0) {
+		return;
+	}
+	for (auto page = vaddr & ~(CACHING_PAGESIZE - 1); page < vaddr + size;
+	     page += CACHING_PAGESIZE) {
+		auto& candidate = m_host_candidates[page];
+		if (candidate.last_frame != m_host_frame) {
+			candidate.last_frame = m_host_frame;
+			candidate.frames++;
+		}
+	}
+}
+
+void BufferCache::SubtractHostPages(std::vector<std::pair<uint64_t, uint64_t>>& runs) {
+	std::vector<std::pair<uint64_t, uint64_t>> kept;
+	kept.reserve(runs.size());
+	for (const auto [address, bytes]: runs) {
+		auto       cursor = address;
+		const auto end    = address + bytes;
+		auto       range  = m_host_ranges.upper_bound(cursor);
+		if (range != m_host_ranges.begin() && std::prev(range)->second > cursor) {
+			--range;
+		}
+		while (cursor < end) {
+			if (range == m_host_ranges.end() || range->first >= end) {
+				kept.emplace_back(cursor, end - cursor);
+				break;
+			}
+			if (range->first > cursor) {
+				kept.emplace_back(cursor, range->first - cursor);
+			}
+			const auto skip_end = std::min(end, range->second);
+			if (skip_end > std::max(cursor, range->first)) {
+				m_host_counts.skipped_bytes += skip_end - std::max(cursor, range->first);
+			}
+			cursor = std::max(cursor, skip_end);
+			++range;
+		}
+	}
+	runs.swap(kept);
+}
+
+bool BufferCache::PromoteHostRun(uint64_t begin, uint64_t end) {
+	const auto size    = end - begin;
+	const auto refused = [&] {
+		for (auto page = begin; page < end; page += CACHING_PAGESIZE) {
+			m_host_refused.insert(page);
+		}
+		m_host_counts.refused += size / CACHING_PAGESIZE;
+		return false;
+	};
+	// GPU-written bytes, or bytes still on their way to guest memory: another time.
+	if (m_memory_tracker.IsRegionGpuModified(begin, size)) {
+		return false;
+	}
+	{
+		std::shared_lock lock(m_dirty_ranges_mutex);
+		if (m_downloading_ranges.Intersects(begin, size) ||
+		    m_gpu_modified_ranges.Intersects(begin, size)) {
+			return false;
+		}
+	}
+	auto* backing =
+	    const_cast<uint8_t*>(Libs::LibKernel::Memory::FindGpuCleanBacking(begin, size));
+	if (backing == nullptr || !m_texture_cache.DescribeImagesInRange(begin, size, 1).empty()) {
+		return refused();
+	}
+	auto buffer = Buffer::ImportHost(m_graphics, m_scheduler, begin, backing, size);
+	if (buffer == nullptr) {
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+			LOGF("Host pages: the driver did not import 0x%016" PRIx64 "+%" PRIu64 " KB\n", begin,
+			     size >> 10u);
+		}
+		return refused();
+	}
+	m_memory_tracker.UntrackMemory(begin, size);
+	m_host_chunks.emplace(begin, HostChunk {.end = end, .buffer = std::move(buffer)});
+	m_host_ranges.emplace(begin, end);
+	RebuildHostRegions();
+	ApplyHostBda(begin, size);
+	m_host_counts.promoted += size / CACHING_PAGESIZE;
+	return true;
+}
+
+void BufferCache::PromoteHostPages() {
+	std::vector<uint64_t> pages;
+	for (const auto& [page, candidate]: m_host_candidates) {
+		if (candidate.frames >= HostNeedFrames && !m_host_refused.contains(page)) {
+			pages.push_back(page);
+		}
+	}
+	m_host_candidates.clear();
+	m_host_frame = 0;
+	std::ranges::sort(pages);
+	uint64_t host_bytes = 0;
+	for (const auto& [begin, end]: m_host_ranges) {
+		host_bytes += end - begin;
+	}
+	for (size_t i = 0; i < pages.size();) {
+		size_t j = i + 1;
+		while (j < pages.size() && pages[j] == pages[j - 1] + CACHING_PAGESIZE) {
+			j++;
+		}
+		const auto begin = pages[i];
+		const auto end   = pages[j - 1] + CACHING_PAGESIZE;
+		i                = j;
+		if (host_bytes + (end - begin) > HostMaxBytes || m_host_chunks.size() >= HostMaxChunks) {
+			break;
+		}
+		if (!HostIntersects(begin, end - begin) && PromoteHostRun(begin, end)) {
+			host_bytes += end - begin;
+		}
+	}
+}
+
+void BufferCache::NoteFrameForHostPages() {
+	if (!HostPagesEnabled()) {
+		return;
+	}
+	if (++m_host_frame >= HostWindowFrames) {
+		PromoteHostPages();
+	}
+	const auto now = std::chrono::steady_clock::now();
+	if (m_host_logged == std::chrono::steady_clock::time_point {}) {
+		m_host_logged = now;
+	}
+	if (now - m_host_logged < std::chrono::seconds(10)) {
+		return;
+	}
+	m_host_logged    = now;
+	uint64_t pages = 0;
+	for (const auto& [begin, end]: m_host_ranges) {
+		pages += (end - begin) / CACHING_PAGESIZE;
+	}
+	LOGF("Host pages: %zu runs, %" PRIu64 " pages (%" PRIu64 " MB) in %zu chunks; in the last 10 s %" PRIu64
+	     " promoted, %" PRIu64 " given back, %" PRIu64 " bindings served from them, %" PRIu64
+	     " MB the walks did not upload, %" PRIu64 " refused (%zu pages refused in all)\n",
+	     m_host_ranges.size(), pages, (pages * CACHING_PAGESIZE) >> 20u, m_host_chunks.size(),
+	     m_host_counts.promoted, m_host_counts.demoted, m_host_counts.redirected,
+	     m_host_counts.skipped_bytes >> 20u, m_host_counts.refused, m_host_refused.size());
+	m_host_counts = {};
 }
 
 // Round 132: KYTY_STORE_CLEAN=0 (or F8's storeclean:off): a GPU-thread store to CPU-clean watched
@@ -2018,6 +2370,9 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
                                     bool is_texel_buffer) {
 	KYTY_PROFILER_FUNCTION();
 	const GpuPhases::Scope phase(GpuPhases::Phase::BufferSync);
+	if (HostIntersects(vaddr, size)) {
+		DemoteHostPages(vaddr, size, true);
+	}
 	// Most calls (~22k a frame in a race) read a range whose tracker regions are all clean: what
 	// ForEachUploadRange finds for it is nothing to copy. Answer from the lock-free summary bitmap
 	// without the protection defer scope, the copy list, the lambdas and their profiler zones.
@@ -2248,6 +2603,13 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	if (command.IsInvalid() || !GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: buffer request requires a recording command buffer\n");
 	}
+	if (HostIntersects(vaddr, size)) {
+		if (auto* host = HostRangeBuffer(vaddr, size); host != nullptr) {
+			m_host_counts.redirected++;
+			return {host, host->Offset(vaddr)};
+		}
+		DemoteHostPages(vaddr, size, true);
+	}
 
 	if (auto& stream = ActiveStream(); !is_written && size <= CACHING_PAGESIZE &&
 	                                   (!needs_device_address || stream.HasDeviceAddress()) &&
@@ -2283,6 +2645,13 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferWritten(uint64_t vaddr, ui
 	if (command.IsInvalid() || !GuestRange {vaddr, size}.Valid() ||
 	    written_vaddr < vaddr || written_size > size || written_vaddr - vaddr > size - written_size) {
 		EXIT("BufferCache: invalid written-range buffer request\n");
+	}
+	if (HostIntersects(vaddr, size)) {
+		if (auto* host = HostRangeBuffer(vaddr, size); host != nullptr) {
+			m_host_counts.redirected++;
+			return {host, host->Offset(vaddr)};
+		}
+		DemoteHostPages(vaddr, size, true);
 	}
 	if (IsBufferInvalid(id) || !m_slot_buffers[id].IsInBounds(vaddr, size)) {
 		id = FindBuffer(vaddr, size);
@@ -2345,6 +2714,13 @@ vk::DeviceAddress BufferCache::WriteBitmapAddress() {
 
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferTracked(uint64_t vaddr, uint64_t size,
                                                               BufferId id) {
+	if (HostIntersects(vaddr, size)) {
+		if (auto* host = HostRangeBuffer(vaddr, size); host != nullptr) {
+			m_host_counts.redirected++;
+			return {host, host->Offset(vaddr)};
+		}
+		DemoteHostPages(vaddr, size, true);
+	}
 	if (IsBufferInvalid(id) || !m_slot_buffers[id].IsInBounds(vaddr, size)) {
 		id = FindBuffer(vaddr, size);
 	}
@@ -2798,6 +3174,9 @@ void BufferCache::WritesRecorded(bool address_writes, uint64_t shader) {
 
 void BufferCache::MarkGpuWritten(uint64_t vaddr, uint64_t size, bool tracked) {
 	KYTY_PROFILER_BLOCK("Obtain::MarkWritten");
+	if (HostIntersects(vaddr, size)) {
+		DemoteHostPages(vaddr, size, true);
+	}
 	if (HostPageStats::Enabled()) {
 		HostPageStats::NoteGpuWrite(vaddr, size);
 	}
@@ -3604,6 +3983,11 @@ uint64_t BufferCache::SynchronizeBdaPending(const RangeSet& mapped) {
 					HostPageStats::NoteWalkUpload(buffer.CpuAddress() + copy.dstOffset, copy.size);
 				}
 			}
+			if (source && HostPagesEnabled()) {
+				for (const auto& copy: span_copies[i]) {
+					NoteHostWalkUpload(buffer.CpuAddress() + copy.dstOffset, copy.size);
+				}
+			}
 			if (source) {
 				if (batched && !batch_open) {
 					UploadBatchBarrier(true);
@@ -3618,6 +4002,9 @@ uint64_t BufferCache::SynchronizeBdaPending(const RangeSet& mapped) {
 		mapped.ForEachInRange(region, TRACKER_REGION_SIZE, [&](uint64_t begin, uint64_t end) {
 			runs.clear();
 			m_memory_tracker.CollectCpuDirtyRuns(begin, end - begin, runs);
+			if (!m_host_ranges.empty()) {
+				SubtractHostPages(runs);
+			}
 			sync_runs();
 		});
 	});
