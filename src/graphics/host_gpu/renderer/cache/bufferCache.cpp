@@ -652,8 +652,8 @@ void BufferCache::ForgetUnmapped(uint64_t vaddr, uint64_t size) {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		return;
 	}
-	if (HostIntersects(vaddr, size)) {
-		DemoteHostPages(vaddr, size, false);
+	if (!m_host_chunks.empty()) {
+		DemoteHostPages(vaddr, size, false, true);
 	}
 	uint64_t dropped = 0;
 	{
@@ -825,12 +825,21 @@ void BufferCache::ApplyHostBda(uint64_t vaddr, uint64_t size) {
 	}
 }
 
-void BufferCache::DemoteHostPages(uint64_t vaddr, uint64_t size, bool refuse) {
-	if (m_host_ranges.empty() || size == 0) {
+void BufferCache::DemoteHostPages(uint64_t vaddr, uint64_t size, bool refuse, bool drop) {
+	if (m_host_chunks.empty() || size == 0) {
 		return;
 	}
-	const auto first = vaddr & ~(CACHING_PAGESIZE - 1);
-	const auto last  = Common::AlignUp(vaddr + size, CACHING_PAGESIZE);
+	auto first = vaddr & ~(CACHING_PAGESIZE - 1);
+	auto last  = Common::AlignUp(vaddr + size, CACHING_PAGESIZE);
+	if (drop) {
+		// The chunks over the range go: every host page of theirs is given back.
+		for (const auto& [begin, chunk]: m_host_chunks) {
+			if (begin < last && chunk.end > first) {
+				first = std::min(first, begin);
+				last  = std::max(last, chunk.end);
+			}
+		}
+	}
 	std::vector<std::pair<uint64_t, uint64_t>> demoted;
 	auto range = m_host_ranges.upper_bound(first);
 	if (range != m_host_ranges.begin()) {
@@ -879,13 +888,18 @@ void BufferCache::DemoteHostPages(uint64_t vaddr, uint64_t size, bool refuse) {
 	}
 	RebuildHostRegions();
 	g_cpu_dirty_epoch.fetch_add(1, std::memory_order_release);
-	// Chunks with no host page left go once the GPU is done with them.
+	// An unmap's chunks go once the GPU is done with them (or are kept until the end); the others
+	// stay for the runs promoted into them later (an import is slow: it pinned the memory and
+	// stalled the GPU, a stutter every promotion when each run had a chunk of its own).
+	if (!drop) {
+		return;
+	}
 	auto chunk = m_host_chunks.upper_bound(first);
 	if (chunk != m_host_chunks.begin()) {
 		--chunk;
 	}
 	while (chunk != m_host_chunks.end() && chunk->first < last) {
-		if (HostIntersects(chunk->first, chunk->second.end - chunk->first)) {
+		if (chunk->second.end <= first) {
 			++chunk;
 			continue;
 		}
@@ -962,22 +976,62 @@ bool BufferCache::PromoteHostRun(uint64_t begin, uint64_t end) {
 			return false;
 		}
 	}
-	auto* backing =
-	    const_cast<uint8_t*>(Libs::LibKernel::Memory::FindGpuCleanBacking(begin, size));
-	if (backing == nullptr || !m_texture_cache.DescribeImagesInRange(begin, size, 1).empty()) {
+	if (Libs::LibKernel::Memory::FindGpuCleanBacking(begin, size) == nullptr ||
+	    !m_texture_cache.DescribeImagesInRange(begin, size, 1).empty()) {
 		return refused();
 	}
-	auto buffer = Buffer::ImportHost(m_graphics, m_scheduler, begin, backing, size);
-	if (buffer == nullptr) {
-		static std::atomic<uint32_t> logged {0};
-		if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
-			LOGF("Host pages: the driver did not import 0x%016" PRIx64 "+%" PRIu64 " KB\n", begin,
-			     size >> 10u);
+	// The chunk holding the run, else a new one over the largest aligned window (16 MB, 4 MB,
+	// 1 MB) that one mapping holds and no chunk overlaps, else over the run alone.
+	auto holder = m_host_chunks.upper_bound(begin);
+	if (holder != m_host_chunks.begin() && std::prev(holder)->second.end >= end) {
+		--holder;
+	} else {
+		holder = m_host_chunks.end();
+	}
+	if (holder == m_host_chunks.end()) {
+		const auto overlaps = [&](uint64_t b, uint64_t e) {
+			auto it = m_host_chunks.upper_bound(b);
+			if (it != m_host_chunks.begin() && std::prev(it)->second.end > b) {
+				return true;
+			}
+			return it != m_host_chunks.end() && it->first < e;
+		};
+		std::unique_ptr<Buffer> buffer;
+		uint64_t                chunk_begin = 0;
+		uint64_t                chunk_end   = 0;
+		for (const uint64_t window: {uint64_t {16} << 20u, uint64_t {4} << 20u, uint64_t {1} << 20u,
+		                             uint64_t {0}}) {
+			const auto b = window == 0 ? begin : Common::AlignDown(begin, window);
+			const auto e = window == 0 ? end : b + window;
+			if (e < end || overlaps(b, e)) {
+				continue;
+			}
+			auto* backing =
+			    const_cast<uint8_t*>(Libs::LibKernel::Memory::FindBackingForImport(b, e - b));
+			if (backing == nullptr) {
+				continue;
+			}
+			buffer = Buffer::ImportHost(m_graphics, m_scheduler, b, backing, e - b);
+			if (buffer != nullptr) {
+				chunk_begin = b;
+				chunk_end   = e;
+				break;
+			}
 		}
-		return refused();
+		if (buffer == nullptr) {
+			static std::atomic<uint32_t> logged {0};
+			if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+				LOGF("Host pages: the driver did not import 0x%016" PRIx64 "+%" PRIu64 " KB\n",
+				     begin, size >> 10u);
+			}
+			return refused();
+		}
+		holder = m_host_chunks.emplace(chunk_begin, HostChunk {.end = chunk_end,
+		                                                       .buffer = std::move(buffer)})
+		             .first;
+		m_host_counts.imported_bytes += chunk_end - chunk_begin;
 	}
 	m_memory_tracker.UntrackMemory(begin, size);
-	m_host_chunks.emplace(begin, HostChunk {.end = end, .buffer = std::move(buffer)});
 	m_host_ranges.emplace(begin, end);
 	RebuildHostRegions();
 	ApplyHostBda(begin, size);
@@ -1038,10 +1092,12 @@ void BufferCache::NoteFrameForHostPages() {
 	}
 	LOGF("Host pages: %zu runs, %" PRIu64 " pages (%" PRIu64 " MB) in %zu chunks; in the last 10 s %" PRIu64
 	     " promoted, %" PRIu64 " given back, %" PRIu64 " bindings served from them, %" PRIu64
-	     " MB the walks did not upload, %" PRIu64 " refused (%zu pages refused in all)\n",
+	     " MB the walks did not upload, %" PRIu64 " refused (%zu pages refused in all), %" PRIu64
+	     " MB imported\n",
 	     m_host_ranges.size(), pages, (pages * CACHING_PAGESIZE) >> 20u, m_host_chunks.size(),
 	     m_host_counts.promoted, m_host_counts.demoted, m_host_counts.redirected,
-	     m_host_counts.skipped_bytes >> 20u, m_host_counts.refused, m_host_refused.size());
+	     m_host_counts.skipped_bytes >> 20u, m_host_counts.refused, m_host_refused.size(),
+	     m_host_counts.imported_bytes >> 20u);
 	m_host_counts = {};
 }
 

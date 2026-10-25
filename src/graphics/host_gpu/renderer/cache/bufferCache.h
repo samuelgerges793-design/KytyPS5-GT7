@@ -504,6 +504,7 @@ private:
 	};
 	struct HostCounts {
 		uint64_t promoted = 0, demoted = 0, redirected = 0, skipped_bytes = 0, refused = 0;
+		uint64_t imported_bytes = 0;
 	};
 	std::map<uint64_t, uint64_t>                       m_host_ranges;
 	std::map<uint64_t, HostChunk>                      m_host_chunks;
@@ -525,7 +526,8 @@ private:
 	[[nodiscard]] bool    HostIntersects(uint64_t vaddr, uint64_t size) const;
 	// Gives back the host pages of the range: tracked (CPU-dirty, so the next sync uploads them
 	// from guest memory), their BDA entries the cached buffers' again, pending for the next walk.
-	void DemoteHostPages(uint64_t vaddr, uint64_t size, bool refuse);
+	// `drop`: an unmap's, whose chunks go too, with every host page of theirs.
+	void DemoteHostPages(uint64_t vaddr, uint64_t size, bool refuse, bool drop = false);
 	// The BDA entries of the host pages in the range, the chunks' (after a buffer's register).
 	void ApplyHostBda(uint64_t vaddr, uint64_t size);
 	void NoteHostWalkUpload(uint64_t vaddr, uint64_t size);
