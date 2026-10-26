@@ -79,21 +79,21 @@ struct SafeCall {
 	static uint64_t GetSize() { return 0x1000; }
 
 	uint8_t code[0x90] = {
-	    /*00*/ 0x48, 0x8d, 0x64, 0x24, 0x80,             // lea    rsp,[rsp-0x80]
-	    /*05*/ 0x66, 0x90,                               // nop
-	    /*07*/ 0x9c,                                     // pushfq
-	    /*08*/ 0x51,                                     // push   rcx
-	    /*09*/ 0x52,                                     // push   rdx
-	    /*0a*/ 0x41, 0x50,                               // push   r8
-	    /*0c*/ 0x41, 0x51,                               // push   r9
-	    /*0e*/ 0x41, 0x52,                               // push   r10
-	    /*10*/ 0x41, 0x53,                               // push   r11
-	    /*12*/ 0x53,                                     // push   rbx
-	    /*13*/ 0x57,                                     // push   rdi
-	    /*14*/ 0x56,                                     // push   rsi
-	    /*15*/ 0x48, 0x89, 0xe3,                         // mov    rbx,rsp
-	    /*18*/ 0x48, 0x83, 0xe4, 0xf0,                   // and    rsp,0xfffffffffffffff0
-	    /*1c*/ 0x48, 0x83, 0xec, 0x20,                   // sub    rsp,0x20
+	    /*00*/ 0x48, 0x8d, 0x64, 0x24, 0x80, // lea    rsp,[rsp-0x80]
+	    /*05*/ 0x66, 0x90,                   // nop
+	    /*07*/ 0x9c,                         // pushfq
+	    /*08*/ 0x51,                         // push   rcx
+	    /*09*/ 0x52,                         // push   rdx
+	    /*0a*/ 0x41, 0x50,                   // push   r8
+	    /*0c*/ 0x41, 0x51,                   // push   r9
+	    /*0e*/ 0x41, 0x52,                   // push   r10
+	    /*10*/ 0x41, 0x53,                   // push   r11
+	    /*12*/ 0x53,                         // push   rbx
+	    /*13*/ 0x57,                         // push   rdi
+	    /*14*/ 0x56,                         // push   rsi
+	    /*15*/ 0x48, 0x89, 0xe3,             // mov    rbx,rsp
+	    /*18*/ 0x48, 0x83, 0xe4, 0xf0,       // and    rsp,0xfffffffffffffff0
+	    /*1c*/ 0x48, 0x83, 0xec, 0x20,       // sub    rsp,0x20
 	    /*20*/ 0x48, 0xb9, 0x88, 0x77, 0x66, 0x55, 0x44,
 	    0x33,        0x22, 0x11, // movabs rcx,0x1122334455667788
 	    /*2a*/ 0xff, 0xd1,       // call   rcx

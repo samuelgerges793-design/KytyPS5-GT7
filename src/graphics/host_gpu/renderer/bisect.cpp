@@ -47,6 +47,10 @@ struct Step {
 	bool              cmask_off    = false;
 	bool              fastread_off = false;
 	bool              fastread_any = false;
+	bool              fastread_gpu    = false; // round 152
+	bool              liftwait_old    = false; // round 153
+	int32_t           faultblock_kb   = -1;    // faultblock:<kb> (round 155); -1: the usual
+	bool              cuts156_off     = false; // round 156
 	bool              recheck      = false;
 	bool              locks_spin   = false;
 	bool              htile_depth  = false;
@@ -226,6 +230,18 @@ bool ParseAction(std::string_view action, Step& step) {
 	}
 	if (action == "fastread:any") {
 		step.fastread_any = true;
+		return true;
+	}
+	if (action == "fastread:gpu") {
+		step.fastread_gpu = true;
+		return true;
+	}
+	if (action == "liftwait:old") {
+		step.liftwait_old = true;
+		return true;
+	}
+	if (action == "cuts156:off") {
+		step.cuts156_off = true;
 		return true;
 	}
 	if (action == "recheck") {
@@ -567,6 +583,21 @@ bool ParseAction(std::string_view action, Step& step) {
 	if (action == "cpu:vcache" || action == "cpu:frequency" || action == "cpu:all" ||
 	    action == "cpu:gpuvcache" || action == "cpu:gpufrequency" || action == "cpu:gpucore") {
 		step.cpu_set = std::string(action.substr(4));
+		return true;
+	}
+	if (action.starts_with("faultblock:") && action != "faultblock:off" &&
+	    action != "faultblock:old") {
+		// Round 155: a write fault's block of that many KB (8 to 1024, a power of two).
+		const auto kb = action.substr(11);
+		if (kb.empty() || kb.size() > 4 ||
+		    kb.find_first_not_of("0123456789") != std::string_view::npos) {
+			return false;
+		}
+		const auto value = std::strtoul(std::string(kb).c_str(), nullptr, 10);
+		if (value < 8 || value > 1024 || (value & (value - 1u)) != 0) {
+			return false;
+		}
+		step.faultblock_kb = static_cast<int32_t>(value);
 		return true;
 	}
 	if (action.starts_with("readback:")) {
@@ -965,6 +996,21 @@ bool FastReadbackAnyAddress() {
 	return step != nullptr && step->fastread_any;
 }
 
+bool FastReadbackOnGpuThread() {
+	const auto* step = Current();
+	return step != nullptr && step->fastread_gpu;
+}
+
+bool LiftWaitOld() {
+	const auto* step = Current();
+	return step != nullptr && step->liftwait_old;
+}
+
+bool Cuts156Off() {
+	const auto* step = Current();
+	return step != nullptr && step->cuts156_off;
+}
+
 bool GpuClearRecheck() {
 	const auto* step = Current();
 	return step != nullptr && step->recheck;
@@ -988,6 +1034,11 @@ bool PatternFillsOff() {
 bool FaultBlocksOff() {
 	const auto* step = Current();
 	return step != nullptr && step->faultblock_off;
+}
+
+int32_t FaultBlockKB() {
+	const auto* step = Current();
+	return step != nullptr ? step->faultblock_kb : -1;
 }
 
 bool PopWait() {
