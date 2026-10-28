@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <source_location>
 #include <span>
 #include <utility>
 #include <vector>
@@ -79,11 +80,13 @@ public:
 	              vk::AccessFlags source_before      = vk::AccessFlagBits::eMemoryWrite,
 	              vk::AccessFlags destination_before = vk::AccessFlagBits::eMemoryRead |
 	                                                   vk::AccessFlagBits::eMemoryWrite,
-	              vk::AccessFlags source_after       = vk::AccessFlagBits::eMemoryRead |
-	                                                   vk::AccessFlagBits::eMemoryWrite,
-	              vk::AccessFlags destination_after  = vk::AccessFlagBits::eMemoryRead |
-	                                                   vk::AccessFlagBits::eMemoryWrite);
-	void Fill(uint64_t offset, uint64_t size, uint32_t value);
+	              vk::AccessFlags source_after = vk::AccessFlagBits::eMemoryRead |
+	                                             vk::AccessFlagBits::eMemoryWrite,
+	              vk::AccessFlags destination_after = vk::AccessFlagBits::eMemoryRead |
+	                                                  vk::AccessFlagBits::eMemoryWrite,
+	              const std::source_location& site = std::source_location::current());
+	void Fill(uint64_t offset, uint64_t size, uint32_t value,
+	          const std::source_location& site = std::source_location::current());
 
 	// BufferCache state lives directly on the resource.
 	bool   is_deleted   = false;
@@ -91,6 +94,10 @@ public:
 	uint64_t last_use_tick = 0;
 	int    stream_score = 0;
 	size_t lru_id       = 0;
+	// Collected with its download in flight (BufferCache::RunGarbageCollector), and whether a draw
+	// or dispatch used it again before the download landed (then it stays).
+	bool         gc_pending = false;
+	mutable bool gc_reused  = false;
 
 protected:
 	Buffer() = default; // ImportHost's

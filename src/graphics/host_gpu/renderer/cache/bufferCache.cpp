@@ -59,13 +59,31 @@ constexpr uint64_t GdsBufferSize = 64 * 1024;
 } // namespace
 
 void BufferCache::WriteDataBuffer(Buffer& buffer, uint64_t address, const void* source,
-                                  uint64_t size) {
-	auto* bytes = static_cast<const uint8_t*>(source);
+                                  uint64_t size, bool guest_store) {
+	// Round 167 (copies:lean): in the command buffer's batch of copies (copyBufferBatched). The
+	// guest's own stores are not ordered after the GPU work before them unless it waits for that
+	// work, which its sync points then order: with them, a store's copy waits for nothing either.
+	const bool batched     = Bisect::LeanCopies() && GuestGpu::IsGpuThread();
+	const bool wait_before = !guest_store || !GuestGpu::GuestPm4Barriers();
+	auto*      bytes       = static_cast<const uint8_t*>(source);
 	while (size != 0) {
 		const auto chunk  = std::min(size, m_staging_buffer.Size());
 		const auto offset = m_staging_buffer.Copy(bytes, chunk, 4);
-		buffer.CopyFrom(m_scheduler.Current(), m_staging_buffer, offset, buffer.Offset(address),
-		                chunk, vk::AccessFlagBits::eHostWrite);
+		if (batched) {
+			const auto destination = buffer.Offset(address);
+			if (destination > buffer.Size() || chunk > buffer.Size() - destination) {
+				EXIT("BufferCache: store 0x%016" PRIx64 "+0x%" PRIx64 " out of its buffer\n",
+				     address, chunk);
+			}
+			auto& command = m_scheduler.Current();
+			command.EndRendering();
+			const vk::BufferCopy copy {offset, destination, chunk};
+			command.Recorder().copyBufferBatched(m_staging_buffer.Handle(), buffer.Handle(), 1,
+			                                     &copy, wait_before);
+		} else {
+			buffer.CopyFrom(m_scheduler.Current(), m_staging_buffer, offset, buffer.Offset(address),
+			                chunk, vk::AccessFlagBits::eHostWrite);
+		}
 		bytes += chunk;
 		address += chunk;
 		size -= chunk;
@@ -166,6 +184,9 @@ void BufferCache::ChangeRegister(BufferId id) {
 void BufferCache::TouchBuffer(const Buffer& buffer) {
 	if (!buffer.is_deleted) {
 		m_lru_cache.Touch(buffer.lru_id, LruClock());
+		if (buffer.gc_pending) {
+			buffer.gc_reused = true;
+		}
 	}
 }
 
@@ -1179,7 +1200,7 @@ static bool StoreCleanEnabled() {
 	return enabled && !Bisect::StoreCleanOff();
 }
 
-bool BufferCache::WriteClean(uint64_t vaddr, const void* data, uint64_t size) {
+bool BufferCache::WriteClean(uint64_t vaddr, const void* data, uint64_t size, bool guest_store) {
 	if (!GuestGpu::IsGpuThread()) {
 		return false;
 	}
@@ -1231,7 +1252,7 @@ bool BufferCache::WriteClean(uint64_t vaddr, const void* data, uint64_t size) {
 	    !Libs::LibKernel::Memory::TryWriteBacking(vaddr, data, size)) {
 		return false;
 	}
-	WriteDataBuffer(m_slot_buffers[*owner], vaddr, data, size);
+	WriteDataBuffer(m_slot_buffers[*owner], vaddr, data, size, guest_store);
 	{
 		std::unique_lock lock(m_dirty_ranges_mutex);
 		ForgetFills(vaddr, size);
@@ -2711,12 +2732,71 @@ static bool DeferProtections(const CommandScheduler& /*scheduler*/) {
 	return t_guest_gpu_thread && Bisect::AsyncMemorySync();
 }
 
+// Round 172, diagnostics: how many of the GPU thread's buffer syncs repeat one of the same range
+// (and kind) made since the last time pages became CPU-dirty anywhere, which a memo could skip.
+// A "Buffer syncs" line every 10 s.
+static void NoteSyncRepeat(uint64_t vaddr, uint64_t size, bool is_written, bool is_texel_buffer) {
+	struct Entry {
+		uint64_t vaddr = 0;
+		uint64_t size  = 0;
+		uint64_t epoch = 0;
+		uint32_t kind  = 0;
+	};
+	struct Stats {
+		std::array<Entry, 1024>               table {};
+		uint64_t                              calls            = 0;
+		uint64_t                              written          = 0;
+		uint64_t                              texel            = 0;
+		uint64_t                              repeats          = 0;
+		uint64_t                              repeated_written = 0;
+		std::chrono::steady_clock::time_point last {};
+	};
+	// The GPU thread's alone (its callers check): no table in every thread's storage.
+	static Stats stats;
+	const auto   kind  = (is_written ? 1u : 0u) | (is_texel_buffer ? 2u : 0u);
+	const auto   epoch = g_cpu_dirty_epoch.load(std::memory_order_relaxed);
+	const auto slot  = ((vaddr >> 4u) ^ (size * 0x9e3779b97f4a7c15ull) ^ kind) % stats.table.size();
+	auto&      entry = stats.table[slot];
+	stats.calls++;
+	stats.written += is_written ? 1u : 0u;
+	stats.texel += is_texel_buffer ? 1u : 0u;
+	if (entry.vaddr == vaddr && entry.size == size && entry.kind == kind && entry.epoch == epoch) {
+		stats.repeats++;
+		stats.repeated_written += is_written ? 1u : 0u;
+	}
+	entry = {vaddr, size, epoch, kind};
+	if ((stats.calls & 4095u) != 0) {
+		return;
+	}
+	const auto now = std::chrono::steady_clock::now();
+	if (stats.last.time_since_epoch().count() == 0) {
+		stats.last = now;
+		return;
+	}
+	const double seconds = std::chrono::duration<double>(now - stats.last).count();
+	if (seconds < 10.0) {
+		return;
+	}
+	LOGF("Buffer syncs (%.1f s): %.0f a second (%.0f of written ranges, %.0f of texel buffers); "
+	     "%.0f a second repeat one of the same range made since pages last became CPU-dirty "
+	     "(%.0f of them written)\n",
+	     seconds, static_cast<double>(stats.calls) / seconds,
+	     static_cast<double>(stats.written) / seconds, static_cast<double>(stats.texel) / seconds,
+	     static_cast<double>(stats.repeats) / seconds,
+	     static_cast<double>(stats.repeated_written) / seconds);
+	stats.calls = stats.written = stats.texel = stats.repeats = stats.repeated_written = 0;
+	stats.last                                                                         = now;
+}
+
 bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size, bool is_written,
                                     bool is_texel_buffer) {
 	KYTY_PROFILER_FUNCTION();
 	const GpuPhases::Scope phase(GpuPhases::Phase::BufferSync);
 	if (HostIntersects(vaddr, size)) {
 		DemoteHostPages(vaddr, size, true);
+	}
+	if (t_guest_gpu_thread) {
+		NoteSyncRepeat(vaddr, size, is_written, is_texel_buffer);
 	}
 	// Most calls (~22k a frame in a race) read a range whose tracker regions are all clean: what
 	// ForEachUploadRange finds for it is nothing to copy. Answer from the lock-free summary bitmap
@@ -2788,7 +2868,14 @@ void BufferCache::RecordUpload(Buffer& buffer, std::span<const vk::BufferCopy> c
 		                              copies.data());
 		return;
 	}
-	const auto              native = command.Recorder();
+	const auto native = command.Recorder();
+	if (Bisect::LeanCopies() && GuestGpu::IsGpuThread()) {
+		// Round 167 (copies:lean): in the command buffer's batch of copies, after the GPU work
+		// before it (draws may still read the bytes it replaces).
+		native.copyBufferBatched(source, buffer.Handle(), static_cast<uint32_t>(copies.size()),
+		                         copies.data(), true);
+		return;
+	}
 	vk::BufferMemoryBarrier before {};
 	before.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite |
 	                       vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite;
@@ -4147,6 +4234,10 @@ void BufferCache::RunGarbageCollector() {
 			// See CreateBuffer: the tracker rejects address 0, so this one is never collected.
 			return false;
 		}
+		if (buffer.gc_pending) {
+			// Its download is in flight; the deferred step at the end drops it.
+			return false;
+		}
 		m_memory_tracker.ValidateGpuDirtyOwnership(m_gpu_modified_ranges.Ranges(),
 		                                           buffer.CpuAddress(), buffer.Size(),
 		                                           "garbage collection");
@@ -4218,6 +4309,67 @@ void BufferCache::RunGarbageCollector() {
 	// recording, so that recording has to actually submit and complete -- see ReadMemory's wait
 	// for why waiting on an older per-buffer tick here would skip that entirely.
 	const auto completion_tick = m_scheduler.CurrentTick();
+	// KYTY_GC_ASYNC_DOWNLOAD=0 waits here as before. By default the GPU thread goes on, and the
+	// buffers are dropped by a deferred operation once the GPU has finished this tick and its
+	// downloads are published (deferred operations run after their tick's priority callbacks). In
+	// a 1440p race on a 6 GB card the wait took 37 ms of each 290 ms frame (2026-10-24). A buffer
+	// a draw or dispatch uses again meanwhile stays: its pages may hold newer GPU writes.
+	static const bool async_download = [] {
+		const char* value = std::getenv("KYTY_GC_ASYNC_DOWNLOAD");
+		return value == nullptr || value[0] != '0';
+	}();
+	if (async_download) {
+		struct Pending {
+			BufferId id;
+			uint64_t address;
+		};
+		std::vector<Pending> pending;
+		pending.reserve(dirty_buffers.size());
+		for (const auto id: dirty_buffers) {
+			auto& buffer      = m_slot_buffers[id];
+			buffer.gc_pending = true;
+			buffer.gc_reused  = false;
+			pending.push_back({id, buffer.CpuAddress()});
+		}
+		m_scheduler.DeferOperation([this, completion_tick, pending = std::move(pending)] {
+			static uint64_t dropped = 0, kept = 0;
+			for (const auto& [id, address]: pending) {
+				auto* buffer = m_slot_buffers.try_get(id);
+				if (buffer == nullptr || buffer->is_deleted || !buffer->gc_pending ||
+				    buffer->CpuAddress() != address) {
+					continue;
+				}
+				buffer->gc_pending = false;
+				// GPU writes recorded since the downloads (also through buffer device addresses,
+				// which bind nothing and so leave gc_reused alone) are in m_gpu_modified_ranges
+				// again: then the buffer holds bytes newer than guest memory and stays.
+				if (buffer->gc_reused || buffer->last_use_tick > completion_tick ||
+				    m_gpu_modified_ranges.Intersects(buffer->CpuAddress(), buffer->Size())) {
+					buffer->gc_reused = false;
+					kept++;
+					continue;
+				}
+				m_memory_tracker.UnmarkRegionAsGpuModified(buffer->CpuAddress(), buffer->Size());
+				if (m_memory_tracker.IsRegionGpuModified(buffer->CpuAddress(), buffer->Size())) {
+					kept++;
+					continue;
+				}
+				m_memory_tracker.UntrackMemory(buffer->CpuAddress(), buffer->Size());
+				NoteBufferEvent(BufferEventKind::Collected, *buffer);
+				// Not destroyed at once: work recorded after the downloads may still reach it
+				// through its device address on the GPU (a device loss on 2026-10-24: a write
+				// into a buffer destroyed one tick before the GPU finished). DeleteBuffer clears
+				// its address table entries and destroys it once the current tick is done.
+				DeleteBuffer(id);
+				if (++dropped % 1024 == 1) {
+					LOGF("BufferCache: %" PRIu64 " GPU-written buffers dropped after their "
+					     "downloads landed, %" PRIu64 " kept (used again meanwhile)\n",
+					     dropped, kept);
+				}
+			}
+		});
+		return;
+	}
 	m_scheduler.Wait(completion_tick);
 	m_scheduler.WaitPriorityOperations(completion_tick);
 	for (const auto id: dirty_buffers) {

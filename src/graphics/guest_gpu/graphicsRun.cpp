@@ -186,7 +186,15 @@ GuestGpu::GuestGpu(RenderContext& renderer): m_renderer(renderer) {
 	m_gfx_cp = std::make_unique<CommandProcessor>(renderer, 0);
 	m_gfx_cp->Reset();
 	if (DrawPrep::Enabled()) {
-		m_draw_prep = std::make_unique<DrawPrepScanner>(renderer);
+		m_draw_prep = std::make_unique<DrawPrepScanner>(renderer, "graphics");
+		// Round 170: the compute queues' submissions on a scanner of their own
+		// (KYTY_DRAW_PREP_SCANNERS=1, or KYTY_BISECT's scan:shared, as before). Behind a graphics
+		// submission of thousands of draws, a compute queue's was often still waiting when the
+		// GPU thread ran it.
+		const char* scanners = std::getenv("KYTY_DRAW_PREP_SCANNERS");
+		if (scanners == nullptr || std::strcmp(scanners, "1") != 0) {
+			m_draw_prep_compute = std::make_unique<DrawPrepScanner>(renderer, "compute");
+		}
 		LOGF("DrawPrep: the scanner prepares draws ahead of the GPU thread (KYTY_DRAW_PREP=0 turns it "
 		     "off; verify %d)\n",
 		     DrawPrep::VerifyMode());
@@ -212,6 +220,7 @@ void GuestGpu::Shutdown() {
 	if (m_thread.joinable()) {
 		m_thread.join();
 	}
+	m_draw_prep_compute.reset();
 	m_draw_prep.reset();
 	m_shutdown_complete = true;
 }
@@ -621,6 +630,10 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 	m_renderer.RefreshHotPages();
 	g_guest_wait_seq.fetch_add(1, std::memory_order_relaxed);
 	GpuPhases::Count(GpuPhases::Phase::WaitPassed, 1);
+	// Round 166 (barriers:guest): what comes after the wait comes after what it waited for.
+	if (GuestGpu::GuestPm4Barriers()) {
+		EmitGlobalBarrier();
+	}
 	if (FrameGraph::Logging()) {
 		FrameGraph::BeginOp();
 		FrameGraph::Log("wait 0x%012" PRIx64 " passed: function %u reference 0x%" PRIx64
@@ -667,7 +680,8 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 	// the page, draining the GPU; WriteClean writes both copies instead.
 	auto& cache = m_renderer.GetBufferCache();
 	if (write_one_address) {
-		if (cache.WriteClean(reinterpret_cast<uint64_t>(dst), &src[dw_num - 1], sizeof(uint32_t))) {
+		if (cache.WriteClean(reinterpret_cast<uint64_t>(dst), &src[dw_num - 1], sizeof(uint32_t),
+		                     true)) {
 			return;
 		}
 		m_renderer.PrepareGpuThreadWrite(reinterpret_cast<uint64_t>(dst), sizeof(uint32_t));
@@ -678,7 +692,7 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 		                                LibKernel::Memory::WriteSource::GpuThreadStore);
 	} else {
 		const auto bytes = static_cast<size_t>(dw_num) * sizeof(uint32_t);
-		if (cache.WriteClean(reinterpret_cast<uint64_t>(dst), src, bytes)) {
+		if (cache.WriteClean(reinterpret_cast<uint64_t>(dst), src, bytes, true)) {
 			return;
 		}
 		m_renderer.PrepareGpuThreadWrite(reinterpret_cast<uint64_t>(dst), bytes);
@@ -766,13 +780,17 @@ void GuestGpu::Enqueue(Submission submission) {
 	EXIT_IF(!m_accepting);
 	if (m_draw_prep != nullptr) {
 		// In queue order, as the GPU thread will run them.
+		auto& scanner =
+		    submission.queue_id != 0 && m_draw_prep_compute != nullptr && !Bisect::ScanShared()
+		        ? *m_draw_prep_compute
+		        : *m_draw_prep;
 		if (submission.type == SubmissionType::Graphics ||
 		    submission.type == SubmissionType::Compute) {
 			submission.prep_seq = ++m_prep_seq;
-			m_draw_prep->EnqueueSubmission(submission.queue_id, submission.prep_seq,
-			                               submission.commands);
+			scanner.EnqueueSubmission(submission.queue_id, submission.prep_seq,
+			                          submission.commands);
 		} else if (submission.type == SubmissionType::SuspendPoint) {
-			m_draw_prep->EnqueueReset(submission.queue_id);
+			scanner.EnqueueReset(submission.queue_id);
 		}
 	}
 	const bool compute = submission.type == SubmissionType::Compute;
@@ -965,6 +983,20 @@ void GuestGpu::ThreadRun(void* data) {
 	}
 }
 
+// KYTY_FLUSH_BEFORE_GC=0 records the garbage collectors' work at the end of a submission into the
+// command buffer of its last commands, as before. By default that command buffer is submitted
+// first, readahead's downloads with it (the before-flush hook), so a game thread's read of what
+// those commands wrote does not wait behind the collectors' image write-backs: in a GT7 race the
+// 14 KB a compute dispatch wrote for a game thread came 70-310 ms after the dispatch, behind
+// 10-180 MB of images written back and retiled in the same command buffer (2026-10-24).
+static bool FlushBeforeGc() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_FLUSH_BEFORE_GC");
+		return value == nullptr || value[0] != '0';
+	}();
+	return on;
+}
+
 bool GuestGpu::Process(Submission& submission) {
 	const bool first_slice = !submission.started;
 	auto&      cp          = GetProcessor(submission.queue_id);
@@ -995,6 +1027,11 @@ bool GuestGpu::Process(Submission& submission) {
 
 	cp.BufferInit();
 	bool complete = true;
+	// Round 166 (barriers:guest): this queue's work comes after what the slices before it
+	// recorded, other queues' included (their labels this one may have waited for).
+	if (GuestPm4Barriers()) {
+		cp.EmitGlobalBarrier();
+	}
 
 	switch (submission.type) {
 		case SubmissionType::Graphics: {
@@ -1030,6 +1067,9 @@ bool GuestGpu::Process(Submission& submission) {
 			submission.progressed = progressed;
 			if (progressed) {
 				if (complete) {
+					if (FlushBeforeGc()) {
+						cp.BufferFlush();
+					}
 					m_renderer.RunGarbageCollector();
 				}
 				cp.BufferFlush();
@@ -1058,6 +1098,9 @@ bool GuestGpu::Process(Submission& submission) {
 			submission.progressed = submission.command_execution.MadeProgress();
 			if (submission.progressed) {
 				if (complete) {
+					if (FlushBeforeGc()) {
+						cp.BufferFlush();
+					}
 					m_renderer.RunGarbageCollector();
 				}
 				cp.BufferFlush();
@@ -1077,7 +1120,7 @@ bool GuestGpu::Process(Submission& submission) {
 			}
 			m_renderer.GetBufferCache().NoteFrameForHostPages();
 			m_renderer.GetTextureCache().TraceFrameEnd();
-			if (GlobalPm4Barriers()) {
+			if (Pm4SyncBarriers()) {
 				cp.EmitGlobalBarrier();
 			}
 			m_renderer.GetCommandScheduler().DeferPriorityOperation(
@@ -1932,26 +1975,36 @@ void CommandProcessor::WriteAtEndOfPipe64(uint32_t cache_policy, uint32_t event_
 
 bool GuestGpu::GlobalPm4Barriers() {
 	static const bool whole_run = [] {
-		const char* value = std::getenv("KYTY_PM4_BARRIERS");
-		const bool  on    = value != nullptr && std::strcmp(value, "global") == 0;
-		LOGF("PM4 barriers: %s (KYTY_PM4_BARRIERS=global, or KYTY_BISECT's barriers:global, for "
-		     "the full barriers of before round 135)\n",
-		     on ? "a full barrier at each cache flush, RELEASE_MEM and suspend point"
-		        : "the renderer's resource barriers only");
+		const char* value    = std::getenv("KYTY_PM4_BARRIERS");
+		const bool  on       = value != nullptr && std::strcmp(value, "global") == 0;
+		const bool  renderer = value != nullptr && std::strcmp(value, "renderer") == 0;
+		LOGF("PM4 barriers: %s (KYTY_PM4_BARRIERS=renderer, or KYTY_BISECT's barriers:renderer, "
+		     "for a barrier before every writing dispatch and after every dispatch, as before "
+		     "round 167; =global, or barriers:global, for the full barriers of before round "
+		     "135)\n",
+		     on         ? "a full barrier at each cache flush, RELEASE_MEM and suspend point"
+		     : renderer ? "the renderer's resource barriers only"
+		                : "the guest's sync points (round 166, the default since round 167)");
 		return on;
 	}();
-	return whole_run || Bisect::GlobalPm4Barriers() || Bisect::GuestBarriers();
+	return whole_run || Bisect::GlobalPm4Barriers();
 }
 
-static std::atomic<uint64_t> g_global_barriers {0};
-
-uint64_t GuestGpu::GlobalBarriersEmitted() noexcept {
-	return g_global_barriers.load(std::memory_order_relaxed);
+bool GuestGpu::GuestPm4Barriers() {
+	// Round 167: on unless KYTY_PM4_BARRIERS names another kind (or a step asks for one). In a
+	// race A/B the GPU thread was no longer held up waiting, about 8 % more frames.
+	static const bool renderer_run = [] {
+		const char* value = std::getenv("KYTY_PM4_BARRIERS");
+		return value != nullptr && std::strcmp(value, "renderer") == 0;
+	}();
+	if (Bisect::GuestPm4Barriers()) {
+		return true;
+	}
+	return !renderer_run && !GlobalPm4Barriers() && !Bisect::RendererPm4Barriers();
 }
 
-void CommandProcessor::EmitGlobalBarrier() {
+void CommandProcessor::EmitGlobalBarrier(const std::source_location& site) {
 	const RendererLock lock(m_renderer.GetMutex());
-	g_global_barriers.fetch_add(1, std::memory_order_relaxed);
 
 	vk::MemoryBarrier2 barrier {};
 	barrier.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
@@ -1963,7 +2016,7 @@ void CommandProcessor::EmitGlobalBarrier() {
 	dependency.memoryBarrierCount = 1;
 	dependency.pMemoryBarriers    = &barrier;
 	GetScheduler().EndRendering();
-	CurrentBuffer().Recorder().pipelineBarrier2(dependency);
+	CurrentBuffer().Recorder().pipelineBarrier2(dependency, site);
 }
 
 void CommandProcessor::TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id) {
@@ -1989,7 +2042,7 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 		case 0x00000007:
 		case 0x0000000f:
 		case 0x00000010:
-			if (GuestGpu::GlobalPm4Barriers()) {
+			if (GuestGpu::Pm4SyncBarriers()) {
 				EmitGlobalBarrier();
 			}
 			break;
@@ -2004,7 +2057,7 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 				EXIT("unknown event type: 0x%08" PRIx32 ", 0x%08" PRIx32 "\n", event_type,
 				     event_index);
 			}
-			if (GuestGpu::GlobalPm4Barriers()) {
+			if (GuestGpu::Pm4SyncBarriers()) {
 				EmitGlobalBarrier();
 			}
 			break;

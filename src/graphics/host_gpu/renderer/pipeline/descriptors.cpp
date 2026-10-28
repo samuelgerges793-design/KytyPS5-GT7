@@ -4238,6 +4238,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 				                        ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
 				                        : vk::ImageLayout::eShaderReadOnlyOptimal;
 				if (image->backing.state.layout != layout) {
+					const GuestImageUses guest_use;
 					image->Transit(layout, vk::AccessFlagBits2::eShaderRead, {}, vk_buffer);
 				}
 			};
@@ -4290,6 +4291,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 						     " changed layout without a state generation change\n",
 						     static_cast<uint32_t>(i), heap->base);
 					}
+					const GuestImageUses guest_use;
 					image->Transit(layout, vk::AccessFlagBits2::eShaderRead, {}, vk_buffer);
 				}
 			}
@@ -4300,6 +4302,8 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		for (uint32_t i = 0; i < program.info.images.size(); i++) {
 			auto& image   = m_context.GetTextureCache().GetImage(descriptors.images[i].image_id);
 			auto& binding = descriptors.images[i];
+			// The draw's or dispatch's own textures (images:lean, round 167).
+			const GuestImageUses        guest_use;
 			const auto&                 view = binding.desc.view_info;
 			const ImageSubresourceRange range {view.base_level, view.level_count, view.base_layer,
 			                                   view.layer_count};
