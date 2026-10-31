@@ -226,6 +226,7 @@ public:
 	// values; arrays go through Stash().
 	template <typename F>
 	void Record(F&& fn) {
+		m_record_count++;
 		using Command = TypedCommand<std::decay_t<F>>;
 		void* memory  = Allocate(sizeof(Command), alignof(Command));
 		auto* command = new (memory) Command(std::forward<F>(fn));
@@ -263,6 +264,16 @@ public:
 	[[nodiscard]] CopyBatchState& CopyBatch() noexcept { return m_copy_batch; }
 	// Round 172: the recording command buffer's pipelines and dynamic state.
 	[[nodiscard]] DynamicStateShadow& StateShadow() noexcept { return m_state_shadow; }
+	// Round 19 (gt7-sync3): the full barrier last recorded (CommandProcessor::EmitGlobalBarrier).
+	// One with nothing queued since it in the same command buffer waits for nothing more: the
+	// guest's sync points often come in a row (a RELEASE_MEM, the wait for it, an ACQUIRE_MEM),
+	// and on NVIDIA each full barrier drains the GPU. Threaded recording only: there every
+	// command goes through Record(), and a raw Handle() forgets the barrier.
+	[[nodiscard]] bool FullBarrierRepeats() const noexcept {
+		return m_threaded && m_full_barrier_at == m_record_count;
+	}
+	void NoteFullBarrier() noexcept { m_full_barrier_at = m_threaded ? m_record_count : NoBarrier; }
+	void ForgetFullBarrier() noexcept { m_full_barrier_at = NoBarrier; }
 
 private:
 	class CommandPool {
@@ -388,6 +399,10 @@ private:
 	uint64_t                            m_chunks_dispatched = 0;
 	uint64_t                            m_chunks_executed   = 0;
 	uint64_t                            m_drains            = 0;
+	// The commands queued (Record) and their count when the last full barrier was (round 19).
+	static constexpr uint64_t           NoBarrier           = UINT64_MAX;
+	uint64_t                            m_record_count      = 0;
+	uint64_t                            m_full_barrier_at   = NoBarrier;
 	vk::CommandBuffer                   m_worker_buffer     = nullptr;
 	uint64_t                            m_record_report_buffers = 0;
 	uint64_t                            m_record_report_chunks  = 0;

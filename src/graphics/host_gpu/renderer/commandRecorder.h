@@ -52,6 +52,8 @@ enum Kind : uint32_t {
 	PipelineBinds,     // pipeline binds
 	PipelineUnchanged, // ... of the pipeline bound already
 	StateLeftOut,      // calls of both kinds left out (state:filter)
+	// Round 19 (gt7-sync3): the guest's full barriers left out, nothing recorded since the last.
+	FullBarriersRepeated,
 	Count
 };
 

@@ -35,6 +35,9 @@ vk::CommandBuffer CommandBuffer::Handle() const {
 	// through a handle kept past a Recorder() state call is not seen by the shadow, so the handle
 	// is taken again (Handle()) after such calls.
 	m_scheduler.StateShadow().InvalidateAll();
+	// Round 19: and what is recorded through the handle is not counted, so the last full barrier
+	// may not be the last command any more.
+	m_scheduler.ForgetFullBarrier();
 	if (m_scheduler.Threaded()) {
 		// Recording directly: the recording thread must have run everything queued first.
 		return m_scheduler.DrainRecording();

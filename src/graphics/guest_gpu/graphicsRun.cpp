@@ -2015,8 +2015,16 @@ void CommandProcessor::EmitGlobalBarrier(const std::source_location& site) {
 	vk::DependencyInfo dependency {};
 	dependency.memoryBarrierCount = 1;
 	dependency.pMemoryBarriers    = &barrier;
-	GetScheduler().EndRendering();
+	auto& scheduler = GetScheduler();
+	scheduler.EndRendering();
+	// Round 19 (gt7-sync3): nothing recorded since the last full barrier, which already orders
+	// everything before it with everything after it.
+	if (scheduler.FullBarrierRepeats()) {
+		RecordedCommands::Add(RecordedCommands::FullBarriersRepeated);
+		return;
+	}
 	CurrentBuffer().Recorder().pipelineBarrier2(dependency, site);
+	scheduler.NoteFullBarrier();
 }
 
 void CommandProcessor::TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id) {

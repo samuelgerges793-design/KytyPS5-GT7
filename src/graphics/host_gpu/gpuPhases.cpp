@@ -623,6 +623,12 @@ void ReportIfDue(uint64_t frames) {
 		     n(RC::BufferUpdates), mb(RC::BufferUpdateBytes), n(RC::BufferFills),
 		     mb(RC::BufferFillBytes), n(RC::ImageUploads), n(RC::ImageDownloads),
 		     n(RC::ImageCopies), n(RC::Clears));
+		// Round 19 (gt7-sync3): the guest's full barriers that repeated the one before them.
+		if (n(RC::FullBarriersRepeated) > 0.0) {
+			LOGF("Recorded (%.1f s), a frame: %.0f of the guest's full barriers left out, nothing "
+			     "recorded since the one before\n",
+			     seconds, n(RC::FullBarriersRepeated));
+		}
 		// Round 172: pipeline binds and dynamic state calls, and those that changed nothing.
 		if (n(RC::StateCalls) + n(RC::PipelineBinds) > 0.0) {
 			LOGF("Recorded state (%.1f s), a frame: %.0f dynamic state calls (%.0f set what was "

@@ -1404,16 +1404,19 @@ bool RendererPm4Barriers() {
 	return step != nullptr && step->barriers_renderer;
 }
 
-// Round 169: KYTY_LEAN_BARRIERS=1 turns copies:lean and images:lean on for the whole run (F8's
-// lean:off turns them off for a step). Off by default: with round 168's shaders a race A/B found
-// no difference (with the shaders of before, about 5 % more frames).
+// Round 169: KYTY_LEAN_BARRIERS turns copies:lean and images:lean on for the whole run (F8's
+// lean:off turns them off for a step). With round 168's shaders a race A/B found no difference
+// (with the shaders of before, about 5 % more frames). On by default since 2026-10-31 (gt7-sync3):
+// on an RTX 4070 Ti SUPER each full barrier drains the GPU (Nsight: the front end stalled on
+// wait-for-idle 25-35 % of the time), and the guest's stores made ~1,200 of the ~2,700 a frame;
+// lean, the Tokyo race ran ~28.8 fps against ~27. KYTY_LEAN_BARRIERS=0 turns them off.
 static bool LeanBarriersDefault() {
 	static const bool on = [] {
 		const char* value = std::getenv("KYTY_LEAN_BARRIERS");
-		const bool  lean  = value != nullptr && std::strcmp(value, "1") == 0;
-		LOGF("Lean barriers: %s (KYTY_LEAN_BARRIERS=1: copies share their barriers, image uses in "
-		     "an unchanged layout make none; KYTY_BISECT's copies:lean, images:lean and lean:off "
-		     "for a step)\n",
+		const bool  lean  = value == nullptr || std::strcmp(value, "0") != 0;
+		LOGF("Lean barriers: %s (KYTY_LEAN_BARRIERS=0 turns them off: copies share their "
+		     "barriers, image uses in an unchanged layout make none; KYTY_BISECT's copies:lean, "
+		     "images:lean and lean:off for a step)\n",
 		     lean ? "on" : "off");
 		return lean;
 	}();

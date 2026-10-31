@@ -649,6 +649,8 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	// Round 167: a batch of copies ends with its command buffer.
 	m_command.Recorder().FlushCopyBatch();
 	m_copy_batch.fenced = false;
+	// Round 19: the next command buffer begins with no full barrier recorded.
+	ForgetFullBarrier();
 	EXIT_IF(submit.num_wait_semaphores > SubmitInfo::MaxSemaphores ||
 	        submit.num_signal_semaphores >= SubmitInfo::MaxSemaphores);
 
