@@ -58,17 +58,20 @@ constexpr uint64_t GdsBufferSize = 64 * 1024;
 
 } // namespace
 
-// Round 20 (gt7-sync3): KYTY_STORES_INLINE=0 copies every store through the staging buffer, as
-// before (WriteDataBuffer).
+// Round 20 (gt7-sync3): KYTY_STORES_INLINE=1 writes the guest's stores of up to 64 KB with
+// vkCmdUpdateBuffer instead of a copy each from the staging buffer (WriteDataBuffer). Off by
+// default: in a Tokyo race on an RTX 4070 Ti SUPER it gave the same frame rate, and Nsight counted
+// more subchannel switches and go-idles per draw or dispatch, not fewer (NVIDIA's driver runs both
+// kinds of transfer outside the 3D and compute work around them).
 constexpr uint64_t InlineStoreBytes = 65536;
 
 static bool StoresInline() {
 	static const bool on = [] {
 		const char* value = std::getenv("KYTY_STORES_INLINE");
-		const bool  on    = value == nullptr || value[0] != '0';
-		LOGF("Inline stores: %s (KYTY_STORES_INLINE=0: through the staging buffer, a copy each)\n",
-		     on ? "the guest's stores of up to 64 KB are written by the command buffer itself"
-		        : "off");
+		const bool  on    = value != nullptr && value[0] == '1';
+		LOGF("Inline stores: %s (KYTY_STORES_INLINE=1: the guest's stores of up to 64 KB written "
+		     "by the command buffer itself, not copied through the staging buffer)\n",
+		     on ? "on" : "off");
 		return on;
 	}();
 	return on;
