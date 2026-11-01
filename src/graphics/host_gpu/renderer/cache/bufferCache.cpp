@@ -58,6 +58,22 @@ constexpr uint64_t GdsBufferSize = 64 * 1024;
 
 } // namespace
 
+// Round 20 (gt7-sync3): KYTY_STORES_INLINE=0 copies every store through the staging buffer, as
+// before (WriteDataBuffer).
+constexpr uint64_t InlineStoreBytes = 65536;
+
+static bool StoresInline() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_STORES_INLINE");
+		const bool  on    = value == nullptr || value[0] != '0';
+		LOGF("Inline stores: %s (KYTY_STORES_INLINE=0: through the staging buffer, a copy each)\n",
+		     on ? "the guest's stores of up to 64 KB are written by the command buffer itself"
+		        : "off");
+		return on;
+	}();
+	return on;
+}
+
 void BufferCache::WriteDataBuffer(Buffer& buffer, uint64_t address, const void* source,
                                   uint64_t size, bool guest_store) {
 	// Round 167 (copies:lean): in the command buffer's batch of copies (copyBufferBatched). The
@@ -67,20 +83,30 @@ void BufferCache::WriteDataBuffer(Buffer& buffer, uint64_t address, const void* 
 	const bool wait_before = !guest_store || !GuestGpu::GuestPm4Barriers();
 	auto*      bytes       = static_cast<const uint8_t*>(source);
 	while (size != 0) {
-		const auto chunk  = std::min(size, m_staging_buffer.Size());
-		const auto offset = m_staging_buffer.Copy(bytes, chunk, 4);
+		// Round 20 (gt7-sync3): a store of at most 64 KB, in whole dwords, goes in the command
+		// buffer itself (CommandRecorder::updateBufferBatched), not through the staging buffer.
+		const auto destination = buffer.Offset(address);
+		const bool inline_store = batched && StoresInline() && (destination & 3u) == 0 &&
+		                          (size & 3u) == 0 && size <= InlineStoreBytes;
+		const auto chunk  = inline_store ? size : std::min(size, m_staging_buffer.Size());
 		if (batched) {
-			const auto destination = buffer.Offset(address);
 			if (destination > buffer.Size() || chunk > buffer.Size() - destination) {
 				EXIT("BufferCache: store 0x%016" PRIx64 "+0x%" PRIx64 " out of its buffer\n",
 				     address, chunk);
 			}
 			auto& command = m_scheduler.Current();
 			command.EndRendering();
-			const vk::BufferCopy copy {offset, destination, chunk};
-			command.Recorder().copyBufferBatched(m_staging_buffer.Handle(), buffer.Handle(), 1,
-			                                     &copy, wait_before);
+			if (inline_store) {
+				command.Recorder().updateBufferBatched(buffer.Handle(), destination, chunk, bytes,
+				                                       wait_before);
+			} else {
+				const auto           offset = m_staging_buffer.Copy(bytes, chunk, 4);
+				const vk::BufferCopy copy {offset, destination, chunk};
+				command.Recorder().copyBufferBatched(m_staging_buffer.Handle(), buffer.Handle(), 1,
+				                                     &copy, wait_before);
+			}
 		} else {
+			const auto offset = m_staging_buffer.Copy(bytes, chunk, 4);
 			buffer.CopyFrom(m_scheduler.Current(), m_staging_buffer, offset, buffer.Offset(address),
 			                chunk, vk::AccessFlagBits::eHostWrite);
 		}

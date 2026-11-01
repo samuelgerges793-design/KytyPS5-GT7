@@ -447,14 +447,46 @@ public:
 	                       const vk::BufferCopy* regions, bool wait_before,
 	    const std::source_location& site = std::source_location::current()) const {
 		RecordedCommands::NoteWork(RecordedCommands::WorkTransfer, site);
-		auto* batch = Batch();
-		EXIT_IF(batch == nullptr || count == 0);
+		EXIT_IF(count == 0);
 		uint64_t begin = UINT64_MAX;
 		uint64_t end   = 0;
 		for (uint32_t i = 0; i < count; i++) {
 			begin = std::min<uint64_t>(begin, regions[i].dstOffset);
 			end   = std::max<uint64_t>(end, regions[i].dstOffset + regions[i].size);
 		}
+		auto* batch = BeginBatchedWrite(destination, begin, end, wait_before);
+		RecordCopy(source, destination, count, regions);
+		EndBatchedWrite(*batch, destination, begin, end);
+	}
+	// Round 20 (gt7-sync3): bytes of the CPU's written by the command buffer itself
+	// (vkCmdUpdateBuffer: at most 65,536 bytes, offset and size multiples of 4), in the batch as
+	// copyBufferBatched. For the guest's stores (WRITE_DATA): a copy from the staging buffer runs
+	// on NVIDIA's copy subchannel, and one between two dispatches switched the GPU twice (about
+	// 240 of the ~800 switches a frame in a GT7 race, each a wait for idle).
+	void updateBufferBatched(vk::Buffer destination, vk::DeviceSize offset, vk::DeviceSize size,
+	                         const void* data, bool wait_before,
+	                         const std::source_location& site = std::source_location::current()) const {
+		RecordedCommands::NoteWork(RecordedCommands::WorkTransfer, site);
+		EXIT_IF(size == 0 || size > 65536 || (size & 3u) != 0 || (offset & 3u) != 0);
+		auto* batch = BeginBatchedWrite(destination, offset, offset + size, wait_before);
+		RecordedCommands::Add(RecordedCommands::BufferUpdates);
+		RecordedCommands::Add(RecordedCommands::BufferUpdateBytes, size);
+		RecordedCommands::Mark(RecordedCommands::GapCopy);
+		if (!Threaded()) {
+			m_direct.updateBuffer(destination, offset, size, data);
+		} else {
+			const auto* copy = m_scheduler->Stash(static_cast<const std::byte*>(data), size);
+			m_scheduler->Record([=](vk::CommandBuffer command) {
+				command.updateBuffer(destination, offset, size, copy);
+			});
+		}
+		EndBatchedWrite(*batch, destination, offset, offset + size);
+	}
+	// The barriers a batched write of [begin, end) of `destination` needs first (copyBufferBatched).
+	CopyBatchState* BeginBatchedWrite(vk::Buffer destination, uint64_t begin, uint64_t end,
+	                                  bool wait_before) const {
+		auto* batch = Batch();
+		EXIT_IF(batch == nullptr);
 		bool overlap = batch->written.size() >= MaxBatchWrites;
 		for (const auto& written: batch->written) {
 			if (overlap) {
@@ -485,9 +517,12 @@ public:
 			batch->written.clear();
 			RecordedCommands::Add(RecordedCommands::BatchBefores);
 		}
-		RecordCopy(source, destination, count, regions);
-		batch->written.push_back({destination, begin, end});
-		batch->after_pending = true;
+		return batch;
+	}
+	static void EndBatchedWrite(CopyBatchState& batch, vk::Buffer destination, uint64_t begin,
+	                            uint64_t end) {
+		batch.written.push_back({destination, begin, end});
+		batch.after_pending = true;
 		RecordedCommands::Add(RecordedCommands::BatchedCopies);
 	}
 	// Round 167: records the batch's "after" barrier if it is due (CommandBuffer::Handle, Submit).
