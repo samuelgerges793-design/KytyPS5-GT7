@@ -200,6 +200,10 @@ public:
 	[[nodiscard]] uint64_t GetSubmitId() const { return m_submit_id; }
 	void                   SetSubmitId(uint64_t submit_id) { m_submit_id = submit_id; }
 	[[nodiscard]] bool     IsAsyncComputeQueue() const { return m_interrupt_event_id >= 0x20; }
+	// Round 20 (gt7-sync3): 0 for the graphics queue, 1 and up for the compute queues.
+	[[nodiscard]] uint32_t QueueIndex() const {
+		return IsAsyncComputeQueue() ? static_cast<uint32_t>(m_interrupt_event_id) - 0x20u + 1u : 0u;
+	}
 
 private:
 	template <typename T>

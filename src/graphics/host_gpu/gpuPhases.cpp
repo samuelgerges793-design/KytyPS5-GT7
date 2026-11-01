@@ -645,7 +645,58 @@ void ReportIfDue(uint64_t frames) {
 			     seconds, n(RC::BatchedCopies), n(RC::BatchBefores), n(RC::BatchAfters),
 			     n(RC::BatchMerged), n(RC::BatchOverlaps), n(RC::ImageBarriersSkipped));
 		}
+		// Round 20 (gt7-sync3): draws and dispatches as recorded, and the switches between them
+		// (each drains the GPU on NVIDIA).
+		if (n(RC::Draws) + n(RC::Dispatches) > 0.0) {
+			LOGF("Recorded work (%.1f s), a frame: %.0f draws, %.0f dispatches, %.0f switches "
+			     "between graphics and compute\n",
+			     seconds, n(RC::Draws), n(RC::Dispatches), n(RC::WorkSwitches));
+		}
 		last = now_counts;
+		{
+			// Round 20: the dispatches by the line that recorded them, with the switches to compute
+			// (after a draw) they made, the most first.
+			static std::array<uint64_t, RC::g_dispatch_sites.size()> last_count {};
+			static std::array<uint64_t, RC::g_dispatch_sites.size()> last_switches {};
+			struct Site {
+				const char* file;
+				uint32_t    line;
+				uint64_t    count;
+				uint64_t    switches;
+			};
+			std::vector<Site> sites;
+			for (size_t i = 0; i < RC::g_dispatch_sites.size(); i++) {
+				const auto& site = RC::g_dispatch_sites[i];
+				const char* file = site.file.load(std::memory_order_acquire);
+				if (file == nullptr) {
+					continue;
+				}
+				const auto count    = site.count.load(std::memory_order_relaxed);
+				const auto switches = site.full.load(std::memory_order_relaxed);
+				if (count != last_count[i]) {
+					sites.push_back({file, site.line.load(std::memory_order_acquire),
+					                 count - last_count[i], switches - last_switches[i]});
+				}
+				last_count[i]    = count;
+				last_switches[i] = switches;
+			}
+			std::sort(sites.begin(), sites.end(),
+			          [](const Site& a, const Site& b) { return a.count > b.count; });
+			std::string by_site;
+			for (size_t k = 0; k < sites.size() && k < 14; k++) {
+				std::string_view file(sites[k].file);
+				if (const auto slash = file.find_last_of("/\\"); slash != std::string_view::npos) {
+					file.remove_prefix(slash + 1);
+				}
+				by_site += fmt::format("{}{}:{} {:.0f} ({:.0f} after a draw)",
+				                       by_site.empty() ? "" : ", ", file, sites[k].line,
+				                       static_cast<double>(sites[k].count) / frames_d,
+				                       static_cast<double>(sites[k].switches) / frames_d);
+			}
+			if (!by_site.empty()) {
+				LOGF("Recorded dispatches by place, a frame: %s\n", by_site.c_str());
+			}
+		}
 		// Round 166: the barriers by the line that made them, the most first.
 		static std::array<uint64_t, RC::g_barrier_sites.size()> last_site_count {};
 		static std::array<uint64_t, RC::g_barrier_sites.size()> last_site_full {};

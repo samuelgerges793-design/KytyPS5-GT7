@@ -44,7 +44,9 @@
 #include <memory>
 #include <mutex>
 #include <semaphore>
+#include <string>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -611,6 +613,99 @@ T CommandProcessor::ReadLabel(const volatile T* addr) const {
 template uint32_t CommandProcessor::ReadLabel<uint32_t>(const volatile uint32_t*) const;
 template uint64_t CommandProcessor::ReadLabel<uint64_t>(const volatile uint64_t*) const;
 
+// Round 20 (gt7-sync3), diagnostics: which queue last wrote the labels the queues wait on
+// (end-of-pipe writes and WRITE_DATA), so that the waits between the graphics queue and the compute
+// queues can be told apart. With the compute queues' work on a host queue of its own, each wait
+// across the two would become a semaphore between them. A "Queue waits" line every 10 s. The GPU
+// thread's alone (the draw-prep scanners run packets on command processors of their own).
+namespace QueueWaits {
+
+enum Relation : uint32_t {
+	Unseen,            // a label no queue wrote (the CPU's, or written before the table had it)
+	SameQueue,         // written by the waiting queue itself
+	GraphicsOnCompute, // the graphics queue waits for a compute queue
+	ComputeOnGraphics, // a compute queue waits for the graphics queue
+	ComputeOnCompute,  // a compute queue waits for another one
+	RelationCount
+};
+
+struct State {
+	std::unordered_map<uint64_t, uint32_t>              writers; // label -> writer queue + 1
+	std::array<std::array<uint64_t, 2>, RelationCount> waits {}; // passed, stopped
+	std::array<uint64_t, 2>                            writes {}; // graphics, compute
+	uint64_t                                           calls       = 0;
+	int                                                first_frame = -1;
+	std::chrono::steady_clock::time_point              last {};
+};
+
+State& Get() {
+	static State state;
+	return state;
+}
+
+void NoteWrite(uint64_t address, uint32_t queue) {
+	if (!t_guest_gpu_thread) {
+		return;
+	}
+	auto& state = Get();
+	if (state.writers.size() >= 65536) {
+		state.writers.clear();
+	}
+	state.writers[address] = queue + 1;
+	state.writes[queue == 0 ? 0 : 1]++;
+}
+
+void NoteWait(uint64_t address, uint32_t queue, bool passed, int frame) {
+	if (!t_guest_gpu_thread) {
+		return;
+	}
+	auto&    state    = Get();
+	Relation relation = Unseen;
+	if (const auto it = state.writers.find(address); it != state.writers.end()) {
+		const uint32_t writer = it->second - 1;
+		relation              = writer == queue ? SameQueue
+		                        : queue == 0    ? GraphicsOnCompute
+		                        : writer == 0   ? ComputeOnGraphics
+		                                        : ComputeOnCompute;
+	}
+	state.waits[relation][passed ? 0 : 1]++;
+	if ((++state.calls & 255u) != 0) {
+		return;
+	}
+	const auto now = std::chrono::steady_clock::now();
+	if (state.first_frame < 0) {
+		state.first_frame = frame;
+		state.last        = now;
+		state.waits       = {};
+		state.writes      = {};
+		return;
+	}
+	const double seconds = std::chrono::duration<double>(now - state.last).count();
+	if (seconds < 10.0) {
+		return;
+	}
+	const double frames = std::max(1.0, static_cast<double>(frame - state.first_frame));
+	const auto   part   = [&](Relation r) {
+		char text[64];
+		std::snprintf(text, sizeof(text), "%.1f (%.1f stopped)",
+		              static_cast<double>(state.waits[r][0]) / frames,
+		              static_cast<double>(state.waits[r][1]) / frames);
+		return std::string(text);
+	};
+	LOGF("Queue waits (%.1f s), a frame: graphics on compute %s, compute on graphics %s, compute "
+	     "on another compute %s, on its own queue %s, on labels no queue wrote %s; labels written "
+	     "by graphics %.1f, by compute %.1f\n",
+	     seconds, part(GraphicsOnCompute).c_str(), part(ComputeOnGraphics).c_str(),
+	     part(ComputeOnCompute).c_str(), part(SameQueue).c_str(), part(Unseen).c_str(),
+	     static_cast<double>(state.writes[0]) / frames, static_cast<double>(state.writes[1]) / frames);
+	state.first_frame = frame;
+	state.last        = now;
+	state.waits       = {};
+	state.writes      = {};
+}
+
+} // namespace QueueWaits
+
 template <typename T>
 void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, uint32_t poll,
                                   uint32_t wait_op) {
@@ -620,7 +715,10 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 	}
 
 	(void)poll;
-	if (!TestWaitRegMemValue(ReadLabel(addr), ref, mask, func)) {
+	const bool passed = TestWaitRegMemValue(ReadLabel(addr), ref, mask, func);
+	QueueWaits::NoteWait(reinterpret_cast<uint64_t>(addr), QueueIndex(), passed,
+	                     m_renderer.GetGpu().GetFrameNum());
+	if (!passed) {
 		SuspendPm4();
 		return;
 	}
@@ -650,6 +748,7 @@ template void CommandProcessor::WaitRegMem<uint64_t>(uint32_t, const uint64_t*, 
 
 void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw_num,
                                  uint32_t write_control) {
+	QueueWaits::NoteWrite(reinterpret_cast<uint64_t>(dst), QueueIndex());
 	const uint32_t dst_sel = ((write_control >> 30u) & 0x1u) | ((write_control >> 7u) & 0x1eu);
 	const bool     write_one_address = ((write_control >> 16u) & 0x1u) != 0;
 
@@ -1744,6 +1843,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 
 	EXIT_NOT_IMPLEMENTED(cache_policy != 0x00000000);
 	EXIT_NOT_IMPLEMENTED(event_write_dest != 0x00000000);
+	QueueWaits::NoteWrite(reinterpret_cast<uint64_t>(dst_gpu_addr), QueueIndex());
 
 	bool with_interrupt = false;
 	switch (interrupt_selector) {

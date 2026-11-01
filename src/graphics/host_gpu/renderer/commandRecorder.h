@@ -54,6 +54,11 @@ enum Kind : uint32_t {
 	StateLeftOut,      // calls of both kinds left out (state:filter)
 	// Round 19 (gt7-sync3): the guest's full barriers left out, nothing recorded since the last.
 	FullBarriersRepeated,
+	// Round 20 (gt7-sync3): draws and dispatches in the order they were recorded, and the switches
+	// between them (a dispatch after a draw, or a draw after a dispatch).
+	Draws,
+	Dispatches,
+	WorkSwitches,
 	Count
 };
 
@@ -89,12 +94,13 @@ struct BarrierSite {
 };
 inline std::array<BarrierSite, 256> g_barrier_sites {};
 
-inline void NoteSite(const std::source_location& site, bool full) noexcept {
+inline void NoteSiteIn(std::array<BarrierSite, 256>& table, const std::source_location& site,
+                       bool full) noexcept {
 	const char* file = site.file_name();
 	const auto  line = site.line();
 	const auto  hash = (reinterpret_cast<uintptr_t>(file) >> 3u) ^ (uintptr_t {line} * 2654435761u);
 	for (size_t probe = 0; probe < 16; probe++) {
-		auto&       slot    = g_barrier_sites[(hash + probe) % g_barrier_sites.size()];
+		auto&       slot    = table[(hash + probe) % table.size()];
 		const char* claimed = slot.file.load(std::memory_order_acquire);
 		if (claimed == nullptr) {
 			const char* expected = nullptr;
@@ -112,6 +118,30 @@ inline void NoteSite(const std::source_location& site, bool full) noexcept {
 			}
 			return;
 		}
+	}
+}
+
+inline void NoteSite(const std::source_location& site, bool full) noexcept {
+	NoteSiteIn(g_barrier_sites, site, full);
+}
+
+// Round 20 (gt7-sync3): on NVIDIA every switch between graphics and compute work on a queue
+// drains the GPU (Nsight: about half of its go-idles in a GT7 race were such subchannel
+// switches). Dispatches by the place that recorded them ("full": the ones that switched to
+// compute after a draw), for the "Recorded work" lines.
+inline std::array<BarrierSite, 256> g_dispatch_sites {};
+inline std::atomic<uint32_t>        g_last_work {0}; // 0: none yet, 1: a draw, 2: a dispatch
+
+inline void NoteWork(bool dispatch, const std::source_location& site) noexcept {
+	const uint32_t kind     = dispatch ? 2u : 1u;
+	const uint32_t last     = g_last_work.exchange(kind, std::memory_order_relaxed);
+	const bool     switched = last != 0 && last != kind;
+	Add(dispatch ? Dispatches : Draws);
+	if (switched) {
+		Add(WorkSwitches);
+	}
+	if (dispatch) {
+		NoteSiteIn(g_dispatch_sites, site, switched);
 	}
 }
 
@@ -192,6 +222,7 @@ public:
 	void draw(uint32_t vertices, uint32_t instances, uint32_t first_vertex,
 	          uint32_t first_instance) const {
 		Touch();
+		RecordedCommands::NoteWork(false, std::source_location::current());
 		Run([=](vk::CommandBuffer command) {
 			command.draw(vertices, instances, first_vertex, first_instance);
 		});
@@ -199,6 +230,7 @@ public:
 	void drawIndexed(uint32_t indices, uint32_t instances, uint32_t first_index, int32_t offset,
 	                 uint32_t first_instance) const {
 		Touch();
+		RecordedCommands::NoteWork(false, std::source_location::current());
 		Run([=](vk::CommandBuffer command) {
 			command.drawIndexed(indices, instances, first_index, offset, first_instance);
 		});
@@ -206,6 +238,7 @@ public:
 	void drawIndirect(vk::Buffer buffer, vk::DeviceSize offset, uint32_t count,
 	                  uint32_t stride) const {
 		Touch();
+		RecordedCommands::NoteWork(false, std::source_location::current());
 		Run([=](vk::CommandBuffer command) {
 			command.drawIndirect(buffer, offset, count, stride);
 		});
@@ -213,27 +246,34 @@ public:
 	void drawIndexedIndirect(vk::Buffer buffer, vk::DeviceSize offset, uint32_t count,
 	                         uint32_t stride) const {
 		Touch();
+		RecordedCommands::NoteWork(false, std::source_location::current());
 		Run([=](vk::CommandBuffer command) {
 			command.drawIndexedIndirect(buffer, offset, count, stride);
 		});
 	}
 	void drawMeshTasksEXT(uint32_t x, uint32_t y, uint32_t z) const {
 		Touch();
+		RecordedCommands::NoteWork(false, std::source_location::current());
 		Run([=](vk::CommandBuffer command) { command.drawMeshTasksEXT(x, y, z); });
 	}
 	void drawMeshTasksIndirectEXT(vk::Buffer buffer, vk::DeviceSize offset, uint32_t count,
 	                              uint32_t stride) const {
 		Touch();
+		RecordedCommands::NoteWork(false, std::source_location::current());
 		Run([=](vk::CommandBuffer command) {
 			command.drawMeshTasksIndirectEXT(buffer, offset, count, stride);
 		});
 	}
-	void dispatch(uint32_t x, uint32_t y, uint32_t z) const {
+	void dispatch(uint32_t x, uint32_t y, uint32_t z,
+	              const std::source_location& site = std::source_location::current()) const {
 		Touch();
+		RecordedCommands::NoteWork(true, site);
 		Run([=](vk::CommandBuffer command) { command.dispatch(x, y, z); });
 	}
-	void dispatchIndirect(vk::Buffer buffer, vk::DeviceSize offset) const {
+	void dispatchIndirect(vk::Buffer buffer, vk::DeviceSize offset,
+	                      const std::source_location& site = std::source_location::current()) const {
 		Touch();
+		RecordedCommands::NoteWork(true, site);
 		Run([=](vk::CommandBuffer command) { command.dispatchIndirect(buffer, offset); });
 	}
 	void bindIndexBuffer(vk::Buffer buffer, vk::DeviceSize offset, vk::IndexType type) const {
