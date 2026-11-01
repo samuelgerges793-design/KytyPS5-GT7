@@ -59,6 +59,11 @@ enum Kind : uint32_t {
 	Draws,
 	Dispatches,
 	WorkSwitches,
+	// Round 20b: transfers (buffer and image copies, updates, fills, clears) between them, and the
+	// switches between transfers and graphics or compute work.
+	Transfers,
+	TransferSwitchesGraphics,
+	TransferSwitchesCompute,
 	Count
 };
 
@@ -130,18 +135,26 @@ inline void NoteSite(const std::source_location& site, bool full) noexcept {
 // switches). Dispatches by the place that recorded them ("full": the ones that switched to
 // compute after a draw), for the "Recorded work" lines.
 inline std::array<BarrierSite, 256> g_dispatch_sites {};
-inline std::atomic<uint32_t>        g_last_work {0}; // 0: none yet, 1: a draw, 2: a dispatch
+// Round 20b: the transfers by place ("full": the ones right after a draw or a dispatch).
+inline std::array<BarrierSite, 256> g_transfer_sites {};
+inline std::atomic<uint32_t>        g_last_work {0}; // 0: none yet, else a WorkKind
 
-inline void NoteWork(bool dispatch, const std::source_location& site) noexcept {
-	const uint32_t kind     = dispatch ? 2u : 1u;
+enum WorkKind : uint32_t { WorkDraw = 1, WorkDispatch = 2, WorkTransfer = 3 };
+
+inline void NoteWork(WorkKind kind, const std::source_location& site) noexcept {
 	const uint32_t last     = g_last_work.exchange(kind, std::memory_order_relaxed);
 	const bool     switched = last != 0 && last != kind;
-	Add(dispatch ? Dispatches : Draws);
+	Add(kind == WorkDraw ? Draws : kind == WorkDispatch ? Dispatches : Transfers);
 	if (switched) {
-		Add(WorkSwitches);
+		const uint32_t other = kind == WorkTransfer ? last : last == WorkTransfer ? kind : 0u;
+		Add(other == 0u           ? WorkSwitches
+		    : other == WorkDraw   ? TransferSwitchesGraphics
+		                          : TransferSwitchesCompute);
 	}
-	if (dispatch) {
+	if (kind == WorkDispatch) {
 		NoteSiteIn(g_dispatch_sites, site, switched);
+	} else if (kind == WorkTransfer) {
+		NoteSiteIn(g_transfer_sites, site, switched);
 	}
 }
 
@@ -222,7 +235,7 @@ public:
 	void draw(uint32_t vertices, uint32_t instances, uint32_t first_vertex,
 	          uint32_t first_instance) const {
 		Touch();
-		RecordedCommands::NoteWork(false, std::source_location::current());
+		RecordedCommands::NoteWork(RecordedCommands::WorkDraw, std::source_location::current());
 		Run([=](vk::CommandBuffer command) {
 			command.draw(vertices, instances, first_vertex, first_instance);
 		});
@@ -230,7 +243,7 @@ public:
 	void drawIndexed(uint32_t indices, uint32_t instances, uint32_t first_index, int32_t offset,
 	                 uint32_t first_instance) const {
 		Touch();
-		RecordedCommands::NoteWork(false, std::source_location::current());
+		RecordedCommands::NoteWork(RecordedCommands::WorkDraw, std::source_location::current());
 		Run([=](vk::CommandBuffer command) {
 			command.drawIndexed(indices, instances, first_index, offset, first_instance);
 		});
@@ -238,7 +251,7 @@ public:
 	void drawIndirect(vk::Buffer buffer, vk::DeviceSize offset, uint32_t count,
 	                  uint32_t stride) const {
 		Touch();
-		RecordedCommands::NoteWork(false, std::source_location::current());
+		RecordedCommands::NoteWork(RecordedCommands::WorkDraw, std::source_location::current());
 		Run([=](vk::CommandBuffer command) {
 			command.drawIndirect(buffer, offset, count, stride);
 		});
@@ -246,20 +259,20 @@ public:
 	void drawIndexedIndirect(vk::Buffer buffer, vk::DeviceSize offset, uint32_t count,
 	                         uint32_t stride) const {
 		Touch();
-		RecordedCommands::NoteWork(false, std::source_location::current());
+		RecordedCommands::NoteWork(RecordedCommands::WorkDraw, std::source_location::current());
 		Run([=](vk::CommandBuffer command) {
 			command.drawIndexedIndirect(buffer, offset, count, stride);
 		});
 	}
 	void drawMeshTasksEXT(uint32_t x, uint32_t y, uint32_t z) const {
 		Touch();
-		RecordedCommands::NoteWork(false, std::source_location::current());
+		RecordedCommands::NoteWork(RecordedCommands::WorkDraw, std::source_location::current());
 		Run([=](vk::CommandBuffer command) { command.drawMeshTasksEXT(x, y, z); });
 	}
 	void drawMeshTasksIndirectEXT(vk::Buffer buffer, vk::DeviceSize offset, uint32_t count,
 	                              uint32_t stride) const {
 		Touch();
-		RecordedCommands::NoteWork(false, std::source_location::current());
+		RecordedCommands::NoteWork(RecordedCommands::WorkDraw, std::source_location::current());
 		Run([=](vk::CommandBuffer command) {
 			command.drawMeshTasksIndirectEXT(buffer, offset, count, stride);
 		});
@@ -267,13 +280,13 @@ public:
 	void dispatch(uint32_t x, uint32_t y, uint32_t z,
 	              const std::source_location& site = std::source_location::current()) const {
 		Touch();
-		RecordedCommands::NoteWork(true, site);
+		RecordedCommands::NoteWork(RecordedCommands::WorkDispatch, site);
 		Run([=](vk::CommandBuffer command) { command.dispatch(x, y, z); });
 	}
 	void dispatchIndirect(vk::Buffer buffer, vk::DeviceSize offset,
 	                      const std::source_location& site = std::source_location::current()) const {
 		Touch();
-		RecordedCommands::NoteWork(true, site);
+		RecordedCommands::NoteWork(RecordedCommands::WorkDispatch, site);
 		Run([=](vk::CommandBuffer command) { command.dispatchIndirect(buffer, offset); });
 	}
 	void bindIndexBuffer(vk::Buffer buffer, vk::DeviceSize offset, vk::IndexType type) const {
@@ -416,7 +429,9 @@ public:
 		}
 	}
 	void copyBuffer(vk::Buffer source, vk::Buffer destination, uint32_t count,
-	                const vk::BufferCopy* regions) const {
+	                const vk::BufferCopy* regions,
+	    const std::source_location& site = std::source_location::current()) const {
+		RecordedCommands::NoteWork(RecordedCommands::WorkTransfer, site);
 		Touch();
 		RecordCopy(source, destination, count, regions);
 	}
@@ -429,7 +444,9 @@ public:
 	// just before serves as the first. Copies of bytes an earlier one of the batch wrote wait for
 	// it. The caller has ended the rendering.
 	void copyBufferBatched(vk::Buffer source, vk::Buffer destination, uint32_t count,
-	                       const vk::BufferCopy* regions, bool wait_before) const {
+	                       const vk::BufferCopy* regions, bool wait_before,
+	    const std::source_location& site = std::source_location::current()) const {
+		RecordedCommands::NoteWork(RecordedCommands::WorkTransfer, site);
 		auto* batch = Batch();
 		EXIT_IF(batch == nullptr || count == 0);
 		uint64_t begin = UINT64_MAX;
@@ -479,7 +496,9 @@ public:
 		copyBuffer(source, destination, 1, &region);
 	}
 	void updateBuffer(vk::Buffer buffer, vk::DeviceSize offset, vk::DeviceSize size,
-	                  const void* data) const {
+	                  const void* data,
+	    const std::source_location& site = std::source_location::current()) const {
+		RecordedCommands::NoteWork(RecordedCommands::WorkTransfer, site);
 		Touch();
 		RecordedCommands::Add(RecordedCommands::BufferUpdates);
 		RecordedCommands::Add(RecordedCommands::BufferUpdateBytes, size);
@@ -509,7 +528,9 @@ public:
 		Run([=](vk::CommandBuffer command) { command.endQuery(pool, query); });
 	}
 	void fillBuffer(vk::Buffer buffer, vk::DeviceSize offset, vk::DeviceSize size,
-	                uint32_t value) const {
+	                uint32_t value,
+	    const std::source_location& site = std::source_location::current()) const {
+		RecordedCommands::NoteWork(RecordedCommands::WorkTransfer, site);
 		Touch();
 		RecordedCommands::Add(RecordedCommands::BufferFills);
 		RecordedCommands::Add(RecordedCommands::BufferFillBytes, size);
@@ -517,7 +538,9 @@ public:
 		Run([=](vk::CommandBuffer command) { command.fillBuffer(buffer, offset, size, value); });
 	}
 	void copyBufferToImage(vk::Buffer source, vk::Image destination, vk::ImageLayout layout,
-	                       uint32_t count, const vk::BufferImageCopy* regions) const {
+	                       uint32_t count, const vk::BufferImageCopy* regions,
+	    const std::source_location& site = std::source_location::current()) const {
+		RecordedCommands::NoteWork(RecordedCommands::WorkTransfer, site);
 		Touch();
 		RecordedCommands::Add(RecordedCommands::ImageUploads);
 		RecordedCommands::Mark(RecordedCommands::GapImageCopy);
@@ -535,7 +558,9 @@ public:
 		copyBufferToImage(source, destination, layout, 1, &region);
 	}
 	void copyImageToBuffer(vk::Image source, vk::ImageLayout layout, vk::Buffer destination,
-	                       uint32_t count, const vk::BufferImageCopy* regions) const {
+	                       uint32_t count, const vk::BufferImageCopy* regions,
+	    const std::source_location& site = std::source_location::current()) const {
+		RecordedCommands::NoteWork(RecordedCommands::WorkTransfer, site);
 		Touch();
 		RecordedCommands::Add(RecordedCommands::ImageDownloads);
 		RecordedCommands::Mark(RecordedCommands::GapImageCopy);
@@ -554,7 +579,9 @@ public:
 	}
 	void copyImage(vk::Image source, vk::ImageLayout source_layout, vk::Image destination,
 	               vk::ImageLayout destination_layout, uint32_t count,
-	               const vk::ImageCopy* regions) const {
+	               const vk::ImageCopy* regions,
+	    const std::source_location& site = std::source_location::current()) const {
+		RecordedCommands::NoteWork(RecordedCommands::WorkTransfer, site);
 		Touch();
 		RecordedCommands::Add(RecordedCommands::ImageCopies);
 		RecordedCommands::Mark(RecordedCommands::GapImageCopy);
@@ -573,7 +600,9 @@ public:
 		copyImage(source, source_layout, destination, destination_layout, 1, &region);
 	}
 	void resolveImage(vk::Image source, vk::ImageLayout source_layout, vk::Image destination,
-	                  vk::ImageLayout destination_layout, const vk::ImageResolve& region) const {
+	                  vk::ImageLayout destination_layout, const vk::ImageResolve& region,
+	    const std::source_location& site = std::source_location::current()) const {
+		RecordedCommands::NoteWork(RecordedCommands::WorkTransfer, site);
 		Touch();
 		RecordedCommands::Add(RecordedCommands::ImageCopies);
 		RecordedCommands::Mark(RecordedCommands::GapImageCopy);
@@ -583,7 +612,9 @@ public:
 		});
 	}
 	void clearColorImage(vk::Image image, vk::ImageLayout layout, const vk::ClearColorValue* color,
-	                     uint32_t count, const vk::ImageSubresourceRange* ranges) const {
+	                     uint32_t count, const vk::ImageSubresourceRange* ranges,
+	    const std::source_location& site = std::source_location::current()) const {
+		RecordedCommands::NoteWork(RecordedCommands::WorkTransfer, site);
 		Touch();
 		RecordedCommands::Add(RecordedCommands::Clears);
 		RecordedCommands::Mark(RecordedCommands::GapClear);
@@ -599,7 +630,9 @@ public:
 	}
 	void clearDepthStencilImage(vk::Image image, vk::ImageLayout layout,
 	                            const vk::ClearDepthStencilValue* value, uint32_t count,
-	                            const vk::ImageSubresourceRange* ranges) const {
+	                            const vk::ImageSubresourceRange* ranges,
+	    const std::source_location& site = std::source_location::current()) const {
+		RecordedCommands::NoteWork(RecordedCommands::WorkTransfer, site);
 		Touch();
 		RecordedCommands::Add(RecordedCommands::Clears);
 		RecordedCommands::Mark(RecordedCommands::GapClear);

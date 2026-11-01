@@ -648,16 +648,19 @@ void ReportIfDue(uint64_t frames) {
 		// Round 20 (gt7-sync3): draws and dispatches as recorded, and the switches between them
 		// (each drains the GPU on NVIDIA).
 		if (n(RC::Draws) + n(RC::Dispatches) > 0.0) {
-			LOGF("Recorded work (%.1f s), a frame: %.0f draws, %.0f dispatches, %.0f switches "
-			     "between graphics and compute\n",
-			     seconds, n(RC::Draws), n(RC::Dispatches), n(RC::WorkSwitches));
+			LOGF("Recorded work (%.1f s), a frame: %.0f draws, %.0f dispatches, %.0f transfers; "
+			     "switches: %.0f between graphics and compute, %.0f between graphics and transfers, "
+			     "%.0f between compute and transfers\n",
+			     seconds, n(RC::Draws), n(RC::Dispatches), n(RC::Transfers), n(RC::WorkSwitches),
+			     n(RC::TransferSwitchesGraphics), n(RC::TransferSwitchesCompute));
 		}
 		last = now_counts;
-		{
-			// Round 20: the dispatches by the line that recorded them, with the switches to compute
-			// (after a draw) they made, the most first.
-			static std::array<uint64_t, RC::g_dispatch_sites.size()> last_count {};
-			static std::array<uint64_t, RC::g_dispatch_sites.size()> last_switches {};
+		// Round 20: the dispatches (and 20b: the transfers) by the line that recorded them, with
+		// the switches they made (after other work), the most first.
+		const auto report_sites = [&](std::array<RC::BarrierSite, 256>& table,
+		                              std::array<uint64_t, 256>&       last_count,
+		                              std::array<uint64_t, 256>&       last_switches,
+		                              const char* what, const char* after) {
 			struct Site {
 				const char* file;
 				uint32_t    line;
@@ -665,8 +668,8 @@ void ReportIfDue(uint64_t frames) {
 				uint64_t    switches;
 			};
 			std::vector<Site> sites;
-			for (size_t i = 0; i < RC::g_dispatch_sites.size(); i++) {
-				const auto& site = RC::g_dispatch_sites[i];
+			for (size_t i = 0; i < table.size(); i++) {
+				const auto& site = table[i];
 				const char* file = site.file.load(std::memory_order_acquire);
 				if (file == nullptr) {
 					continue;
@@ -688,15 +691,23 @@ void ReportIfDue(uint64_t frames) {
 				if (const auto slash = file.find_last_of("/\\"); slash != std::string_view::npos) {
 					file.remove_prefix(slash + 1);
 				}
-				by_site += fmt::format("{}{}:{} {:.0f} ({:.0f} after a draw)",
-				                       by_site.empty() ? "" : ", ", file, sites[k].line,
+				by_site += fmt::format("{}{}:{} {:.0f} ({:.0f} {})", by_site.empty() ? "" : ", ",
+				                       file, sites[k].line,
 				                       static_cast<double>(sites[k].count) / frames_d,
-				                       static_cast<double>(sites[k].switches) / frames_d);
+				                       static_cast<double>(sites[k].switches) / frames_d, after);
 			}
 			if (!by_site.empty()) {
-				LOGF("Recorded dispatches by place, a frame: %s\n", by_site.c_str());
+				LOGF("Recorded %s by place, a frame: %s\n", what, by_site.c_str());
 			}
-		}
+		};
+		static std::array<uint64_t, 256> dispatch_count {};
+		static std::array<uint64_t, 256> dispatch_switches {};
+		static std::array<uint64_t, 256> transfer_count {};
+		static std::array<uint64_t, 256> transfer_switches {};
+		report_sites(RC::g_dispatch_sites, dispatch_count, dispatch_switches, "dispatches",
+		             "after a draw or transfer");
+		report_sites(RC::g_transfer_sites, transfer_count, transfer_switches, "transfers",
+		             "after a draw or dispatch");
 		// Round 166: the barriers by the line that made them, the most first.
 		static std::array<uint64_t, RC::g_barrier_sites.size()> last_site_count {};
 		static std::array<uint64_t, RC::g_barrier_sites.size()> last_site_full {};
