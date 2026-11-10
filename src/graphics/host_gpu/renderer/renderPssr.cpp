@@ -1,12 +1,15 @@
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "common/threads.h"
 #include "gpu_blit_shaders/gpu_pssr_linear_spv.h"
 #include "graphics/guest_gpu/pssr.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/rendererLock.h"
 #include "graphics/shader/shaderBindings.h"
 
 #include <algorithm>
@@ -33,9 +36,27 @@ void MemoryBarrier(vk::CommandBuffer command) {
 	    vk::DependencyInfo {.memoryBarrierCount = 1, .pMemoryBarriers = &barrier});
 }
 
+// Round 21: one line whenever what the game asks of its upscaler changes (the render size, the
+// output size, its flags, or whether DLSS took it), at most 64 lines a run.
+void NotePssr(const Pssr::Request& request, uint32_t output_width, uint32_t output_height,
+              bool dlss) {
+	static uint32_t last[6] {};
+	static uint32_t lines = 0;
+	const uint32_t  now[6] {request.width, request.height, output_width, output_height,
+	                       request.flags, dlss ? 1u : 0u};
+	if (std::equal(std::begin(now), std::end(now), std::begin(last)) || lines >= 64) {
+		return;
+	}
+	std::copy(std::begin(now), std::end(now), std::begin(last));
+	lines++;
+	LOGF("PSSR: the game renders %ux%u, upscaled to %ux%u by %s (flags 0x%x)\n", request.width,
+	     request.height, output_width, output_height, dlss ? "DLSS" : "linear scaling",
+	     request.flags);
+}
+
 } // namespace
 
-RenderExecutor::~RenderExecutor() {
+void RenderExecutor::DestroyPssr() {
 	for (const auto& context: m_dlss_contexts) {
 		if (context.feature != nullptr) {
 			Dlss::ReleaseFeature(context.feature);
@@ -92,8 +113,8 @@ bool RenderExecutor::Upscale(vk::CommandBuffer command, const Pssr::Request& req
 
 void RenderExecutor::ProcessPssr(CommandBuffer& buffer, const Pssr::Request& request) {
 	EXIT_IF(buffer.IsInvalid());
-	m_context.GetCommandScheduler().PopPendingOperations();
-	Common::LockGuard lock(m_context.GetMutex());
+	m_context.GetCommandScheduler().PopPendingOperations(false);
+	const RendererLock lock(m_context.GetMutex());
 	ShaderTextureResource input_descriptor {}, output_descriptor {};
 	std::copy_n(request.input, 8, input_descriptor.fields);
 	std::copy_n(request.output, 8, output_descriptor.fields);
@@ -204,7 +225,9 @@ void RenderExecutor::ProcessPssr(CommandBuffer& buffer, const Pssr::Request& req
 		const auto resource = [&](const TextureBinding& binding, bool write) {
 			const auto& image  = cache.GetImage(binding.image_id);
 			const auto& view   = binding.desc.view_info;
-			const auto  extent = binding.desc.info.MipExtent(view.base_level);
+			const auto& full   = binding.desc.info.extent;
+			const vk::Extent2D extent {(std::max)(1u, full.width >> view.base_level),
+			                          (std::max)(1u, full.height >> view.base_level)};
 			// DLSS takes a depth image in its backing format and depth aspect.
 			const bool depth  = image.info.IsDepth();
 			const auto aspect = depth ? vk::ImageAspectFlagBits::eDepth : view.aspect;
@@ -229,10 +252,15 @@ void RenderExecutor::ProcessPssr(CommandBuffer& buffer, const Pssr::Request& req
 		Dlss::Inputs inputs {resource(input, false), resource(*dlss_bindings[0], false),
 		                     resource(*dlss_bindings[1], false),
 		                     dlss_bindings[2] ? &exposure : nullptr, resource(output, true)};
-		if (Upscale(command, request, inputs)) {
+		const bool upscaled = Upscale(command, request, inputs);
+		NotePssr(request, parameters.output_size[0], parameters.output_size[1], upscaled);
+		if (upscaled) {
 			ResetBindings();
 			return;
 		}
+	}
+	if (!dlss_bindings[0]) {
+		NotePssr(request, parameters.output_size[0], parameters.output_size[1], false);
 	}
 	auto& graphics = m_context.GetGraphics();
 	if (m_pssr_pipeline == nullptr) {

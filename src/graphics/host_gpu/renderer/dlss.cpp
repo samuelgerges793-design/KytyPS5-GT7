@@ -168,7 +168,7 @@ std::optional<Creation> Choose(Parameter& capabilities, const Pssr::Request& req
 			read("DLSS.Get.Dynamic.Max.Render.Height", creation.max_height);
 		}
 		const auto distance =
-		    std::max(optimal_width, request.width) - std::min(optimal_width, request.width);
+		    (std::max)(optimal_width, request.width) - (std::min)(optimal_width, request.width);
 		if (Takes(creation, request, inputs) && (!best || distance < best_distance)) {
 			best          = creation;
 			best_distance = distance;

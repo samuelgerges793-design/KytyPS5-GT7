@@ -818,7 +818,9 @@ static vk::ResolveModeFlagBits ColorResolveMode(Prospero::BufferFormat format) {
 	}
 }
 
-RenderExecutor::~RenderExecutor() = default;
+RenderExecutor::~RenderExecutor() {
+	DestroyPssr();
+}
 
 RenderExecutor::MsColorTarget&
 RenderExecutor::GetMsColorTarget(CommandBuffer& buffer, ImageId image_id, const Image& source,

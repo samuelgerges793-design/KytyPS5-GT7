@@ -1,4 +1,5 @@
 #include "kernel/memory.h"
+#include "loader/systemContent.h"
 
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -1061,7 +1062,12 @@ public:
 
 	KYTY_CLASS_NO_COPY(PhysicalMemory);
 
-	static constexpr uint64_t TotalSize() { return static_cast<uint64_t>(13824) * 1024 * 1024; }
+	// Round 21: a PS5 Pro (Trinity mode) gives a title 1216 MiB more (KytyPS5 651ef73a).
+	static uint64_t TotalSize() {
+		return (static_cast<uint64_t>(13824) +
+		        (Loader::SystemContentIsTrinityMode() ? static_cast<uint64_t>(1216) : 0)) *
+		       1024 * 1024;
+	}
 	static uint64_t           Size() {
 		EXIT_IF(g_flexible_memory_size >= TotalSize());
 		return TotalSize() - g_flexible_memory_size;

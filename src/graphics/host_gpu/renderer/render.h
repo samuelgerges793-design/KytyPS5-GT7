@@ -258,6 +258,7 @@ public:
 	void DispatchIndirectPart(uint64_t submit_id, CommandBuffer& buffer, uint64_t args_addr,
 	                          uint32_t mode, PipelineCache::ComputePartition* partition);
 	void ProcessPssr(CommandBuffer& buffer, const Pssr::Request& request);
+	void DestroyPssr();
 
 	void PrepareBindings(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
 	// Bindless heaps: register the draw's heaps, patch their regions, and once per frame resolve
