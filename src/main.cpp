@@ -4,6 +4,7 @@
 #include "common/debug.h"
 #include "common/file.h"
 #include "common/lastWords.h"
+#include "common/proConfig.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/virtualMemory.h"
@@ -132,6 +133,9 @@ static void PrintUsage() {
 	         "                                       devices (see --wheel-config).\n");
 	::printf("  --wheel-config <json>                Wheel mapping file. Default: wheel.json in\n"
 	         "                                       the working directory.\n");
+	::printf("  --dlss <folder>                      With --trinity, upscale PSSR with the DLSS\n"
+	         "                                       model in <folder> instead of linearly.\n");
+	::printf("  --dlss-preset <A-O>                  DLSS preset. Default: the model's own.\n");
 	::printf("  --amd-cpu                            Apply AMD CPU instruction patches.\n");
 	::printf("  --vblank-frequency <num>             Virtual vblank frequency. Default: 60.\n");
 	::printf("  --console-language <0-29>            Console language. Default: 1 (English US).\n");
@@ -304,7 +308,7 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 		}
 
 		if (arg == "--trinity") {
-			options.config.pro_enabled = true;
+			Config::g_pro_options.enabled = true;
 			continue;
 		}
 
@@ -453,6 +457,14 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("invalid present mode: %s\n", value.c_str());
 				return false;
 			}
+		} else if (arg == "--dlss") {
+			Config::g_pro_options.dlss_folder = Common::PathFromUtf8(value);
+		} else if (arg == "--dlss-preset") {
+			if (value.size() != 1 || value[0] < 'A' || value[0] > 'O') {
+				::printf("invalid DLSS preset: %s\n", value.c_str());
+				return false;
+			}
+			Config::g_pro_options.dlss_preset = static_cast<uint32_t>(value[0] - 'A' + 1);
 		} else if (arg == "--gpu") {
 			if (!ParseInt32(value, options.config.gpu_index)) {
 				::printf("invalid gpu index: %s\n", value.c_str());

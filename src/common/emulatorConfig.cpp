@@ -80,10 +80,6 @@ bool VrEnabled() {
 	return g_config->vr_enabled;
 }
 
-bool Ps5ProEnabled() {
-	return g_config->pro_enabled;
-}
-
 bool AmdCpuEnabled() {
 	return g_config->amd_cpu_enabled;
 }
