@@ -1751,6 +1751,11 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 	CompleteDispatch();
 }
 
+void CommandProcessor::ProcessPssr(const Pssr::Request& request) {
+	EXIT_NOT_IMPLEMENTED(IsAsyncComputeQueue());
+	m_renderer.GetRenderExecutor().ProcessPssr(CurrentBuffer(), request);
+}
+
 void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 	EXIT_NOT_IMPLEMENTED(args_addr == 0 || (args_addr & 3u) != 0);
 	// Thread counts are converted on the GPU. Reading them here drained the GPU for every

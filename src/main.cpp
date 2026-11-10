@@ -126,6 +126,8 @@ static void PrintUsage() {
 	::printf(
 	    "  --hide-cursor                        Hide the cursor after 2 s idle. Default: off.\n");
 	::printf("  --vr                                 Enable the virtual VR headset.\n");
+	::printf("  --trinity                            Enable experimental PS5 Pro mode for\n"
+	         "                                       supported titles. Default: off.\n");
 	::printf("  --wheel <true|false>                 Show the game a racing wheel fed by host\n"
 	         "                                       devices (see --wheel-config).\n");
 	::printf("  --wheel-config <json>                Wheel mapping file. Default: wheel.json in\n"
@@ -298,6 +300,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 
 		if (arg == "--vr") {
 			options.config.vr_enabled = true;
+			continue;
+		}
+
+		if (arg == "--trinity") {
+			options.config.pro_enabled = true;
 			continue;
 		}
 

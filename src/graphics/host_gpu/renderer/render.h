@@ -234,6 +234,10 @@ private:
 	friend class CommandScheduler;
 };
 
+namespace Pssr {
+struct Request;
+}
+
 class RenderExecutor {
 public:
 	explicit RenderExecutor(RenderContext& context): m_context(context) {}
@@ -252,6 +256,7 @@ public:
 	                        PipelineCache::ComputePartition* partition);
 	void DispatchIndirectPart(uint64_t submit_id, CommandBuffer& buffer, uint64_t args_addr,
 	                          uint32_t mode, PipelineCache::ComputePartition* partition);
+	void ProcessPssr(CommandBuffer& buffer, const Pssr::Request& request);
 
 	void PrepareBindings(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
 	// Bindless heaps: register the draw's heaps, patch their regions, and once per frame resolve
@@ -413,6 +418,9 @@ private:
 	// entry); an entry is rewritten only after the ring has gone round, behind its last read.
 	std::unique_ptr<Buffer>                 m_mesh_indirect;
 	uint32_t                                m_mesh_indirect_next = 0;
+	vk::DescriptorSetLayout               m_pssr_descriptor_layout = nullptr;
+	vk::PipelineLayout                    m_pssr_pipeline_layout   = nullptr;
+	vk::Pipeline                          m_pssr_pipeline          = nullptr;
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;
