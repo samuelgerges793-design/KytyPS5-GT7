@@ -9,6 +9,7 @@
 
 #include <SDL3/SDL_loadso.h>
 #include <algorithm>
+#include <cstdlib>
 #include <array>
 #include <span>
 #include <string>
@@ -262,6 +263,18 @@ void AppendExtensions(std::vector<const char*>&                   out,
 			                        return std::string_view(properties.extensionName.data());
 		                        }) &&
 		    std::ranges::none_of(out, same)) {
+			// Round 21: the device is made with Vulkan 1.2's own bufferDeviceAddress feature, and
+			// the EXT extension may not be enabled beside it (vkCreateDevice fails).
+			// KYTY_DLSS_SKIP_EXT: names (any separator) of extensions to leave out, for diagnosis.
+			const char* skip = std::getenv("KYTY_DLSS_SKIP_EXT");
+			if (skip != nullptr && std::string_view(skip).find(name) != std::string_view::npos) {
+				continue;
+			}
+			if (device && std::string_view(name) == "VK_EXT_buffer_device_address") {
+				LOGF("DLSS: device extension %s left out (the core feature is on)\n", name);
+				continue;
+			}
+			LOGF("DLSS: %s extension %s\n", device ? "device" : "instance", name);
 			out.push_back(name);
 		}
 	}

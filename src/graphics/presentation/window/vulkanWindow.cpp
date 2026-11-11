@@ -14,6 +14,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/pipeline/spirvMeshTest.h"
 #include "graphics/host_gpu/renderer/dlss.h"
+#include "graphics/host_gpu/vkProbe.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -916,6 +917,63 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	auto result = physical_device.createDevice(&create_info, nullptr, &device);
 	if (result != vk::Result::eSuccess) {
 		LOGF("vkCreateDevice failed: %s\n", vk::to_string(result).c_str());
+		// Round 21 diagnosis: which part of the request the driver refuses.
+		const auto probe = [&](const char* what, const vk::DeviceCreateInfo& info) {
+			vk::Device test    = nullptr;
+			const auto outcome = physical_device.createDevice(&info, nullptr, &test);
+			LOGF("vkCreateDevice probe, %s: %s\n", what, vk::to_string(outcome).c_str());
+			if (test != nullptr) {
+				test.destroy();
+			}
+		};
+		vk::PhysicalDeviceVulkan12Features only12 {};
+		only12.bufferDeviceAddress = VK_TRUE;
+		const std::array<const char*, 3> dlss_only {"VK_NVX_binary_import", "VK_NVX_image_view_handle",
+		                                            "VK_KHR_buffer_device_address"};
+		auto minimal                    = create_info;
+		minimal.pNext                   = &only12;
+		minimal.pEnabledFeatures        = nullptr;
+		minimal.queueCreateInfoCount    = 1;
+		minimal.enabledExtensionCount   = static_cast<uint32_t>(dlss_only.size());
+		minimal.ppEnabledExtensionNames = dlss_only.data();
+		probe("DLSS's extensions and one queue only", minimal);
+		auto no_features             = create_info;
+		no_features.pNext            = &only12;
+		no_features.pEnabledFeatures = nullptr;
+		probe("every extension, no features but bufferDeviceAddress", no_features);
+		auto one_queue                 = create_info;
+		one_queue.queueCreateInfoCount = 1;
+		probe("everything, one queue family", one_queue);
+		// The feature chain, one struct left out at a time.
+		for (auto* skip = static_cast<const vk::BaseInStructure*>(create_info.pNext);
+		     skip != nullptr; skip = skip->pNext) {
+			std::vector<vk::BaseOutStructure*> chain;
+			for (auto* s = static_cast<const vk::BaseInStructure*>(create_info.pNext); s != nullptr;
+			     s       = s->pNext) {
+				chain.push_back(const_cast<vk::BaseOutStructure*>(
+				    reinterpret_cast<const vk::BaseOutStructure*>(s)));
+			}
+			std::vector<vk::BaseOutStructure*> saved_next;
+			for (auto* s: chain) {
+				saved_next.push_back(s->pNext);
+			}
+			auto        without = create_info;
+			const void* head    = create_info.pNext;
+			if (static_cast<const void*>(skip) == head) {
+				without.pNext = skip->pNext;
+			} else {
+				for (auto* s: chain) {
+					if (static_cast<const void*>(s->pNext) == static_cast<const void*>(skip)) {
+						s->pNext = const_cast<vk::BaseOutStructure*>(
+						    reinterpret_cast<const vk::BaseOutStructure*>(skip->pNext));
+					}
+				}
+			}
+			probe(fmt::format("without {}", vk::to_string(skip->sType)).c_str(), without);
+			for (size_t i = 0; i < chain.size(); i++) {
+				chain[i]->pNext = saved_next[i];
+			}
+		}
 		return nullptr;
 	}
 
@@ -1464,6 +1522,16 @@ void WindowContext::CreateVulkan() {
 		}
 	}
 
+	// Round 21 diagnosis: KYTY_DEVICE_SKIP_EXT names device extensions to leave out.
+	if (const char* skip = std::getenv("KYTY_DEVICE_SKIP_EXT"); skip != nullptr) {
+		std::erase_if(device_extensions, [&](const char* name) {
+			return std::string_view(skip).find(name) != std::string_view::npos;
+		});
+	}
+	for (const char* name: device_extensions) {
+		LOGF("Vulkan device extension enabled: %s\n", name);
+	}
+	VkProbe("before the device");
 	graphic_ctx.device = VulkanCreateDevice(graphic_ctx, device_extensions);
 	if (graphic_ctx.device == nullptr) {
 		EXIT("Could not create device");

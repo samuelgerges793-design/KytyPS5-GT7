@@ -607,9 +607,13 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 // time, and only drivers with Smooth Motion gain anything). KYTY_CUDA_VA_FLOOR_GB: the floor in
 // GiB, 1024 (the default) to 65536. Without nvcuda.dll (no NVIDIA driver) nothing happens.
 // From Jetsku/KytyPS5 (Luiz Henrique, PR 58, and Jetsku's opt-in, ec9943e6).
-static void InitCudaEarly() {
+// Round 21: --dlss turns it on too. A device with DLSS's VK_NVX_binary_import starts CUDA, which
+// wants 56 GB of addresses from 0x200000000, the start of the guest address space: without
+// this, vkCreateDevice fails (ErrorInitializationFailed); started first with no floor, CUDA holds
+// the addresses the guest's fixed mappings need.
+static void InitCudaEarly(bool dlss) {
 	if (const char* value = std::getenv("KYTY_CUDA_EARLY_INIT");
-	    value == nullptr || std::strcmp(value, "1") != 0) {
+	    !dlss && (value == nullptr || std::strcmp(value, "1") != 0)) {
 		return;
 	}
 	HMODULE cuda = LoadLibraryExW(L"nvcuda.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
@@ -672,7 +676,11 @@ static void InitCudaEarly() {
 
 static int Main(int argc, char* argv[]) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	InitCudaEarly();
+	bool dlss = false;
+	for (int i = 1; i < argc; i++) {
+		dlss = dlss || std::strcmp(argv[i], "--dlss") == 0;
+	}
+	InitCudaEarly(dlss);
 #endif
 	VirtualMemory::Init();
 	InitializeThreads();

@@ -1,5 +1,7 @@
 #include "emulator.h"
 
+#include "graphics/host_gpu/vkProbe.h"
+
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
@@ -141,14 +143,23 @@ static void Init(const Config::ConfigOptions& cfg, const std::filesystem::path& 
 	}
 
 	// Initialization order is explicit; destruction is automatic and reversed.
+	Libs::Graphics::VkProbe("before the subsystems");
 	subsystems.Initialize<Loader::Timer::Lifecycle>();
+	Libs::Graphics::VkProbe("after Loader::Timer::Lifecycle");
 	subsystems.Initialize<Libs::LibKernel::PthreadLifecycle>();
+	Libs::Graphics::VkProbe("after Libs::LibKernel::PthreadLifecycle");
 	subsystems.Initialize<Profiler::Lifecycle>();
+	Libs::Graphics::VkProbe("after Profiler::Lifecycle");
 	subsystems.Initialize<Libs::Network::Lifecycle>();
+	Libs::Graphics::VkProbe("after Libs::Network::Lifecycle");
 	subsystems.Initialize<Libs::LibKernel::Memory::Lifecycle>();
+	Libs::Graphics::VkProbe("after Libs::LibKernel::Memory::Lifecycle");
 	subsystems.Initialize<Libs::LibKernel::FileSystem::Lifecycle>();
+	Libs::Graphics::VkProbe("after Libs::LibKernel::FileSystem::Lifecycle");
 	subsystems.Initialize<Libs::Controller::Lifecycle>();
+	Libs::Graphics::VkProbe("after Libs::Controller::Lifecycle");
 	subsystems.Initialize<Libs::Audio::Lifecycle>();
+	Libs::Graphics::VkProbe("after Libs::Audio::Lifecycle");
 	subsystems.Initialize<Libs::Graphics::Lifecycle>();
 	// After the window: SDL is initialised there, on this thread.
 	subsystems.Initialize<Libs::Wheel::Lifecycle>();
