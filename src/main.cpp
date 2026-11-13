@@ -627,7 +627,10 @@ static void InitCudaEarly(bool dlss) {
 	if (init == nullptr) {
 		return;
 	}
-	constexpr uint64_t MinFloorGb = 1024;
+	// Round 22: 1008 GiB, the end of the guest range (HOST_USER_MAX + 1), not 1024: measured on
+	// driver 621.01, cuInit fails (2, out of memory) with everything below 1024 GiB held, and with
+	// only the guest range held it succeeds and takes 9 GB at 0xfd00000000, past the guest range.
+	constexpr uint64_t MinFloorGb = 1008;
 	constexpr uint64_t MaxFloorGb = 65536;
 	uint64_t           floor_gb   = MinFloorGb;
 	if (const char* value = std::getenv("KYTY_CUDA_VA_FLOOR_GB");
