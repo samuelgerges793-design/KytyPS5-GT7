@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <optional>
 
 namespace Libs::Graphics {
@@ -38,8 +39,44 @@ void MemoryBarrier(vk::CommandBuffer command) {
 
 // Round 21: one line whenever what the game asks of its upscaler changes (the render size, the
 // output size, its flags, or whether DLSS took it), at most 64 lines a run.
+uint64_t g_pssr_ns[3] {};
+
+uint64_t PssrNow() {
+	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                                 std::chrono::steady_clock::now().time_since_epoch())
+	                                 .count());
+}
+
 void NotePssr(const Pssr::Request& request, uint32_t output_width, uint32_t output_height,
               bool dlss) {
+	// Round 21b: and every 1024 requests one line with the render sizes of those requests, since
+	// the game changes its render size all the time and the lines above run out.
+	static uint32_t count      = 0;
+	static uint32_t dlss_count = 0;
+	static uint32_t min_height = UINT32_MAX;
+	static uint32_t max_height = 0;
+	static uint64_t pixels     = 0;
+	count++;
+	dlss_count += dlss ? 1u : 0u;
+	min_height = (std::min)(min_height, request.height);
+	max_height = (std::max)(max_height, request.height);
+	pixels += static_cast<uint64_t>(request.width) * request.height;
+	if (count == 1024) {
+		LOGF("PSSR (1024 requests): render heights %u to %u, %.0f%% of the output's pixels on "
+		     "average, output %ux%u, %u by DLSS; GPU thread time a request: %.2f ms before the "
+		     "handle, %.2f ms taking it, %.2f ms recording the upscale\n",
+		     min_height, max_height,
+		     100.0 * static_cast<double>(pixels) /
+		         (1024.0 * static_cast<double>(output_width) * output_height),
+		     output_width, output_height, dlss_count,
+		     static_cast<double>(g_pssr_ns[0]) / 1024e6, static_cast<double>(g_pssr_ns[1]) / 1024e6,
+		     static_cast<double>(g_pssr_ns[2]) / 1024e6);
+		g_pssr_ns[0] = g_pssr_ns[1] = g_pssr_ns[2] = 0;
+		count = dlss_count = 0;
+		min_height         = UINT32_MAX;
+		max_height         = 0;
+		pixels             = 0;
+	}
 	static uint32_t last[6] {};
 	static uint32_t lines = 0;
 	const uint32_t  now[6] {request.width, request.height, output_width, output_height,
@@ -113,6 +150,7 @@ bool RenderExecutor::Upscale(vk::CommandBuffer command, const Pssr::Request& req
 
 void RenderExecutor::ProcessPssr(CommandBuffer& buffer, const Pssr::Request& request) {
 	EXIT_IF(buffer.IsInvalid());
+	const auto pssr_start = PssrNow();
 	m_context.GetCommandScheduler().PopPendingOperations(false);
 	const RendererLock lock(m_context.GetMutex());
 	ShaderTextureResource input_descriptor {}, output_descriptor {};
@@ -213,7 +251,11 @@ void RenderExecutor::ProcessPssr(CommandBuffer& buffer, const Pssr::Request& req
 	         source_view.base_layer == destination_view.base_layer));
 
 	buffer.EndRendering();
-	const auto command = buffer.Handle();
+	const auto pssr_before_handle = PssrNow();
+	const auto command            = buffer.Handle();
+	const auto pssr_after_handle  = PssrNow();
+	g_pssr_ns[0] += pssr_before_handle - pssr_start;
+	g_pssr_ns[1] += pssr_after_handle - pssr_before_handle;
 	const auto range   = [](const ImageViewInfo& view) {
 		return ImageSubresourceRange {view.base_level, 1, view.base_layer, 1};
 	};
@@ -253,6 +295,7 @@ void RenderExecutor::ProcessPssr(CommandBuffer& buffer, const Pssr::Request& req
 		                     resource(*dlss_bindings[1], false),
 		                     dlss_bindings[2] ? &exposure : nullptr, resource(output, true)};
 		const bool upscaled = Upscale(command, request, inputs);
+		g_pssr_ns[2] += PssrNow() - pssr_after_handle;
 		NotePssr(request, parameters.output_size[0], parameters.output_size[1], upscaled);
 		if (upscaled) {
 			ResetBindings();

@@ -1,3 +1,4 @@
+#include "common/logging/log.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/guest_gpu/pssr.h"
 #include "graphics/shader/shaderBindings.h"
@@ -708,6 +709,23 @@ int KYTY_SYSV_ABI GetDispatchPackets(const Context* context, const CommandSpace*
 	uint32_t flags = params->flags & (Pssr::kReverseDepth | Pssr::kAutoExposure);
 	if (params->encoding != 0 || (params->flags & DILATED_MOTION) != 0) {
 		flags |= Pssr::kSpatialOnly;
+	}
+	// Round 21b diagnosis: the first 48 dispatches as the game gave them.
+	if (static uint32_t dumped = 0; dumped < 48) {
+		dumped++;
+		LOGF("Psml mfsr2 dispatch %u: context %p, %ux%u at %u,%u, jitter %.3f,%.3f, motion scale "
+		     "%.2f,%.2f, motion offset %.3f,%.3f, depth range %.4f,%.4f, reset %u reserved %u "
+		     "encoding %u particle bits %u, flags 0x%x, pre-exposure %.3f, output %p color %p "
+		     "motion %p depth %p exposure %p particles %p\n",
+		     dumped, static_cast<const void*>(context), params->width, params->height, params->x,
+		     params->y, params->jitter[0], params->jitter[1], params->motion_scale[0],
+		     params->motion_scale[1], params->motion_offset[0], params->motion_offset[1],
+		     params->depth_range[0], params->depth_range[1], params->reset, params->reserved,
+		     params->encoding, params->particle_bits, params->flags, params->pre_exposure,
+		     static_cast<const void*>(params->output), static_cast<const void*>(params->color),
+		     static_cast<const void*>(params->motion), static_cast<const void*>(params->depth),
+		     static_cast<const void*>(params->exposure),
+		     static_cast<const void*>(params->particle_mask));
 	}
 	WritePacket(*space, MakeRequest(context, *params, flags, params->pre_exposure));
 	return OK;
